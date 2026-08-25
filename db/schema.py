@@ -105,6 +105,11 @@ def _ensure_mms(cur) -> None:
             -- 不要改成數字型別——它不參與任何計算或比對。
             players TEXT,
 
+            -- 每個場次時段最多可以排幾組候補（不含已成立的那一組）。
+            -- 放在 mms 而不是全域設定，因為熱門劇本可能想放寬、冷門的想收緊。
+            -- 要改成全站統一調整的話，改動這一欄的預設值即可。
+            waitlist_limit INTEGER NOT NULL DEFAULT 3 CHECK (waitlist_limit >= 0),
+
             -- 主持人角色名稱。NULL 代表這個劇本沒有這個角色。
             gm1_name TEXT,
             gm2_name TEXT,
@@ -183,9 +188,47 @@ def _ensure_booking_record(cur) -> None:
         cancelled    已取消
     （原始需求寫的是 gm_comfirm，是 confirm 的拼字錯誤，這裡用正確拼法。）
 
+    候補順位刻意「不存欄位、每次由 created_at 算出來」：
+
+        SELECT id, player_id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY mms_id, session_date, session_time
+                   ORDER BY created_at
+               ) AS position
+        FROM booking_record
+        WHERE mms_id = ? AND session_date = ? AND session_time = ?
+          AND status <> 'cancelled'
+
+    position = 1 是成立的那一組，其餘依序是候補。
+
+    為什麼不存一個 priority 欄位（或 waitlist_position 數字）：
+    那會讓「誰是第一位」有兩個來源——created_at 的先後，和欄位裡的值——
+    而兩者可以不一致。取消時要把下一位升上來，那是「改另一列」的寫入，
+    必須跟取消本身在同一個交易裡；只要升位因為任何原因沒跑成功
+    （交易回滾、程式 bug、升位當下剛好有新預約插進來），就會留下
+    「這個時段沒有任何人是第一位」的狀態，而且看起來跟「全部取消了」
+    一模一樣，不會有錯誤訊息。用算的則不可能出現這種狀態：取消就只是
+    把自己的 status 改掉，順位自動遞補，沒有第二個地方需要同步。
+
+    效能上也沒有取捨：每個 (劇本, 日期, 時間) 的分組最多只有
+    1 + waitlist_limit 列（預設 4 列），對 4 列做 ROW_NUMBER 的成本可以忽略，
+    而玩家瀏覽用的熱查詢本來就走 Redis 快取、不會打到這裡。
+
+    候補上限的檢查（這是真正需要小心的地方）：
+    「這個時段還沒滿」這件事無法用唯一約束表達——要擋的是「第 N+1 筆」，
+    而那筆資料在檢查當下還不存在，沒有東西可以鎖（典型的 phantom read）。
+    正確做法是在交易一開始先取得該時段的 advisory lock：
+
+        SELECT pg_advisory_xact_lock(
+            hashtext(mms_id::text || '|' || session_date::text || '|' || session_time::text)
+        );
+
+    這把鎖只序列化「同一個時段」的預約，不影響其他時段，並且在交易結束時
+    自動釋放（xact 版本不需要手動解鎖，交易回滾也會放掉）。拿到鎖之後再
+    COUNT 現有未取消的筆數、跟 mms.waitlist_limit 比較，才 INSERT。
+
     刻意沒有對 (mms_id, session_date, session_time) 建唯一約束：
-    同一個劇本在同一時段可以有多場並行。候補機制待設計，屆時可能需要
-    在這裡加欄位（例如 waitlist_position）或新增 status 值。
+    一個時段允許多筆（1 組成立 + N 組候補），唯一性由上面的上限檢查負責。
     """
     cur.execute(
         """
@@ -231,10 +274,12 @@ def _ensure_booking_record(cur) -> None:
         )
         """
     )
-    # 最常見的查詢：某劇本某天有哪些場次（玩家瀏覽可預約時段）
+    # 場次查詢與候補順位計算共用這一個索引。結尾帶 created_at 是刻意的：
+    # 上面那段 ROW_NUMBER 的 ORDER BY 就是 created_at，索引順序對上之後
+    # 排序可以直接走索引，不需要額外的 sort 步驟。
     cur.execute(
-        "CREATE INDEX IF NOT EXISTS idx_booking_mms_date "
-        "ON booking_record (mms_id, session_date, session_time)"
+        "CREATE INDEX IF NOT EXISTS idx_booking_slot "
+        "ON booking_record (mms_id, session_date, session_time, created_at)"
     )
     # 某玩家的預約紀錄
     cur.execute("CREATE INDEX IF NOT EXISTS idx_booking_player ON booking_record (player_id)")
