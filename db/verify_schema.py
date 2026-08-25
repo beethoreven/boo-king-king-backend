@@ -36,7 +36,7 @@ from db.schema import ensure_schema  # noqa: E402
 # 範例資料一律用這個前綴，--clean 靠它辨識該刪哪些，不會碰到真實帳號。
 SEED_PREFIX = "booking-king-verify"
 
-EXPECTED_TABLES = ["users", "mms", "booking_record"]
+EXPECTED_TABLES = ["users", "mmg", "booking_record"]
 
 
 def _print_header(title: str) -> None:
@@ -136,7 +136,7 @@ def seed(cur) -> None:
     # 角色 1 有兩位主持人可選、角色 2 只有一位、角色 3/4 這個劇本沒有。
     cur.execute(
         """
-        INSERT INTO mms (name, period, price, booking_cost, players,
+        INSERT INTO mmg (name, period, price, booking_cost, players,
                          gm1_name, gm2_name, gm1_user, gm2_user, waitlist_limit)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
@@ -149,8 +149,8 @@ def seed(cur) -> None:
             3,
         ),
     )
-    mms_id = cur.fetchone()[0]
-    print(f"    mms          新增 1 筆 (id={mms_id}, 時長 3.5h, 訂金 300)")
+    mmg_id = cur.fetchone()[0]
+    print(f"    mmg          新增 1 筆 (id={mmg_id}, 時長 3.5h, 訂金 300)")
     print("                 角色1 可選 2 位主持人、角色2 可選 1 位、角色3/4 不存在")
 
     # 三組玩家搶同一個時段。created_at 用 DEFAULT NOW()，插入先後即順位。
@@ -158,15 +158,15 @@ def seed(cur) -> None:
         cur.execute(
             """
             INSERT INTO booking_record
-                (mms_id, player_id, session_date, session_time, deposit,
+                (mmg_id, player_id, session_date, session_time, deposit,
                  gm1_user_id, gm2_user_id, request_id)
             VALUES (%s, %s, DATE '2026-09-05', TIME '14:00', 300, %s, %s, gen_random_uuid())
             """,
-            (mms_id, user_ids[label], user_ids["gm-alice"], user_ids["gm-alice"]),
+            (mmg_id, user_ids[label], user_ids["gm-alice"], user_ids["gm-alice"]),
         )
     print("    booking_record 新增 3 筆 (同一時段，測試候補順位)")
 
-    return mms_id
+    return mmg_id
 
 
 def show_waitlist(cur) -> None:
@@ -176,12 +176,12 @@ def show_waitlist(cur) -> None:
         """
         SELECT b.session_date, b.session_time, u.name, b.status,
                ROW_NUMBER() OVER (
-                   PARTITION BY b.mms_id, b.session_date, b.session_time
+                   PARTITION BY b.mmg_id, b.session_date, b.session_time
                    ORDER BY b.created_at
                ) AS position
         FROM booking_record b
         JOIN users u ON u.id = b.player_id
-        JOIN mms m ON m.id = b.mms_id
+        JOIN mmg m ON m.id = b.mmg_id
         WHERE m.name LIKE %s AND b.status <> 'cancelled'
         ORDER BY b.session_date, b.session_time, position
         """,
@@ -208,7 +208,7 @@ def check_gm_constraint(cur) -> bool:
     try:
         cur.execute(
             """
-            INSERT INTO mms (name, gm1_name, gm3_user) VALUES (%s, %s, %s)
+            INSERT INTO mmg (name, gm1_name, gm3_user) VALUES (%s, %s, %s)
             """,
             (f"{SEED_PREFIX} 違規測試", "主控", [1]),
         )
@@ -226,12 +226,12 @@ def clean(cur) -> None:
     _print_header("清除範例資料")
     # 先刪參照方（booking_record / mms_gm），再刪被參照方，否則外鍵會擋。
     cur.execute(
-        "DELETE FROM booking_record WHERE mms_id IN (SELECT id FROM mms WHERE name LIKE %s)",
+        "DELETE FROM booking_record WHERE mmg_id IN (SELECT id FROM mmg WHERE name LIKE %s)",
         (f"{SEED_PREFIX}%",),
     )
     print(f"    booking_record 刪除 {cur.rowcount} 筆")
-    cur.execute("DELETE FROM mms WHERE name LIKE %s", (f"{SEED_PREFIX}%",))
-    print(f"    mms            刪除 {cur.rowcount} 筆")
+    cur.execute("DELETE FROM mmg WHERE name LIKE %s", (f"{SEED_PREFIX}%",))
+    print(f"    mmg            刪除 {cur.rowcount} 筆")
     cur.execute("DELETE FROM users WHERE email LIKE %s", (f"{SEED_PREFIX}%",))
     print(f"    users          刪除 {cur.rowcount} 筆")
 

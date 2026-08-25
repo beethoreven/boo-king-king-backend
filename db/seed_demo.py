@@ -35,7 +35,7 @@ USERS = [
 # 《竊雲台》有三個主持人角色，沒有第四個。
 # 每個角色目前各由一位主持人擔任，但 gm{n}_user 是陣列，之後要加人
 # 直接往陣列裡塞 user id 即可，不用改結構。
-MMS = {
+MMG = {
     "id": 1,
     "name": "竊雲台",
     "period": 10,          # 遊戲時長 10 小時
@@ -71,7 +71,7 @@ def seed(cur) -> None:
 
     cur.execute(
         """
-        INSERT INTO mms (id, name, period, price, booking_cost, players,
+        INSERT INTO mmg (id, name, period, price, booking_cost, players,
                          gm1_name, gm2_name, gm3_name, gm4_name,
                          gm1_user, gm2_user, gm3_user, gm4_user, status)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -86,14 +86,14 @@ def seed(cur) -> None:
                 status = EXCLUDED.status
         """,
         (
-            MMS["id"], MMS["name"], MMS["period"], MMS["price"],
-            MMS["booking_cost"], MMS["players"],
-            *MMS["gm_names"],
-            *MMS["gm_users"],
-            MMS["status"],
+            MMG["id"], MMG["name"], MMG["period"], MMG["price"],
+            MMG["booking_cost"], MMG["players"],
+            *MMG["gm_names"],
+            *MMG["gm_users"],
+            MMG["status"],
         ),
     )
-    print("    mms    寫入 1 筆")
+    print("    mmg    寫入 1 筆")
 
     _fix_sequences(cur)
 
@@ -111,7 +111,7 @@ def _fix_sequences(cur) -> None:
     引爆點會剛好落在開賣當天的第一筆預約。
     """
     _print_header("修正序列值")
-    for table in ("users", "mms", "booking_record"):
+    for table in ("users", "mmg", "booking_record"):
         cur.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}")  # noqa: S608 - 常數表名
         max_id = cur.fetchone()[0]
         seq = f"{table}_id_seq"
@@ -132,13 +132,13 @@ def show(cur) -> None:
         print(f"    id={uid}  {name:<8} {role_label.get(role, role):<8} {status:<8} {email}")
         print(f"           line_id={line_id or '(空)'}  phone={phone or '(空)'}")
 
-    _print_header("mms")
+    _print_header("mmg")
     cur.execute(
         """
         SELECT id, name, period, price, booking_cost, players, waitlist_limit, status,
                gm1_name, gm2_name, gm3_name, gm4_name,
                gm1_user, gm2_user, gm3_user, gm4_user
-        FROM mms ORDER BY id
+        FROM mmg ORDER BY id
         """
     )
     for row in cur.fetchall():

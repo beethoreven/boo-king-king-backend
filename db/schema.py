@@ -3,7 +3,7 @@
 
 建立順序有相依性，不能隨便調換：
 1. users（帳號）——booking_record.player_id、gm{n}_user_id 會參照這裡
-2. mms（可提供服務的劇本）——booking_record.mms_id 會參照這裡
+2. mmg（可提供服務的劇本）——booking_record.mmg_id 會參照這裡
 3. booking_record（預定場次）
 
 只支援 Postgres（Neon）。冪等操作（CREATE TABLE IF NOT EXISTS、補欄位前
@@ -44,107 +44,10 @@ def ensure_schema(cur) -> None:
             return
 
         _ensure_users(cur)
-        _ensure_mms(cur)
+        _ensure_mmg(cur)
         _ensure_booking_record(cur)
-        _drop_legacy_mms_gm(cur)
-        _ensure_views(cur)
 
         _schema_ready = True
-
-
-def _ensure_views(cur) -> None:
-    """給人瀏覽用的檢視表。
-
-    存在的理由是可讀性，不是效能：直接看 booking_record 只會看到一堆 id，
-    還要自己對照 users 才知道誰是誰。而且資料庫瀏覽器（Neon 的表格檢視）
-    看到外鍵之後會自動長出一堆反查用的欄位捷徑（id_booking_records_
-    gm1_user_id 之類），把畫面塞滿——那些是 UI 自己算出來的顯示項目，
-    不是真實欄位，也無法改名或調順序（名稱是從表名/欄位名組出來的，
-    不是讀外鍵約束的名稱）。
-
-    檢視表沒有外鍵，所以完全不會產生那些捷徑，是繞過這個問題最直接的方式。
-
-    應用程式的讀寫一律走實體資料表，不要依賴這些檢視——它們的欄位名稱
-    是為了給人看而取的，隨時可能為了更好讀而調整。
-    """
-    cur.execute("DROP VIEW IF EXISTS v_booking")
-    cur.execute(
-        """
-        CREATE VIEW v_booking AS
-        SELECT
-            b.id,
-            m.name                                   AS 劇本,
-            b.session_date                           AS 場次日期,
-            b.session_time                           AS 場次時間,
-            p.name                                   AS 玩家,
-            CASE WHEN b.status = 'cancelled' THEN NULL
-                 ELSE ROW_NUMBER() OVER (
-                     PARTITION BY b.mms_id, b.session_date, b.session_time,
-                                  (b.status = 'cancelled')
-                     ORDER BY b.created_at
-                 ) END                               AS 順位,
-            b.status                                 AS 狀態,
-            b.deposit                                AS 已收訂金,
-            m.booking_cost                           AS 應收訂金,
-            g1.name                                  AS 主持人1,
-            g2.name                                  AS 主持人2,
-            g3.name                                  AS 主持人3,
-            g4.name                                  AS 主持人4,
-            b.note                                   AS 備註,
-            b.created_at AT TIME ZONE 'Asia/Taipei'  AS 建立時間,
-            b.request_id
-        FROM booking_record b
-        JOIN mms   m  ON m.id  = b.mms_id
-        JOIN users p  ON p.id  = b.player_id
-        LEFT JOIN users g1 ON g1.id = b.gm1_user_id
-        LEFT JOIN users g2 ON g2.id = b.gm2_user_id
-        LEFT JOIN users g3 ON g3.id = b.gm3_user_id
-        LEFT JOIN users g4 ON g4.id = b.gm4_user_id
-        """
-    )
-
-    # 劇本一覽：把 gm{n}_user 陣列裡的 id 換成人名，不用自己去 users 對照
-    cur.execute("DROP VIEW IF EXISTS v_mms")
-    cur.execute(
-        """
-        CREATE VIEW v_mms AS
-        SELECT
-            m.id,
-            m.name          AS 劇本,
-            m.period        AS 時長,
-            m.price         AS 售價,
-            m.booking_cost  AS 訂金,
-            m.players       AS 人數,
-            m.waitlist_limit AS 候補上限,
-            m.status        AS 狀態,
-            m.gm1_name      AS 角色1,
-            (SELECT string_agg(u.name, '、' ORDER BY u.id)
-               FROM users u WHERE u.id = ANY(m.gm1_user)) AS 角色1可帶,
-            m.gm2_name      AS 角色2,
-            (SELECT string_agg(u.name, '、' ORDER BY u.id)
-               FROM users u WHERE u.id = ANY(m.gm2_user)) AS 角色2可帶,
-            m.gm3_name      AS 角色3,
-            (SELECT string_agg(u.name, '、' ORDER BY u.id)
-               FROM users u WHERE u.id = ANY(m.gm3_user)) AS 角色3可帶,
-            m.gm4_name      AS 角色4,
-            (SELECT string_agg(u.name, '、' ORDER BY u.id)
-               FROM users u WHERE u.id = ANY(m.gm4_user)) AS 角色4可帶
-        FROM mms m
-        """
-    )
-
-
-def _drop_legacy_mms_gm(cur) -> None:
-    """移除舊的 mms_gm 資料表。
-
-    早期版本把「哪些主持人會哪個角色」拆成獨立的 junction table，後來改回
-    mms.gm{n}_user 陣列（理由見 _ensure_mms）。這行讓已經建過那張表的資料庫
-    跟著清乾淨，對全新的資料庫是無害的空操作。
-
-    確認沒有其他東西依賴它之後才刪，所以不需要 CASCADE——如果哪天真的有
-    外部依賴，讓它報錯比靜靜連帶刪掉安全。
-    """
-    cur.execute("DROP TABLE IF EXISTS mms_gm")
 
 
 def _ensure_users(cur) -> None:
@@ -182,7 +85,7 @@ def _ensure_users(cur) -> None:
     )
 
 
-def _ensure_mms(cur) -> None:
+def _ensure_mmg(cur) -> None:
     """可提供服務的劇本。
 
     gm{n}_name 是「這個劇本需要幾個主持人角色、各叫什麼名字」，
@@ -201,12 +104,12 @@ def _ensure_mms(cur) -> None:
 
     陣列反而讓一條原本表達不出來的規則變得可以強制：
     「gm{n}_name 為空時，gm{n}_user 必然為空」。這兩個欄位現在同表，
-    寫成 CHECK 約束即可（見下方 _ensure_mms_gm_constraints）；
+    寫成 CHECK 約束即可（見下方 _ensure_mmg_gm_constraints）；
     分成兩張表時這條規則跨表，只能靠應用層自律。
     """
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS mms (
+        CREATE TABLE IF NOT EXISTS mmg (
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
 
@@ -222,38 +125,44 @@ def _ensure_mms(cur) -> None:
             players TEXT,
 
             -- 每個場次時段最多可以排幾組候補（不含已成立的那一組）。
-            -- 放在 mms 而不是全域設定，因為熱門劇本可能想放寬、冷門的想收緊。
+            -- 放在 mmg 而不是全域設定，因為熱門劇本可能想放寬、冷門的想收緊。
             -- 要改成全站統一調整的話，改動這一欄的預設值即可。
             waitlist_limit INTEGER NOT NULL DEFAULT 3 CHECK (waitlist_limit >= 0),
 
-            -- 主持人角色名稱。NULL 代表這個劇本沒有這個角色。
+            -- 每個主持人角色是「名稱 + 會這個角色的人」一組，刻意讓
+            -- gm{n}_name 與 gm{n}_user 相鄰，直接看資料表時一眼就能
+            -- 把角色跟人對起來，不用左右來回捲。
+            --
+            -- gm{n}_name 為 NULL 代表這個劇本沒有這個角色；
+            -- gm{n}_user 是 users.id 的集合，空陣列代表還沒指派。
             gm1_name TEXT,
-            gm2_name TEXT,
-            gm3_name TEXT,
-            gm4_name TEXT,
-
-            -- 會這個角色的主持人（users.id 的集合）。空陣列代表還沒指派。
             gm1_user INTEGER[] NOT NULL DEFAULT '{}',
+            gm2_name TEXT,
             gm2_user INTEGER[] NOT NULL DEFAULT '{}',
+            gm3_name TEXT,
             gm3_user INTEGER[] NOT NULL DEFAULT '{}',
+            gm4_name TEXT,
             gm4_user INTEGER[] NOT NULL DEFAULT '{}',
 
             status TEXT NOT NULL DEFAULT 'active'
         )
         """
     )
-    # 既有資料庫補欄位（全新建立的已經在上面的 CREATE TABLE 裡了）
-    existing = _existing_columns(cur, "mms")
+    # 既有資料庫補欄位。注意這條路徑補出來的欄位會排在最後面，
+    # 拿不到上面 CREATE TABLE 的相鄰順序——Postgres 沒有調整既有欄位
+    # 順序的語法，只能重建整張表。要讓現有資料庫也變成相鄰排列，
+    # 跑一次 db/migrate_reorder_mms.py。
+    existing = _existing_columns(cur, "mmg")
     for n in (1, 2, 3, 4):
         if f"gm{n}_user" not in existing:
             cur.execute(
-                f"ALTER TABLE mms ADD COLUMN gm{n}_user INTEGER[] NOT NULL DEFAULT '{{}}'"
+                f"ALTER TABLE mmg ADD COLUMN gm{n}_user INTEGER[] NOT NULL DEFAULT '{{}}'"
             )
 
-    _ensure_mms_gm_constraints(cur)
+    _ensure_mmg_gm_constraints(cur)
 
 
-def _ensure_mms_gm_constraints(cur) -> None:
+def _ensure_mmg_gm_constraints(cur) -> None:
     """強制「沒有這個角色，就不能有人被指派到這個角色」。
 
     gm{n}_name 為 NULL（劇本沒有這個角色）時，gm{n}_user 必須是空陣列。
@@ -264,10 +173,10 @@ def _ensure_mms_gm_constraints(cur) -> None:
     改了條件內容之後也會換成新版本。
     """
     for n in (1, 2, 3, 4):
-        cur.execute(f"ALTER TABLE mms DROP CONSTRAINT IF EXISTS gm{n}_slot_consistent")
+        cur.execute(f"ALTER TABLE mmg DROP CONSTRAINT IF EXISTS gm{n}_slot_consistent")
         cur.execute(
             f"""
-            ALTER TABLE mms ADD CONSTRAINT gm{n}_slot_consistent
+            ALTER TABLE mmg ADD CONSTRAINT gm{n}_slot_consistent
             CHECK (gm{n}_name IS NOT NULL OR cardinality(gm{n}_user) = 0)
             """
         )
@@ -300,11 +209,11 @@ def _ensure_booking_record(cur) -> None:
 
         SELECT id, player_id,
                ROW_NUMBER() OVER (
-                   PARTITION BY mms_id, session_date, session_time
+                   PARTITION BY mmg_id, session_date, session_time
                    ORDER BY created_at
                ) AS position
         FROM booking_record
-        WHERE mms_id = ? AND session_date = ? AND session_time = ?
+        WHERE mmg_id = ? AND session_date = ? AND session_time = ?
           AND status <> 'cancelled'
 
     position = 1 是成立的那一組，其餘依序是候補。
@@ -328,14 +237,14 @@ def _ensure_booking_record(cur) -> None:
     正確做法是在交易一開始先取得該時段的 advisory lock：
 
         SELECT pg_advisory_xact_lock(
-            hashtext(mms_id::text || '|' || session_date::text || '|' || session_time::text)
+            hashtext(mmg_id::text || '|' || session_date::text || '|' || session_time::text)
         );
 
     這把鎖只序列化「同一個時段」的預約，不影響其他時段，並且在交易結束時
     自動釋放（xact 版本不需要手動解鎖，交易回滾也會放掉）。拿到鎖之後再
-    COUNT 現有未取消的筆數、跟 mms.waitlist_limit 比較，才 INSERT。
+    COUNT 現有未取消的筆數、跟 mmg.waitlist_limit 比較，才 INSERT。
 
-    刻意沒有對 (mms_id, session_date, session_time) 建唯一約束——這一點
+    刻意沒有對 (mmg_id, session_date, session_time) 建唯一約束——這一點
     很容易被後人誤判成漏了約束而「補上」，補了會直接讓候補功能失效，
     所以說清楚：
 
@@ -350,7 +259,7 @@ def _ensure_booking_record(cur) -> None:
         CREATE TABLE IF NOT EXISTS booking_record (
             id SERIAL PRIMARY KEY,
 
-            mms_id INTEGER NOT NULL REFERENCES mms(id),
+            mmg_id INTEGER NOT NULL REFERENCES mmg(id),
             player_id INTEGER NOT NULL REFERENCES users(id),
 
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -359,7 +268,7 @@ def _ensure_booking_record(cur) -> None:
 
             status TEXT NOT NULL DEFAULT 'gm_confirm',
 
-            -- 實際支付的訂金金額。與 mms.booking_cost 分開存，因為後者是
+            -- 實際支付的訂金金額。與 mmg.booking_cost 分開存，因為後者是
             -- 「目前的定價」，會隨時間調整；這裡要的是「這筆預約當下收了多少」，
             -- 事後查帳不能被之後的改價影響。
             deposit INTEGER NOT NULL DEFAULT 0,
@@ -378,7 +287,7 @@ def _ensure_booking_record(cur) -> None:
             -- 屆時應該另開一張 booking_status_log，而不是在這裡補單一欄位。
             note TEXT,
 
-            -- 這場實際由誰主持，對應 mms.gm{n}_name 的四個角色。
+            -- 這場實際由誰主持，對應 mmg.gm{n}_name 的四個角色。
             -- NULL 代表該劇本沒有這個角色，或尚未指定。
             gm1_user_id INTEGER REFERENCES users(id),
             gm2_user_id INTEGER REFERENCES users(id),
@@ -408,7 +317,7 @@ def _ensure_booking_record(cur) -> None:
     # 排序可以直接走索引，不需要額外的 sort 步驟。
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_booking_slot "
-        "ON booking_record (mms_id, session_date, session_time, created_at)"
+        "ON booking_record (mmg_id, session_date, session_time, created_at)"
     )
     # 某玩家的預約紀錄
     cur.execute("CREATE INDEX IF NOT EXISTS idx_booking_player ON booking_record (player_id)")

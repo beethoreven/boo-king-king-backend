@@ -31,14 +31,14 @@ class BookingResult:
         return "正選" if self.is_confirmed else f"候補 {self.position - 1}"
 
 
-def _lock_slot(cur, mms_id: int, session_date, session_time) -> None:
+def _lock_slot(cur, mmg_id: int, session_date, session_time) -> None:
     """鎖住這個時段，直到交易結束。
 
     為什麼需要：容量檢查要擋的是「第 N+1 筆」，而那筆在檢查當下還不存在，
     沒有既有的列可以鎖（phantom read）。只有先序列化同一時段的預約，
     「先數再寫」才是安全的。
 
-    用 advisory lock 而不是鎖 mms 那一列：鎖 mms 會把該劇本所有日期、
+    用 advisory lock 而不是鎖 mmg 那一列：鎖 mmg 會把該劇本所有日期、
     所有時段的預約全部序列化，開賣尖峰時會把不相干的時段也卡住。
     advisory lock 的鍵是「劇本+日期+時間」，只擋真正在搶同一場的人。
 
@@ -50,26 +50,26 @@ def _lock_slot(cur, mms_id: int, session_date, session_time) -> None:
     """
     cur.execute(
         "SELECT pg_advisory_xact_lock(hashtext(%s))",
-        (f"booking|{mms_id}|{session_date}|{session_time}",),
+        (f"booking|{mmg_id}|{session_date}|{session_time}",),
     )
 
 
-def _validate_gm_choice(cur, mms_id: int, gm_user_ids: list[int | None]) -> None:
+def _validate_gm_choice(cur, mmg_id: int, gm_user_ids: list[int | None]) -> None:
     """確認玩家挑的主持人真的會帶這個角色。
 
     這條規則資料庫擋不了：booking_record.gm1_user_id 的外鍵只保證「是一個
-    存在的使用者」，不保證「這個人在 mms.gm1_user 的名單裡」。跨表的成員
+    存在的使用者」，不保證「這個人在 mmg.gm1_user 的名單裡」。跨表的成員
     檢查要寫成約束得用 trigger，不划算，所以在這裡擋。
     """
     cur.execute(
         "SELECT name, gm1_name, gm2_name, gm3_name, gm4_name,"
         "       gm1_user, gm2_user, gm3_user, gm4_user "
-        "FROM mms WHERE id = %s",
-        (mms_id,),
+        "FROM mmg WHERE id = %s",
+        (mmg_id,),
     )
     row = cur.fetchone()
     if row is None:
-        raise BookingError(f"劇本 id={mms_id} 不存在")
+        raise BookingError(f"劇本 id={mmg_id} 不存在")
 
     mms_name, *rest = row
     gm_names, gm_pools = rest[0:4], rest[4:8]
@@ -90,7 +90,7 @@ def _validate_gm_choice(cur, mms_id: int, gm_user_ids: list[int | None]) -> None
 def create_booking(
     cur,
     *,
-    mms_id: int,
+    mmg_id: int,
     player_id: int,
     session_date,
     session_time,
@@ -110,32 +110,32 @@ def create_booking(
     """
     request_id = request_id or str(uuid.uuid4())
 
-    _lock_slot(cur, mms_id, session_date, session_time)
-    _validate_gm_choice(cur, mms_id, gm_user_ids)
+    _lock_slot(cur, mmg_id, session_date, session_time)
+    _validate_gm_choice(cur, mmg_id, gm_user_ids)
 
     # 容量 = 1 組正選 + waitlist_limit 組候補
-    cur.execute("SELECT name, waitlist_limit FROM mms WHERE id = %s", (mms_id,))
+    cur.execute("SELECT name, waitlist_limit FROM mmg WHERE id = %s", (mmg_id,))
     mms_name, waitlist_limit = cur.fetchone()
     capacity = 1 + waitlist_limit
 
     cur.execute(
         "SELECT COUNT(*) FROM booking_record "
-        "WHERE mms_id = %s AND session_date = %s AND session_time = %s "
+        "WHERE mmg_id = %s AND session_date = %s AND session_time = %s "
         "  AND status <> 'cancelled'",
-        (mms_id, session_date, session_time),
+        (mmg_id, session_date, session_time),
     )
     current = cur.fetchone()[0]
 
     cur.execute(
         """
         INSERT INTO booking_record
-            (mms_id, player_id, session_date, session_time, deposit, note,
+            (mmg_id, player_id, session_date, session_time, deposit, note,
              gm1_user_id, gm2_user_id, gm3_user_id, gm4_user_id, request_id)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (request_id) DO NOTHING
         RETURNING id
         """,
-        (mms_id, player_id, session_date, session_time, deposit, note, *gm_user_ids, request_id),
+        (mmg_id, player_id, session_date, session_time, deposit, note, *gm_user_ids, request_id),
     )
     row = cur.fetchone()
 
@@ -172,13 +172,13 @@ def get_position(cur, booking_id: int) -> int:
         """
         SELECT position FROM (
             SELECT id, ROW_NUMBER() OVER (
-                       PARTITION BY mms_id, session_date, session_time
+                       PARTITION BY mmg_id, session_date, session_time
                        ORDER BY created_at
                    ) AS position
             FROM booking_record
             WHERE status <> 'cancelled'
-              AND (mms_id, session_date, session_time) = (
-                  SELECT mms_id, session_date, session_time
+              AND (mmg_id, session_date, session_time) = (
+                  SELECT mmg_id, session_date, session_time
                   FROM booking_record WHERE id = %s
               )
         ) ranked WHERE id = %s
@@ -191,7 +191,7 @@ def get_position(cur, booking_id: int) -> int:
     return row[0]
 
 
-def list_slot(cur, mms_id: int, session_date, session_time) -> list[tuple]:
+def list_slot(cur, mmg_id: int, session_date, session_time) -> list[tuple]:
     """列出某時段的所有有效預約，依順位排序。"""
     cur.execute(
         """
@@ -199,10 +199,10 @@ def list_slot(cur, mms_id: int, session_date, session_time) -> list[tuple]:
                b.id, u.name, b.status, b.deposit, b.created_at, b.request_id
         FROM booking_record b
         JOIN users u ON u.id = b.player_id
-        WHERE b.mms_id = %s AND b.session_date = %s AND b.session_time = %s
+        WHERE b.mmg_id = %s AND b.session_date = %s AND b.session_time = %s
           AND b.status <> 'cancelled'
         ORDER BY b.created_at
         """,
-        (mms_id, session_date, session_time),
+        (mmg_id, session_date, session_time),
     )
     return cur.fetchall()
