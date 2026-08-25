@@ -47,8 +47,91 @@ def ensure_schema(cur) -> None:
         _ensure_mms(cur)
         _ensure_booking_record(cur)
         _drop_legacy_mms_gm(cur)
+        _ensure_views(cur)
 
         _schema_ready = True
+
+
+def _ensure_views(cur) -> None:
+    """給人瀏覽用的檢視表。
+
+    存在的理由是可讀性，不是效能：直接看 booking_record 只會看到一堆 id，
+    還要自己對照 users 才知道誰是誰。而且資料庫瀏覽器（Neon 的表格檢視）
+    看到外鍵之後會自動長出一堆反查用的欄位捷徑（id_booking_records_
+    gm1_user_id 之類），把畫面塞滿——那些是 UI 自己算出來的顯示項目，
+    不是真實欄位，也無法改名或調順序（名稱是從表名/欄位名組出來的，
+    不是讀外鍵約束的名稱）。
+
+    檢視表沒有外鍵，所以完全不會產生那些捷徑，是繞過這個問題最直接的方式。
+
+    應用程式的讀寫一律走實體資料表，不要依賴這些檢視——它們的欄位名稱
+    是為了給人看而取的，隨時可能為了更好讀而調整。
+    """
+    cur.execute("DROP VIEW IF EXISTS v_booking")
+    cur.execute(
+        """
+        CREATE VIEW v_booking AS
+        SELECT
+            b.id,
+            m.name                                   AS 劇本,
+            b.session_date                           AS 場次日期,
+            b.session_time                           AS 場次時間,
+            p.name                                   AS 玩家,
+            CASE WHEN b.status = 'cancelled' THEN NULL
+                 ELSE ROW_NUMBER() OVER (
+                     PARTITION BY b.mms_id, b.session_date, b.session_time,
+                                  (b.status = 'cancelled')
+                     ORDER BY b.created_at
+                 ) END                               AS 順位,
+            b.status                                 AS 狀態,
+            b.deposit                                AS 已收訂金,
+            m.booking_cost                           AS 應收訂金,
+            g1.name                                  AS 主持人1,
+            g2.name                                  AS 主持人2,
+            g3.name                                  AS 主持人3,
+            g4.name                                  AS 主持人4,
+            b.note                                   AS 備註,
+            b.created_at AT TIME ZONE 'Asia/Taipei'  AS 建立時間,
+            b.request_id
+        FROM booking_record b
+        JOIN mms   m  ON m.id  = b.mms_id
+        JOIN users p  ON p.id  = b.player_id
+        LEFT JOIN users g1 ON g1.id = b.gm1_user_id
+        LEFT JOIN users g2 ON g2.id = b.gm2_user_id
+        LEFT JOIN users g3 ON g3.id = b.gm3_user_id
+        LEFT JOIN users g4 ON g4.id = b.gm4_user_id
+        """
+    )
+
+    # 劇本一覽：把 gm{n}_user 陣列裡的 id 換成人名，不用自己去 users 對照
+    cur.execute("DROP VIEW IF EXISTS v_mms")
+    cur.execute(
+        """
+        CREATE VIEW v_mms AS
+        SELECT
+            m.id,
+            m.name          AS 劇本,
+            m.period        AS 時長,
+            m.price         AS 售價,
+            m.booking_cost  AS 訂金,
+            m.players       AS 人數,
+            m.waitlist_limit AS 候補上限,
+            m.status        AS 狀態,
+            m.gm1_name      AS 角色1,
+            (SELECT string_agg(u.name, '、' ORDER BY u.id)
+               FROM users u WHERE u.id = ANY(m.gm1_user)) AS 角色1可帶,
+            m.gm2_name      AS 角色2,
+            (SELECT string_agg(u.name, '、' ORDER BY u.id)
+               FROM users u WHERE u.id = ANY(m.gm2_user)) AS 角色2可帶,
+            m.gm3_name      AS 角色3,
+            (SELECT string_agg(u.name, '、' ORDER BY u.id)
+               FROM users u WHERE u.id = ANY(m.gm3_user)) AS 角色3可帶,
+            m.gm4_name      AS 角色4,
+            (SELECT string_agg(u.name, '、' ORDER BY u.id)
+               FROM users u WHERE u.id = ANY(m.gm4_user)) AS 角色4可帶
+        FROM mms m
+        """
+    )
 
 
 def _drop_legacy_mms_gm(cur) -> None:
