@@ -73,7 +73,15 @@ def _ensure_users(cur) -> None:
             email TEXT NOT NULL UNIQUE,
             name TEXT,
             role INTEGER NOT NULL CHECK (role IN (1, 2, 3)),
-            status TEXT NOT NULL DEFAULT 'active'
+            status TEXT NOT NULL DEFAULT 'active',
+
+            -- 聯絡方式。兩者都可為空——玩家可能只留其中一種，
+            -- 主持人要聯絡時挑有值的那個用。
+            -- 刻意用 TEXT 不做格式驗證：LINE ID 沒有固定格式，
+            -- 電話也可能是市話、分機、或帶國碼的寫法，在資料庫層
+            -- 卡格式只會擋掉合法但沒預期到的輸入。
+            line_id TEXT,
+            phone TEXT
         )
         """
     )
@@ -248,6 +256,20 @@ def _ensure_booking_record(cur) -> None:
             -- 「目前的定價」，會隨時間調整；這裡要的是「這筆預約當下收了多少」，
             -- 事後查帳不能被之後的改價影響。
             deposit INTEGER NOT NULL DEFAULT 0,
+
+            -- 主持人／管理員的備註欄。取消原因與取消時間、改期、
+            -- 特殊需求、付款狀況等都寫在這裡。
+            --
+            -- 刻意不為「取消時間」另開一個 cancelled_at 欄位：那個值只在
+            -- status = 'cancelled' 時有意義，其餘時候永遠是 NULL，而且
+            -- 一旦有了欄位就會冒出「欄位有值但 status 不是 cancelled」
+            -- 這種對不起來的狀態要處理。備註是給人讀的自由文字，
+            -- 不參與任何查詢或計算，放在這裡剛好。
+            --
+            -- 若之後真的需要「查出某段期間內被取消的場次」這類功能，
+            -- 那要的是完整的狀態變更歷程（誰、何時、從什麼狀態改成什麼），
+            -- 屆時應該另開一張 booking_status_log，而不是在這裡補單一欄位。
+            note TEXT,
 
             -- 這場實際由誰主持，對應 mms.gm{n}_name 的四個角色。
             -- NULL 代表該劇本沒有這個角色，或尚未指定。
