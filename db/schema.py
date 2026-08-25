@@ -2,10 +2,9 @@
 全站資料庫 schema 建立/遷移，集中在這一支檔案，不要分散在各個模組裡。
 
 建立順序有相依性，不能隨便調換：
-1. users（帳號）——mms_gm.user_id、booking_record.player_id 會參照這裡
-2. mms（可提供服務的劇本）——mms_gm.mms_id、booking_record.mms_id 會參照
-3. mms_gm（劇本的主持人角色 ←→ 能擔任該角色的主持人，多對多）
-4. booking_record（預定場次）
+1. users（帳號）——booking_record.player_id、gm{n}_user_id 會參照這裡
+2. mms（可提供服務的劇本）——booking_record.mms_id 會參照這裡
+3. booking_record（預定場次）
 
 只支援 Postgres（Neon）。冪等操作（CREATE TABLE IF NOT EXISTS、補欄位前
 先檢查），但只需要在這個 process 生命週期裡成功跑過一次——第一次成功後
@@ -46,10 +45,23 @@ def ensure_schema(cur) -> None:
 
         _ensure_users(cur)
         _ensure_mms(cur)
-        _ensure_mms_gm(cur)
         _ensure_booking_record(cur)
+        _drop_legacy_mms_gm(cur)
 
         _schema_ready = True
+
+
+def _drop_legacy_mms_gm(cur) -> None:
+    """移除舊的 mms_gm 資料表。
+
+    早期版本把「哪些主持人會哪個角色」拆成獨立的 junction table，後來改回
+    mms.gm{n}_user 陣列（理由見 _ensure_mms）。這行讓已經建過那張表的資料庫
+    跟著清乾淨，對全新的資料庫是無害的空操作。
+
+    確認沒有其他東西依賴它之後才刪，所以不需要 CASCADE——如果哪天真的有
+    外部依賴，讓它報錯比靜靜連帶刪掉安全。
+    """
+    cur.execute("DROP TABLE IF EXISTS mms_gm")
 
 
 def _ensure_users(cur) -> None:
@@ -90,11 +102,24 @@ def _ensure_users(cur) -> None:
 def _ensure_mms(cur) -> None:
     """可提供服務的劇本。
 
-    gm1_name ~ gm4_name 是「這個劇本需要幾個主持人角色、各叫什麼名字」。
+    gm{n}_name 是「這個劇本需要幾個主持人角色、各叫什麼名字」，
     為空代表這個劇本沒有這個角色（例如只需要一位主持人的劇本，
     gm2_name ~ gm4_name 全為 NULL）。
 
-    「誰能擔任這些角色」不在這張表裡，見 mms_gm 的說明。
+    gm{n}_user 是「有哪些主持人會這個角色」，用 INTEGER[] 存一組 users.id。
+    同一個角色可以有好幾位主持人都會，玩家預約時從中挑一位——每一場遊戲
+    只會有一位主持人，不是共同擔任。
+
+    為什麼用陣列而不是 junction table：
+    陣列元素沒辦法建外鍵，理論上會有「指向不存在使用者」的風險，但這個
+    專案不會真的刪除帳號——停用只是把 status 改掉並清空個資，users 那一列
+    永遠留著，id 也就永遠有效。既然孤兒 id 不會發生，junction table 換來的
+    保護是空的，只剩多一張表的理解成本。
+
+    陣列反而讓一條原本表達不出來的規則變得可以強制：
+    「gm{n}_name 為空時，gm{n}_user 必然為空」。這兩個欄位現在同表，
+    寫成 CHECK 約束即可（見下方 _ensure_mms_gm_constraints）；
+    分成兩張表時這條規則跨表，只能靠應用層自律。
     """
     cur.execute(
         """
@@ -124,53 +149,45 @@ def _ensure_mms(cur) -> None:
             gm3_name TEXT,
             gm4_name TEXT,
 
+            -- 會這個角色的主持人（users.id 的集合）。空陣列代表還沒指派。
+            gm1_user INTEGER[] NOT NULL DEFAULT '{}',
+            gm2_user INTEGER[] NOT NULL DEFAULT '{}',
+            gm3_user INTEGER[] NOT NULL DEFAULT '{}',
+            gm4_user INTEGER[] NOT NULL DEFAULT '{}',
+
             status TEXT NOT NULL DEFAULT 'active'
         )
         """
     )
+    # 既有資料庫補欄位（全新建立的已經在上面的 CREATE TABLE 裡了）
+    existing = _existing_columns(cur, "mms")
+    for n in (1, 2, 3, 4):
+        if f"gm{n}_user" not in existing:
+            cur.execute(
+                f"ALTER TABLE mms ADD COLUMN gm{n}_user INTEGER[] NOT NULL DEFAULT '{{}}'"
+            )
+
+    _ensure_mms_gm_constraints(cur)
 
 
-def _ensure_mms_gm(cur) -> None:
-    """劇本的主持人角色 ←→ 能擔任該角色的主持人。多對多。
+def _ensure_mms_gm_constraints(cur) -> None:
+    """強制「沒有這個角色，就不能有人被指派到這個角色」。
 
-    為什麼不是 mms.gm1_user / gm2_user / ... 這樣的欄位：
-    同一個劇本的同一個主持人角色，可以有好幾位主持人都會，玩家預約時
-    從中挑一位。一個欄位存不下多個值——硬要存就得用陣列或逗號分隔字串，
-    兩者都無法建立外鍵約束（Postgres 的 FK 不能作用在陣列元素上），
-    等於放棄「這個 user_id 真的存在」這層保護，之後刪除帳號時會留下
-    指向不存在使用者的殘骸。用 junction table 是這個關係的正確表達方式。
+    gm{n}_name 為 NULL（劇本沒有這個角色）時，gm{n}_user 必須是空陣列。
+    這條規則在 gm{n}_user 還是獨立資料表的時候跨兩張表、寫不成 CHECK；
+    現在兩個欄位同表，資料庫可以自己擋下矛盾的資料。
 
-    這張表同時也回答了反方向的問題「這位主持人會哪些劇本」——
-    查 `SELECT DISTINCT mms_id FROM mms_gm WHERE user_id = ?` 即可，
-    所以 users 表不需要再開一個 mms 欄位（那會是同一份資料的第二個副本，
-    兩邊遲早不一致）。
-
-    未強制、需由應用層維護的規則：
-    若 mms.gm{n}_name 為 NULL（劇本沒有這個角色），就不該存在對應
-    gm_slot = n 的資料列。這個規則跨兩張表，用 CHECK 約束表達不了，
-    要用 trigger 才行——但 trigger 會讓「為什麼插入失敗」變得難以追查，
-    在只有一處寫入路徑的情況下不划算。改為在新增/修改劇本的 API 裡檢查。
+    先 DROP 再 ADD 是為了冪等——同一個 process 重跑不會因為約束已存在而失敗，
+    改了條件內容之後也會換成新版本。
     """
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS mms_gm (
-            id SERIAL PRIMARY KEY,
-            mms_id INTEGER NOT NULL REFERENCES mms(id) ON DELETE CASCADE,
-
-            -- 對應 mms.gm{n}_name 的 n
-            gm_slot INTEGER NOT NULL CHECK (gm_slot BETWEEN 1 AND 4),
-
-            user_id INTEGER NOT NULL REFERENCES users(id),
-
-            -- 同一個劇本的同一個角色，同一位主持人只能登記一次
-            UNIQUE (mms_id, gm_slot, user_id)
+    for n in (1, 2, 3, 4):
+        cur.execute(f"ALTER TABLE mms DROP CONSTRAINT IF EXISTS gm{n}_slot_consistent")
+        cur.execute(
+            f"""
+            ALTER TABLE mms ADD CONSTRAINT gm{n}_slot_consistent
+            CHECK (gm{n}_name IS NOT NULL OR cardinality(gm{n}_user) = 0)
+            """
         )
-        """
-    )
-    # 查詢方向一：某劇本某角色有哪些主持人可選（玩家預約時的下拉選單）
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mms_gm_mms ON mms_gm (mms_id, gm_slot)")
-    # 查詢方向二：某主持人會哪些劇本（主持人的個人頁）
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mms_gm_user ON mms_gm (user_id)")
 
 
 def _ensure_booking_record(cur) -> None:

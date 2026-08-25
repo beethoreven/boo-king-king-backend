@@ -36,7 +36,7 @@ from db.schema import ensure_schema  # noqa: E402
 # 範例資料一律用這個前綴，--clean 靠它辨識該刪哪些，不會碰到真實帳號。
 SEED_PREFIX = "booking-king-verify"
 
-EXPECTED_TABLES = ["users", "mms", "mms_gm", "booking_record"]
+EXPECTED_TABLES = ["users", "mms", "booking_record"]
 
 
 def _print_header(title: str) -> None:
@@ -132,29 +132,26 @@ def seed(cur) -> None:
         user_ids[label] = cur.fetchone()[0]
     print(f"    users        新增/更新 {len(user_ids)} 筆")
 
-    # 一個需要兩位主持人的劇本
+    # 一個需要兩位主持人的劇本。
+    # 角色 1 有兩位主持人可選、角色 2 只有一位、角色 3/4 這個劇本沒有。
     cur.execute(
         """
         INSERT INTO mms (name, period, price, booking_cost, players,
-                         gm1_name, gm2_name, waitlist_limit)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                         gm1_name, gm2_name, gm1_user, gm2_user, waitlist_limit)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
-        (f"{SEED_PREFIX} 範例劇本", 3.5, 1200, 300, "6-8 人", "主控", "NPC", 3),
+        (
+            f"{SEED_PREFIX} 範例劇本", 3.5, 1200, 300, "6-8 人",
+            "主控", "NPC",
+            [user_ids["gm-alice"], user_ids["gm-bob"]],
+            [user_ids["gm-alice"]],
+            3,
+        ),
     )
     mms_id = cur.fetchone()[0]
     print(f"    mms          新增 1 筆 (id={mms_id}, 時長 3.5h, 訂金 300)")
-
-    # 角色 1 有兩位主持人可選、角色 2 只有一位
-    for slot, label in [(1, "gm-alice"), (1, "gm-bob"), (2, "gm-alice")]:
-        cur.execute(
-            """
-            INSERT INTO mms_gm (mms_id, gm_slot, user_id) VALUES (%s, %s, %s)
-            ON CONFLICT (mms_id, gm_slot, user_id) DO NOTHING
-            """,
-            (mms_id, slot, user_ids[label]),
-        )
-    print("    mms_gm       新增 3 筆 (角色1 可選 2 位、角色2 可選 1 位)")
+    print("                 角色1 可選 2 位主持人、角色2 可選 1 位、角色3/4 不存在")
 
     # 三組玩家搶同一個時段。created_at 用 DEFAULT NOW()，插入先後即順位。
     for label in ["player-1", "player-2", "player-3"]:
@@ -199,6 +196,32 @@ def show_waitlist(cur) -> None:
         print(f"    {date} {time}  #{position} {name:<12} {status:<12} {tag}")
 
 
+def check_gm_constraint(cur) -> bool:
+    """確認「沒有這個角色就不能指派主持人」的 CHECK 約束真的會擋。
+
+    刻意寫入一筆矛盾資料（gm3_name 為空、卻指派了 gm3_user），預期被資料庫
+    拒絕。如果它竟然寫進去了，代表約束沒建起來，這比沒驗證更危險——
+    會讓人以為有保護。用 SAVEPOINT 包起來，失敗後回捲不影響外層交易。
+    """
+    _print_header("約束驗證：沒有的角色不能指派主持人")
+    cur.execute("SAVEPOINT constraint_probe")
+    try:
+        cur.execute(
+            """
+            INSERT INTO mms (name, gm1_name, gm3_user) VALUES (%s, %s, %s)
+            """,
+            (f"{SEED_PREFIX} 違規測試", "主控", [1]),
+        )
+    except Exception as exc:  # noqa: BLE001 - 這裡預期會失敗，型別不重要
+        cur.execute("ROLLBACK TO SAVEPOINT constraint_probe")
+        name = type(exc).__name__
+        print(f"    ✓ 寫入被拒絕（{name}）——gm3_name 為空時不接受 gm3_user")
+        return True
+    cur.execute("ROLLBACK TO SAVEPOINT constraint_probe")
+    print("    ✗ 矛盾資料竟然寫入成功——CHECK 約束沒有生效")
+    return False
+
+
 def clean(cur) -> None:
     _print_header("清除範例資料")
     # 先刪參照方（booking_record / mms_gm），再刪被參照方，否則外鍵會擋。
@@ -207,11 +230,6 @@ def clean(cur) -> None:
         (f"{SEED_PREFIX}%",),
     )
     print(f"    booking_record 刪除 {cur.rowcount} 筆")
-    cur.execute(
-        "DELETE FROM mms_gm WHERE mms_id IN (SELECT id FROM mms WHERE name LIKE %s)",
-        (f"{SEED_PREFIX}%",),
-    )
-    print(f"    mms_gm         刪除 {cur.rowcount} 筆")
     cur.execute("DELETE FROM mms WHERE name LIKE %s", (f"{SEED_PREFIX}%",))
     print(f"    mms            刪除 {cur.rowcount} 筆")
     cur.execute("DELETE FROM users WHERE email LIKE %s", (f"{SEED_PREFIX}%",))
@@ -285,10 +303,12 @@ def main() -> int:
 
                 show_counts(cur)
                 show_waitlist(cur)
+                constraint_ok = check_gm_constraint(cur)
                 sequences_ok = check_sequences(cur)
+                conn.commit()
 
         print()
-        if structure_ok and sequences_ok:
+        if structure_ok and sequences_ok and constraint_ok:
             print("結果：通過")
             return 0
         print("結果：有問題，見上面標示 ✗ 的項目")
