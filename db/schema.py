@@ -46,8 +46,43 @@ def ensure_schema(cur) -> None:
         _ensure_users(cur)
         _ensure_mmg(cur)
         _ensure_booking_record(cur)
+        _ensure_sessions(cur)
 
         _schema_ready = True
+
+
+def _ensure_sessions(cur) -> None:
+    """應用程式自己簽發的登入 session。
+
+    這張表存在的理由，是把「Google 證明了你的身分」跟「你這次登入還有效」
+    這兩件事分開。Google ID Token 大約一小時就過期，那是它的設計目的——
+    它要證明的是「此刻這確實是一個 Google 認證過的身分」，不是「這個人接下來
+    整段時間都有權限」。若拿 ID Token 當每次 API 呼叫的憑證，使用者會在
+    登入約一小時後被無預警登出，而且所有手動測試都測不出來（測試流程通常
+    幾分鐘就結束）。
+
+    對預約系統來說，最糟的觸發時機是玩家填完資料、按下送出的那一刻。
+
+    token 是 secrets.token_hex(32) 產生的隨機字串，不是 JWT——前端不需要
+    解析它的內容，只需要原樣帶回來。不可解析反而是優點：沒有人會想從裡面
+    讀權限資訊，權限一律當場查資料庫。
+
+    有效期是「滑動窗口」：每次成功查驗都更新 last_seen_at，只有連續
+    SESSION_IDLE_DAYS 天完全沒有任何請求才過期，不是固定時鐘到點就失效。
+    這讓「不要在使用中途登出使用者」成為結構上的保證，而不是靠額外補丁。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    # 「把某個使用者的所有 session 一次撤銷」會用到（停用帳號時）
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_email ON sessions (email)")
 
 
 def _ensure_users(cur) -> None:
