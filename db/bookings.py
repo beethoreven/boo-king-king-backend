@@ -588,39 +588,66 @@ def _paged(cur, sql: str, params: dict, row_to_item) -> dict:
     return {"items": [row_to_item(r) for r in rows[:PAGE_SIZE]], "has_more": has_more}
 
 
-def host_dashboard(
+# 三個頁籤各自的 WHERE 條件與排序。差異只在這裡，其餘查詢結構共用。
+#
+# 待確認 vs 已確認的分野，是「這個人自己的 gm{n}_confirmed」，不是整筆
+# 的 status——一齣戲兩位主持人，我確認了、對方還沒確認時，整筆 status
+# 仍是 gm_confirm，但這場對「我」而言已經確認過了，該出現在已確認
+# （顯示「等待其他主持確認」），不是待確認（那裡不該再讓我按一次）。
+_TABS = {
+    "pending": {
+        "where": f"AND b.status = 'gm_confirm' AND NOT COALESCE({_HOST_CONFIRMED}, false)",
+        "order": "b.session_date, b.session_time",
+    },
+    "confirmed": {
+        "where": f"""AND (
+                 b.status IN ('gm_reviewed', 'booked')
+                 OR (b.status = 'gm_confirm' AND {_HOST_CONFIRMED})
+               )""",
+        "order": "b.session_date, b.session_time",
+    },
+    "ended": {
+        "where": "AND b.status = 'ended'",
+        "order": "b.session_date DESC, b.session_time DESC",
+    },
+}
+
+
+def host_tab(
     cur,
     host_id: int,
+    tab: str,
     *,
-    pending_start: int = 1,
-    confirmed_start: int = 1,
-    ended_start: int = 1,
+    start: int = 1,
     filters: dict | None = None,
 ) -> dict:
-    """主持人介面三個頁籤要的資料，一次撈完（一支函式對應一支 API）。
+    """撈主持人介面「某一個頁籤」的一頁資料。
 
-    三包各自獨立分頁，每頁固定 50 筆——`*_start` 是 1-based 的起始筆數
-    （1、51、101...），對應畫面上「換頁」的箭頭；基礎操作（打開頁面、
-    切換頁籤）只需要每包的第一頁，一支 API 打完。只有使用者主動點了
-    某一包的「下一頁」，才需要為那一包單獨帶新的 start 重打。
+    分頁與篩選都是當前頁籤的事，不影響另外兩個頁籤——所以它們是這支
+    函式的參數，而不是 host_dashboard() 的。使用者翻頁或按下篩選時，
+    前端只針對當前頁籤呼叫這支，另外兩包維持畫面上既有的內容。
 
-    待確認 vs 已確認的分野，是「這個人自己的 gm{n}_confirmed」，不是整筆
-    的 status——一齣戲兩位主持人，我確認了、對方還沒確認時，整筆 status
-    仍是 gm_confirm，但這場對「我」而言已經確認過了，該出現在已確認
-    （顯示「等待其他主持確認」），不是待確認（那裡不該再讓我按一次）。
-    因為這個分野不是單純的 status 相等，待確認/已確認拆成兩支各自
-    獨立的 SQL，各自的 WHERE 直接表達自己的條件，而不是撈同一批
-    再用 Python 拆——那樣做分頁的話，兩包的 LIMIT/OFFSET 會互相打架。
+    start 是 1-based 的起始筆數（1、51、101...）。換篩選條件時前端要把
+    start 重設回 1——舊的頁碼在新條件下可能根本不存在。
 
-    filters 是選填的篩選條件（全部欄位都可省略，省略＝不篩）：
+    filters 全部欄位都可省略（省略＝不篩）：
         mmg_name / player_name / role_name  字串，包含比對、不分大小寫
         session_date                        date，精確等於
         session_time                        time，精確等於
-        status                              只作用於已確認頁籤
-    篩選是使用者按下「篩選」按鈕才送出的（不是每改一格就打一次），
-    換條件時前端應該把三包的 *_start 都重設回 1——舊的頁碼在新條件下
-    可能根本不存在。
+        status                              只對 confirmed 頁籤有意義；
+                                            另兩個頁籤各自只有一種狀態，
+                                            傳了也不會有作用（見下）
     """
+    if tab not in _TABS:
+        raise BookingError(f"未知的頁籤「{tab}」")
+
+    # 待確認永遠只有 gm_confirm、已結束永遠只有 ended，對它們篩狀態
+    # 等於沒篩或直接清空；狀態篩選器在畫面上也只出現在已確認頁籤。
+    effective = dict(filters or {})
+    if tab != "confirmed":
+        effective.pop("status", None)
+
+    where, fp = _filter_clauses(effective)
 
     def item(r):
         return {
@@ -629,15 +656,8 @@ def host_dashboard(
             "status": r[5], "status_label": STATUS_LABEL[r[5]], "role_name": r[6],
         }
 
-    where, fp = _filter_clauses(filters)
-    # 「狀態」篩選只對已確認頁籤有意義（另兩個頁籤各自只有一種狀態），
-    # 所以待確認／已結束在套用篩選時把它拿掉，避免使用者在已確認頁籤
-    # 選了狀態之後，另外兩包被一個對它們沒有意義的條件清空。
-    where_no_status, fp_no_status = _filter_clauses(
-        {k: v for k, v in (filters or {}).items() if k != "status"}
-    )
-
-    pending = _paged(
+    spec = _TABS[tab]
+    return _paged(
         cur,
         f"""
         SELECT b.id, m.name, u.name, b.session_date, b.session_time, b.status,
@@ -646,56 +666,24 @@ def host_dashboard(
           JOIN mmg m   ON m.id = b.mmg_id
           JOIN users u ON u.id = b.player_id
          WHERE %(host)s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
-           AND b.status = 'gm_confirm'
-           AND NOT COALESCE({_HOST_CONFIRMED}, false)
-           {where_no_status}
-         ORDER BY b.session_date, b.session_time
-         LIMIT %(limit)s OFFSET %(offset)s
-        """,
-        {"host": host_id, "offset": pending_start - 1, **fp_no_status},
-        item,
-    )
-
-    confirmed = _paged(
-        cur,
-        f"""
-        SELECT b.id, m.name, u.name, b.session_date, b.session_time, b.status,
-               {_HOST_ROLE_NAME} AS role_name
-          FROM booking_record b
-          JOIN mmg m   ON m.id = b.mmg_id
-          JOIN users u ON u.id = b.player_id
-         WHERE %(host)s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
-           AND (
-                 b.status IN ('gm_reviewed', 'booked')
-                 OR (b.status = 'gm_confirm' AND {_HOST_CONFIRMED})
-               )
+           {spec["where"]}
            {where}
-         ORDER BY b.session_date, b.session_time
+         ORDER BY {spec["order"]}
          LIMIT %(limit)s OFFSET %(offset)s
         """,
-        {"host": host_id, "offset": confirmed_start - 1, **fp},
+        {"host": host_id, "offset": start - 1, **fp},
         item,
     )
 
-    ended = _paged(
-        cur,
-        f"""
-        SELECT b.id, m.name, u.name, b.session_date, b.session_time, b.status,
-               {_HOST_ROLE_NAME} AS role_name
-          FROM booking_record b
-          JOIN mmg m   ON m.id = b.mmg_id
-          JOIN users u ON u.id = b.player_id
-         WHERE %(host)s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
-           AND b.status = 'ended'
-           {where_no_status}
-         ORDER BY b.session_date DESC, b.session_time DESC
-         LIMIT %(limit)s OFFSET %(offset)s
-        """,
-        {"host": host_id, "offset": ended_start - 1, **fp_no_status},
-        item,
-    )
 
-    return {"pending": pending, "confirmed": confirmed, "ended": ended}
+def host_dashboard(cur, host_id: int) -> dict:
+    """主持人介面初次載入：三個頁籤各拿第一頁，一支 API 打完。
+
+    只給「剛打開頁面」用，刻意不收分頁與篩選參數——那兩件事都只作用於
+    當前頁籤，走 host_tab() 單獨拿即可，不需要為了改動一個頁籤而把
+    另外兩個也重查一次。
+    """
+    return {tab: host_tab(cur, host_id, tab) for tab in _TABS}
 
 
 def mark_ended(cur, booking_id: int) -> dict:
