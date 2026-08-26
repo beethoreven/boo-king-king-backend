@@ -301,7 +301,7 @@ def list_slot(cur, mmg_id: int, session_date, session_time) -> list[tuple]:
 #   gm_reviewed  主持人已審閱
 #   booked       已成立
 #   cancelled    已取消
-VALID_STATUSES = ("gm_confirm", "gm_reviewed", "booked", "cancelled")
+VALID_STATUSES = ("gm_confirm", "gm_reviewed", "booked", "ended", "cancelled")
 
 
 def get_booking(cur, booking_id: int) -> dict | None:
@@ -440,6 +440,237 @@ def record_deposit(cur, booking_id: int, amount: int) -> dict:
             raise BookingError(f"預約 id={booking_id} 不存在")
         raise BookingError("已取消的預約不能記錄訂金")
     return get_booking(cur, booking_id)
+
+
+def confirm_host(cur, booking_id: int, host_id: int) -> dict:
+    """某位主持人確認自己在這場的指定。
+
+    只有 status 還是 gm_confirm 時才能確認——已經 gm_reviewed 以後代表
+    全部人都確認過了，沒有「重新確認」這個動作；已取消／已結束更不用說。
+
+    「確認」針對的是這個人，不是這一格：萬一同一位主持人剛好同時佔了
+    這場的兩個角色（前端字串比對會擋，但後端不假設前端一定擋得住），
+    一次確認會把他佔的每一格都標記，不需要對同一個人分別按兩次。
+
+    確認完之後，若全部被指定的角色都確認過了，這句 UPDATE 一併把整筆
+    status 從 gm_confirm 轉成 gm_reviewed，不留給呼叫端另外判斷——
+    跟 record_deposit() 的轉態方式是同一個原則：轉態條件在寫入的那一刻
+    由資料庫自己算。
+    """
+    # COALESCE(...,false) 每一個都不能省：gm{n}_user_id 是 NULL 時
+    # (gm{n}_user_id = %(host)s) 在 SQL 三值邏輯下算出來是 NULL，
+    # 不是 false，而 `false OR NULL` 還是 NULL——寫進 NOT NULL 欄位
+    # 直接違反約束（實測撞過：NotNullViolation on gm4_confirmed）。
+    cur.execute(
+        """
+        UPDATE booking_record
+           SET gm1_confirmed = gm1_confirmed OR COALESCE(gm1_user_id = %(host)s, false),
+               gm2_confirmed = gm2_confirmed OR COALESCE(gm2_user_id = %(host)s, false),
+               gm3_confirmed = gm3_confirmed OR COALESCE(gm3_user_id = %(host)s, false),
+               gm4_confirmed = gm4_confirmed OR COALESCE(gm4_user_id = %(host)s, false)
+         WHERE id = %(id)s
+           AND status = 'gm_confirm'
+           AND %(host)s IN (gm1_user_id, gm2_user_id, gm3_user_id, gm4_user_id)
+        RETURNING
+            (gm1_user_id IS NULL OR gm1_confirmed)
+        AND (gm2_user_id IS NULL OR gm2_confirmed)
+        AND (gm3_user_id IS NULL OR gm3_confirmed)
+        AND (gm4_user_id IS NULL OR gm4_confirmed)
+        """,
+        {"host": host_id, "id": booking_id},
+    )
+    row = cur.fetchone()
+    if row is None:
+        cur.execute("SELECT status FROM booking_record WHERE id = %s", (booking_id,))
+        existing = cur.fetchone()
+        if existing is None:
+            raise BookingError(f"預約 id={booking_id} 不存在")
+        if existing[0] != "gm_confirm":
+            raise BookingError("這筆預約已經不在待確認狀態")
+        raise BookingError("你不是這場預約指定的主持人")
+
+    if row[0]:
+        cur.execute(
+            "UPDATE booking_record SET status = 'gm_reviewed' "
+            "WHERE id = %s AND status = 'gm_confirm'",
+            (booking_id,),
+        )
+    return get_booking(cur, booking_id)
+
+
+STATUS_LABEL = {
+    "gm_confirm": "等待其他主持確認",
+    "gm_reviewed": "等待訂金支付",
+    "booked": "場次已確認",
+    "ended": "已結束",
+    "cancelled": "已取消",
+}
+
+
+_HOST_ROLE_NAME = """
+    CASE WHEN b.gm1_user_id = %(host)s THEN m.gm1_name
+         WHEN b.gm2_user_id = %(host)s THEN m.gm2_name
+         WHEN b.gm3_user_id = %(host)s THEN m.gm3_name
+         WHEN b.gm4_user_id = %(host)s THEN m.gm4_name
+    END
+"""
+
+_HOST_CONFIRMED = """
+    CASE WHEN b.gm1_user_id = %(host)s THEN b.gm1_confirmed
+         WHEN b.gm2_user_id = %(host)s THEN b.gm2_confirmed
+         WHEN b.gm3_user_id = %(host)s THEN b.gm3_confirmed
+         WHEN b.gm4_user_id = %(host)s THEN b.gm4_confirmed
+    END
+"""
+
+PAGE_SIZE = 50
+
+
+def _paged(cur, sql: str, params: dict, row_to_item) -> dict:
+    """撈一頁，多要一筆判斷還有沒有下一頁，回傳前把那多要的一筆丟掉。
+
+    不用 COUNT(*) 另外查總數——分頁箭頭只需要知道「有沒有下一頁」，
+    不需要知道「總共幾頁」，COUNT 一次全表在候補/場次這種會員不斷長大
+    的表上是白花的成本。
+    """
+    cur.execute(sql, {**params, "limit": PAGE_SIZE + 1})
+    rows = cur.fetchall()
+    has_more = len(rows) > PAGE_SIZE
+    return {"items": [row_to_item(r) for r in rows[:PAGE_SIZE]], "has_more": has_more}
+
+
+def host_dashboard(
+    cur, host_id: int, *, pending_start: int = 1, confirmed_start: int = 1, ended_start: int = 1
+) -> dict:
+    """主持人介面三個頁籤要的資料，一次撈完（一支函式對應一支 API）。
+
+    三包各自獨立分頁，每頁固定 50 筆——`*_start` 是 1-based 的起始筆數
+    （1、51、101...），對應畫面上「換頁」的箭頭；基礎操作（打開頁面、
+    切換頁籤）只需要每包的第一頁，一支 API 打完。只有使用者主動點了
+    某一包的「下一頁」，才需要為那一包單獨帶新的 start 重打。
+
+    待確認 vs 已確認的分野，是「這個人自己的 gm{n}_confirmed」，不是整筆
+    的 status——一齣戲兩位主持人，我確認了、對方還沒確認時，整筆 status
+    仍是 gm_confirm，但這場對「我」而言已經確認過了，該出現在已確認
+    （顯示「等待其他主持確認」），不是待確認（那裡不該再讓我按一次）。
+    因為這個分野不是單純的 status 相等，待確認/已確認拆成兩支各自
+    獨立的 SQL，各自的 WHERE 直接表達自己的條件，而不是撈同一批
+    再用 Python 拆——那樣做分頁的話，兩包的 LIMIT/OFFSET 會互相打架。
+    """
+
+    def item(r):
+        return {
+            "id": r[0], "mmg_name": r[1], "player_name": r[2],
+            "session_date": r[3].isoformat(), "session_time": r[4].strftime("%H:%M"),
+            "status": r[5], "status_label": STATUS_LABEL[r[5]], "role_name": r[6],
+        }
+
+    pending = _paged(
+        cur,
+        f"""
+        SELECT b.id, m.name, u.name, b.session_date, b.session_time, b.status,
+               {_HOST_ROLE_NAME} AS role_name
+          FROM booking_record b
+          JOIN mmg m   ON m.id = b.mmg_id
+          JOIN users u ON u.id = b.player_id
+         WHERE %(host)s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
+           AND b.status = 'gm_confirm'
+           AND NOT COALESCE({_HOST_CONFIRMED}, false)
+         ORDER BY b.session_date, b.session_time
+         LIMIT %(limit)s OFFSET %(offset)s
+        """,
+        {"host": host_id, "offset": pending_start - 1},
+        item,
+    )
+
+    confirmed = _paged(
+        cur,
+        f"""
+        SELECT b.id, m.name, u.name, b.session_date, b.session_time, b.status,
+               {_HOST_ROLE_NAME} AS role_name
+          FROM booking_record b
+          JOIN mmg m   ON m.id = b.mmg_id
+          JOIN users u ON u.id = b.player_id
+         WHERE %(host)s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
+           AND (
+                 b.status IN ('gm_reviewed', 'booked')
+                 OR (b.status = 'gm_confirm' AND {_HOST_CONFIRMED})
+               )
+         ORDER BY b.session_date, b.session_time
+         LIMIT %(limit)s OFFSET %(offset)s
+        """,
+        {"host": host_id, "offset": confirmed_start - 1},
+        item,
+    )
+
+    ended = _paged(
+        cur,
+        f"""
+        SELECT b.id, m.name, u.name, b.session_date, b.session_time, b.status,
+               {_HOST_ROLE_NAME} AS role_name
+          FROM booking_record b
+          JOIN mmg m   ON m.id = b.mmg_id
+          JOIN users u ON u.id = b.player_id
+         WHERE %(host)s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
+           AND b.status = 'ended'
+         ORDER BY b.session_date DESC, b.session_time DESC
+         LIMIT %(limit)s OFFSET %(offset)s
+        """,
+        {"host": host_id, "offset": ended_start - 1},
+        item,
+    )
+
+    return {"pending": pending, "confirmed": confirmed, "ended": ended}
+
+
+def mark_ended(cur, booking_id: int) -> dict:
+    """人工把一筆已成立的預約標記為結束。
+
+    只能從 booked 轉過來——沒收訂金、沒經過主持人審核的場次談不上
+    「結束」，那種情況要嘛還卡在審核流程，要嘛該走 cancel_booking。
+    """
+    cur.execute(
+        "UPDATE booking_record SET status = 'ended' "
+        "WHERE id = %s AND status = 'booked' RETURNING id",
+        (booking_id,),
+    )
+    if cur.fetchone() is None:
+        cur.execute("SELECT status FROM booking_record WHERE id = %s", (booking_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise BookingError(f"預約 id={booking_id} 不存在")
+        raise BookingError(f"只有已成立（booked）的預約能標記結束，目前狀態是「{row[0]}」")
+    return get_booking(cur, booking_id)
+
+
+def mark_ended_batch(cur) -> int:
+    """把所有「已成立、且場次時間加上劇本時長已經過去」的預約批次轉成
+    ended。設計成排程呼叫（建議每天 00:00 一次），不是每次查詢時即時
+    判斷——理由見 schema.py：status 欄位裡存的值才是唯一事實，不該讓
+    同一筆資料的狀態隨「現在幾點」在讀取當下臨時算出不同答案。
+
+    ★ 時區地雷：session_date/session_time 是不帶時區的「牆上時鐘」
+    （台北時間的字面值，約定成俗，見 schema.py 的說明），NOW() 回傳的
+    是有時區的當下瞬間。兩者不能直接比大小——(date+time)::timestamp
+    是一個裸值，拿去跟 NOW() 比較時，Postgres 會用「連線當下的 session
+    TimeZone 設定」去解讀它，如果那個設定剛好不是 Asia/Taipei（例如
+    連線預設是 UTC），比較結果會整整偏移 8 小時，讓場次提早或延後
+    被標記結束，而且不會報錯，只會默默算錯。用 `AT TIME ZONE
+    'Asia/Taipei'` 明確告訴 Postgres 這個裸值是台北時間，轉成正確的
+    時間點之後再跟 NOW() 比較，結果就不受連線的 session 設定影響。
+    """
+    cur.execute(
+        """
+        UPDATE booking_record b
+           SET status = 'ended'
+          FROM mmg m
+         WHERE b.mmg_id = m.id
+           AND b.status = 'booked'
+           AND (b.session_date + b.session_time) AT TIME ZONE 'Asia/Taipei'
+                 + (m.period * interval '1 hour') <= NOW()
+        """
+    )
+    return cur.rowcount
 
 
 def set_status(cur, booking_id: int, status: str, *, note: str | None = None) -> dict:

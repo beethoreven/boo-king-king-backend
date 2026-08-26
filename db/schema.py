@@ -234,11 +234,21 @@ def _ensure_booking_record(cur) -> None:
     （約定）。全系統統一以台北時間解讀 session_* 欄位。
 
     status 目前的值：
-        gm_confirm   等待主持人確認
-        gm_reviewed  主持人已審閱
-        booked       已成立
+        gm_confirm   等待主持人確認（尚有被指定的主持人還沒按確認）
+        gm_reviewed  主持人已審閱（全部被指定的主持人都確認過了）
+        booked       已成立（訂金已收足，見 record_deposit()）
+        ended        場次已結束
         cancelled    已取消
     （原始需求寫的是 gm_comfirm，是 confirm 的拼字錯誤，這裡用正確拼法。）
+
+    booked → ended 的轉換有兩條路：主持人／管理員手動標記，或是
+    mark_ended_batch() 排程（建議每天 00:00 跑一次）自動把
+    session_date+session_time+mmg.period 已經過去的 booked 場次批次
+    轉掉。刻意不做成「每次查詢就即時判斷已經過了沒有」——那會讓同一筆
+    資料的狀態隨著「現在幾點」而在读取當下臨時計算出不同答案，等於
+    status 有兩個事實來源（欄位裡存的值，跟查詢當下算出來的值）。
+    寫進資料庫的 status 才是唯一事實，批次工作負責讓它跟上時間，
+    不是每次讀取都重新猜一次。
 
     候補順位刻意「不存欄位、每次由 created_at 算出來」：
 
@@ -322,12 +332,26 @@ def _ensure_booking_record(cur) -> None:
             -- 屆時應該另開一張 booking_status_log，而不是在這裡補單一欄位。
             note TEXT,
 
-            -- 這場實際由誰主持，對應 mmg.gm{n}_name 的四個角色。
-            -- NULL 代表該劇本沒有這個角色，或尚未指定。
+            -- 這場實際由誰主持，對應 mmg.gm{n}_name 的四個角色，以及
+            -- 那位主持人是否已經確認這次指定。刻意讓 gm{n}_confirmed
+            -- 緊鄰 gm{n}_user_id，跟 mmg 表 gm{n}_name／gm{n}_user 相鄰
+            -- 的排列慣例一致——同一件事的兩個屬性放在一起，不用左右
+            -- 對照著找。NULL 的 user_id 代表該劇本沒有這個角色或尚未
+            -- 指定，此時對應的 confirmed 恆為 false，沒有意義但無害。
+            --
+            -- 全部被指定的角色都確認過（confirm_host() 判斷），才會把
+            -- status 從 gm_confirm 轉成 gm_reviewed。「確認」是針對
+            -- 「這個人」而不是「這一列資料」——同一位主持人若同時佔了
+            -- 這場的兩個角色，一次確認會把他佔的每一格都標記，見
+            -- confirm_host() 的說明。
             gm1_user_id INTEGER REFERENCES users(id),
+            gm1_confirmed BOOLEAN NOT NULL DEFAULT false,
             gm2_user_id INTEGER REFERENCES users(id),
+            gm2_confirmed BOOLEAN NOT NULL DEFAULT false,
             gm3_user_id INTEGER REFERENCES users(id),
+            gm3_confirmed BOOLEAN NOT NULL DEFAULT false,
             gm4_user_id INTEGER REFERENCES users(id),
+            gm4_confirmed BOOLEAN NOT NULL DEFAULT false,
 
             -- 冪等鍵。前端在玩家「按下預約」的當下產生一組 UUID，該次意圖的
             -- 所有重試都沿用同一組。寫入時搭配
@@ -356,3 +380,15 @@ def _ensure_booking_record(cur) -> None:
     )
     # 某玩家的預約紀錄
     cur.execute("CREATE INDEX IF NOT EXISTS idx_booking_player ON booking_record (player_id)")
+
+    # 既有資料庫補欄位。這裡補出來的欄位會排在最後面，拿不到上面
+    # CREATE TABLE 的相鄰順序——正式環境已用
+    # db/migrate_add_gm_confirmed.py 重建過一次表，這裡純粹是防呆：
+    # 就算漏跑那支腳本，這個專案至少也不會因為缺欄位而整個壞掉。
+    existing = _existing_columns(cur, "booking_record")
+    for n in (1, 2, 3, 4):
+        if f"gm{n}_confirmed" not in existing:
+            cur.execute(
+                f"ALTER TABLE booking_record ADD COLUMN gm{n}_confirmed "
+                f"BOOLEAN NOT NULL DEFAULT false"
+            )
