@@ -51,17 +51,36 @@ def _fetch_user(cur, email: str) -> dict | None:
     return {"id": uid, "email": mail, "name": name, "role": role, "status": status}
 
 
-def get_user(cur, email: str) -> dict | None:
-    """查使用者資料，帶短期快取。查不到回傳 None。"""
+def get_user(cur, email: str, *, fresh: bool = False) -> dict | None:
+    """查使用者資料，帶短期快取。查不到回傳 None。
+
+    fresh=True 會跳過快取直接查資料庫，並順便把結果寫回快取。
+
+    什麼時候該用 fresh：**會佔用稀缺資源的寫入路徑**。快取的代價是
+    「帳號被停用後，最多 _CACHE_TTL_SECONDS 秒內仍會被視為有效」。
+    對唯讀查詢來說那個窗口無所謂；但對「搶下一個場次名額」這種寫入，
+    在窗口內成立的預約會真的佔住位子，而停用帳號並不會把它吐回來——
+    要另外人工取消。
+
+    這個形狀是 zh-cn-to-tw 回饋過來的：他們的 job 一旦啟動就跑到完，
+    中途不再檢查授權，所以剛被停用的人在快取窗口內還能啟動一個
+    燒好幾分鐘 LLM 額度的工作。我們沒有那種長流程（預約是單一短交易），
+    但「窗口內取得的東西撤銷不回來」這件事是一樣的，而且我們的資源
+    有庫存、會被搶。
+
+    成本很低，值得用在預約寫入上：多一次索引查詢（同區約 4ms），
+    而預約的頻率是平時每天個位數、尖峰每分鐘幾十筆。
+    """
     key = (email or "").lower().strip()
     if not key:
         return None
 
     now = time.monotonic()
-    with _cache_lock:
-        hit = _cache.get(key)
-        if hit and hit[0] > now:
-            return hit[1]
+    if not fresh:
+        with _cache_lock:
+            hit = _cache.get(key)
+            if hit and hit[0] > now:
+                return hit[1]
 
     # 刻意在鎖外面查資料庫。鎖只保護那個 dict 的讀寫，不能包住網路操作——
     # 一旦把資料庫查詢放進鎖裡，任何一次連線變慢都會讓所有等著查權限的
@@ -73,9 +92,12 @@ def get_user(cur, email: str) -> dict | None:
     return user
 
 
-def is_permitted_user(cur, email: str) -> bool:
-    """這個 email 現在可以使用系統嗎。"""
-    user = get_user(cur, email)
+def is_permitted_user(cur, email: str, *, fresh: bool = False) -> bool:
+    """這個 email 現在可以使用系統嗎。
+
+    預約寫入路徑請傳 fresh=True，理由見 get_user。
+    """
+    user = get_user(cur, email, fresh=fresh)
     return bool(user and user["status"] == "active")
 
 
