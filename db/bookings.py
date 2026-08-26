@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 
 class BookingError(Exception):
@@ -52,6 +53,78 @@ def _lock_slot(cur, mmg_id: int, session_date, session_time) -> None:
         "SELECT pg_advisory_xact_lock(hashtext(%s))",
         (f"booking|{mmg_id}|{session_date}|{session_time}",),
     )
+
+
+def _lock_hosts(cur, host_ids: list[int]) -> None:
+    """鎖住這幾位主持人的行事曆，直到交易結束。
+
+    跟 _lock_slot 是同一個 TOCTOU 問題（查沒衝突→寫入，中間可能被插隊），
+    只是鎖的資源從「一個時段」換成「一位主持人的整個行事曆」——沒有這把鎖，
+    兩筆不同劇本／不同時段但共用同一位主持人的預約，可能同時通過衝突檢查、
+    同時寫入，讓這位主持人被排進兩場重疊的場次。
+
+    對不重複的 id 用排序過的順序逐一上鎖（sorted(set(...))）：多筆交易
+    如果各自要鎖好幾位主持人，鎖的順序不一致就會有死鎖風險（A 先鎖 1 再等 2，
+    B 先鎖 2 再等 1）；統一用同一個順序上鎖可以避免這個情況。
+    """
+    for host_id in sorted(set(host_ids)):
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"host|{host_id}",))
+
+
+def _has_mmg_conflict(cur, mmg_id: int, session_date, session_time, start, end) -> bool:
+    """這個劇本本身，在這段時間內是否已經有另一場（不同時段）真正成立
+    （status='booked'）的場次跟它重疊——包含首尾相接（無縫接軌也算衝突）。
+
+    刻意排除跟候選時段完全相同的 (session_date, session_time)：那些是
+    同一場遊戲的正選／候補隊伍，是候補容量機制在管的事，不是這裡要擋的
+    「劇本被排成兩場」。
+    """
+    cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM booking_record b
+            JOIN mmg m ON m.id = b.mmg_id
+            WHERE b.mmg_id = %s AND b.status = 'booked'
+              AND NOT (b.session_date = %s AND b.session_time = %s)
+              AND (b.session_date + b.session_time)::timestamp <= %s
+              AND %s <= (b.session_date + b.session_time)::timestamp
+                        + (m.period * interval '1 hour')
+        )
+        """,
+        (mmg_id, session_date, session_time, end, start),
+    )
+    return cur.fetchone()[0]
+
+
+def _conflicting_host(
+    cur, host_ids: list[int], mmg_id: int, session_date, session_time, start, end
+) -> int | None:
+    """host_ids 裡任何一位在這段時間有沒有別的（不同場次的）已成立預約，
+    回傳第一個撞期的 user id；都沒撞回傳 None。
+
+    排除條件是「跟候選場次完全相同的 (mmg_id, session_date, session_time)」，
+    不是「這位主持人」本身——同一場遊戲底下正選＋候補掛的是同一位主持人，
+    那是同一件事被記錄很多次，不是這位主持人被排了兩場不同的戲。
+    """
+    for host_id in host_ids:
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM booking_record b
+                JOIN mmg m ON m.id = b.mmg_id
+                WHERE b.status = 'booked'
+                  AND %s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
+                  AND NOT (b.mmg_id = %s AND b.session_date = %s AND b.session_time = %s)
+                  AND (b.session_date + b.session_time)::timestamp <= %s
+                  AND %s <= (b.session_date + b.session_time)::timestamp
+                            + (m.period * interval '1 hour')
+            )
+            """,
+            (host_id, mmg_id, session_date, session_time, end, start),
+        )
+        if cur.fetchone()[0]:
+            return host_id
+    return None
 
 
 def _validate_gm_choice(cur, mmg_id: int, gm_user_ids: list[int | None]) -> None:
@@ -109,14 +182,29 @@ def create_booking(
     都是新的意圖，冪等保護會失效。
     """
     request_id = request_id or str(uuid.uuid4())
+    host_ids = [i for i in gm_user_ids if i is not None]
 
     _lock_slot(cur, mmg_id, session_date, session_time)
+    _lock_hosts(cur, host_ids)
     _validate_gm_choice(cur, mmg_id, gm_user_ids)
 
-    # 容量 = 1 組正選 + waitlist_limit 組候補
-    cur.execute("SELECT name, waitlist_limit FROM mmg WHERE id = %s", (mmg_id,))
-    mms_name, waitlist_limit = cur.fetchone()
+    # 容量 = 1 組正選 + waitlist_limit 組候補；period 用來換算這場實際
+    # 佔用到幾點，供劇本／主持人的排程衝突檢查用。
+    cur.execute("SELECT name, waitlist_limit, period FROM mmg WHERE id = %s", (mmg_id,))
+    mms_name, waitlist_limit, period = cur.fetchone()
     capacity = 1 + waitlist_limit
+
+    start = datetime.combine(session_date, session_time)
+    end = start + timedelta(hours=float(period))
+
+    if _has_mmg_conflict(cur, mmg_id, session_date, session_time, start, end):
+        raise BookingError(f"《{mms_name}》這段時間已經排了另一場，時段衝突")
+
+    conflicting = _conflicting_host(cur, host_ids, mmg_id, session_date, session_time, start, end)
+    if conflicting is not None:
+        cur.execute("SELECT name FROM users WHERE id = %s", (conflicting,))
+        host_name = cur.fetchone()[0]
+        raise BookingError(f"{host_name}在這個時間有場次無法預定")
 
     cur.execute(
         "SELECT COUNT(*) FROM booking_record "
