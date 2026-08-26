@@ -471,6 +471,16 @@ def confirm_host(cur, booking_id: int, host_id: int) -> dict:
          WHERE id = %(id)s
            AND status = 'gm_confirm'
            AND %(host)s IN (gm1_user_id, gm2_user_id, gm3_user_id, gm4_user_id)
+           -- 這個人還沒確認過。少了這行，重複確認會靜靜地成功
+           -- （OR 是冪等的，true OR true 還是 true），呼叫端拿到 200
+           -- 卻什麼都沒發生——UI 上那一列早就變暗了，回一個假的成功
+           -- 比回錯誤更難查。
+           AND NOT (
+                 COALESCE(gm1_user_id = %(host)s AND gm1_confirmed, false)
+              OR COALESCE(gm2_user_id = %(host)s AND gm2_confirmed, false)
+              OR COALESCE(gm3_user_id = %(host)s AND gm3_confirmed, false)
+              OR COALESCE(gm4_user_id = %(host)s AND gm4_confirmed, false)
+           )
         RETURNING
             (gm1_user_id IS NULL OR gm1_confirmed)
         AND (gm2_user_id IS NULL OR gm2_confirmed)
@@ -481,13 +491,31 @@ def confirm_host(cur, booking_id: int, host_id: int) -> dict:
     )
     row = cur.fetchone()
     if row is None:
-        cur.execute("SELECT status FROM booking_record WHERE id = %s", (booking_id,))
+        # 沒更新到任何列。分辨是哪一種情況，回一個說得清楚的錯誤——
+        # 三種都回同一句話的話，主持人看到「你不是指定的主持人」
+        # 卻明明看得到這場，會不知道發生什麼事。
+        cur.execute(
+            """
+            SELECT status,
+                   COALESCE(%(host)s IN (gm1_user_id, gm2_user_id,
+                                         gm3_user_id, gm4_user_id), false),
+                   COALESCE(gm1_user_id = %(host)s AND gm1_confirmed, false)
+                OR COALESCE(gm2_user_id = %(host)s AND gm2_confirmed, false)
+                OR COALESCE(gm3_user_id = %(host)s AND gm3_confirmed, false)
+                OR COALESCE(gm4_user_id = %(host)s AND gm4_confirmed, false)
+              FROM booking_record WHERE id = %(id)s
+            """,
+            {"host": host_id, "id": booking_id},
+        )
         existing = cur.fetchone()
         if existing is None:
             raise BookingError(f"預約 id={booking_id} 不存在")
-        if existing[0] != "gm_confirm":
-            raise BookingError("這筆預約已經不在待確認狀態")
-        raise BookingError("你不是這場預約指定的主持人")
+        status, is_host, already = existing
+        if not is_host:
+            raise BookingError("你不是這場預約指定的主持人")
+        if already:
+            raise BookingError("你已經確認過這場預約了")
+        raise BookingError("這筆預約已經不在待確認狀態")
 
     if row[0]:
         cur.execute(

@@ -405,6 +405,105 @@ def set_booking_status(booking_id: int):
     return jsonify(updated)
 
 
+# ── 主持人介面 ──────────────────────────────────────────────────
+#
+# 權限一律 require_role(2)：那是「主持人以上」，管理員（role 1）因為
+# 階層關係本來就通過（判斷式是 role <= minimum，不是 role == minimum）。
+#
+# 但這些路由回傳的是「g.user 這個人自己被指定的場次」，不是全站場次——
+# 管理員登入主持人介面時，看到的是他自己以主持人身分被指定的那些，
+# 不是所有人的。管理員要看全站，是之後管理員介面的事，兩者刻意分開。
+
+def _parse_filters(args) -> dict:
+    """從 query string 取出篩選條件。空字串一律視為「不篩」，日期時間
+    格式錯誤直接丟 BookingError 讓呼叫端回 400，不要默默忽略——
+    使用者明明篩了卻沒有效果，比直接報錯難查得多。"""
+    f = {}
+    for key in ("mmg_name", "player_name", "role_name", "status"):
+        v = (args.get(key) or "").strip()
+        if v:
+            f[key] = v
+
+    raw_date = (args.get("session_date") or "").strip()
+    if raw_date:
+        try:
+            f["session_date"] = date.fromisoformat(raw_date)
+        except ValueError:
+            raise BookingError(f"日期格式錯誤：{raw_date}（需要 YYYY-MM-DD）") from None
+
+    raw_time = (args.get("session_time") or "").strip()
+    if raw_time:
+        try:
+            f["session_time"] = time.fromisoformat(
+                raw_time if len(raw_time) > 5 else raw_time + ":00"
+            )
+        except ValueError:
+            raise BookingError(f"時間格式錯誤：{raw_time}（需要 HH:MM）") from None
+
+    if f.get("status") and f["status"] not in bookings_db.CONFIRMED_TAB_STATUSES:
+        raise BookingError(f"未知的狀態篩選值「{f['status']}」")
+    return f
+
+
+@app.get("/api/host/dashboard")
+@require_role(2)
+def host_dashboard_route():
+    """主持人介面初次載入：三個頁籤各第一頁，一次拿完。
+
+    翻頁與篩選都不走這支——那兩件事只影響當前頁籤，走 /api/host/tab/<tab>
+    單獨拿，另外兩個頁籤維持畫面上既有的內容、不重查。
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            return jsonify(bookings_db.host_dashboard(cur, g.user["id"]))
+
+
+@app.get("/api/host/tab/<tab>")
+@require_role(2)
+def host_tab_route(tab: str):
+    """單一頁籤的一頁資料。翻頁（start）與篩選都在這裡。
+
+    start 是 1-based 起始筆數（1、51、101...）。換篩選條件時前端要把
+    start 重設回 1——舊頁碼在新條件下可能根本不存在。
+    """
+    try:
+        start = int(request.args.get("start", 1))
+    except ValueError:
+        return jsonify({"error": "start 必須是數字"}), 400
+    if start < 1:
+        return jsonify({"error": "start 必須大於 0"}), 400
+
+    try:
+        filters = _parse_filters(request.args)
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                return jsonify(
+                    bookings_db.host_tab(cur, g.user["id"], tab, start=start, filters=filters)
+                )
+    except BookingError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/bookings/<int:booking_id>/confirm")
+@require_role(2)
+def confirm_booking_route(booking_id: int):
+    """主持人確認自己在這場的指定。
+
+    刻意不檢查「這個人是不是這場的主持人」——confirm_host() 的 WHERE
+    已經包含那個條件，不符合就拋 BookingError。在這裡多做一次檢查，
+    等於同一條規則有兩個地方可以改，遲早會不一致。
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            try:
+                updated = bookings_db.confirm_host(cur, booking_id, g.user["id"])
+            except BookingError as exc:
+                conn.rollback()
+                return jsonify({"error": str(exc)}), 409
+            conn.commit()
+    return jsonify(updated)
+
+
 if __name__ == "__main__":
     # 預設 5001 不是 5000：macOS 的 AirPlay 接收器佔用 5000，
     # 會回 403 而不是連線被拒，症狀看起來像應用程式壞了。
