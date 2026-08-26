@@ -560,7 +560,7 @@ PAGE_SIZE = 50
 CONFIRMED_TAB_STATUSES = ("gm_confirm", "gm_reviewed", "booked")
 
 
-def _filter_clauses(f: dict | None) -> tuple[str, dict]:
+def filter_clauses(f: dict | None) -> tuple[str, dict]:
     """把篩選條件轉成 SQL 片段與參數。空值一律視為「不篩」。
 
     字串比對用 ILIKE '%值%'（包含、不分大小寫）。實測過這不會是效能
@@ -603,7 +603,7 @@ def _filter_clauses(f: dict | None) -> tuple[str, dict]:
     return "\n           ".join(sql), params
 
 
-def _paged(cur, sql: str, params: dict, row_to_item) -> dict:
+def paged(cur, sql: str, params: dict, row_to_item) -> dict:
     """撈一頁，多要一筆判斷還有沒有下一頁，回傳前把那多要的一筆丟掉。
 
     不用 COUNT(*) 另外查總數——分頁箭頭只需要知道「有沒有下一頁」，
@@ -675,7 +675,7 @@ def host_tab(
     if tab != "confirmed":
         effective.pop("status", None)
 
-    where, fp = _filter_clauses(effective)
+    where, fp = filter_clauses(effective)
 
     def item(r):
         return {
@@ -685,7 +685,7 @@ def host_tab(
         }
 
     spec = _TABS[tab]
-    return _paged(
+    return paged(
         cur,
         f"""
         SELECT b.id, m.name, u.name, b.session_date, b.session_time, b.status,

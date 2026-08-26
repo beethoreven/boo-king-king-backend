@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, time
+from functools import wraps
 
 from dotenv import load_dotenv
 
@@ -21,6 +22,7 @@ from flask_cors import CORS  # noqa: E402
 from auth_utils import sessions, whitelist  # noqa: E402
 from auth_utils.decorators import require_auth, require_role  # noqa: E402
 from auth_utils.google_auth import extract_bearer_token, verify_google_id_token  # noqa: E402
+from admin_utils import bookings_admin, mmg_admin, users_admin  # noqa: E402
 from db import bookings as bookings_db  # noqa: E402
 from db import mmg as mmg_db  # noqa: E402
 from db.bookings import BookingError  # noqa: E402
@@ -29,6 +31,13 @@ from db.schema import ensure_schema  # noqa: E402
 
 app = Flask(__name__)
 CORS(app)
+
+# Flask 預設會把 JSON 物件的鍵照字母排序輸出。對大部分回應無所謂，但
+# 管理員場次管理的 tabs 是「照營運流程排的子頁籤順序」
+# （待主持確認 → 待收訂金 → 已成立 → 已結束 → 已取消），排序過會變成
+# booked, cancelled, ended... 前端照著畫就是亂的。關掉排序，讓後端
+# 定義的順序原樣傳到前端。
+app.json.sort_keys = False
 
 # 連線池建立時是 open=False（避免在 import 期就連線，那個時間點 .env 可能
 # 還沒載入）。到這裡環境變數已經就緒，可以打開了。
@@ -502,6 +511,133 @@ def confirm_booking_route(booking_id: int):
                 return jsonify({"error": str(exc)}), 409
             conn.commit()
     return jsonify(updated)
+
+
+# ── 管理員介面 ──────────────────────────────────────────────────
+#
+# 全部 require_role(1)：只有管理員。跟主持人介面不同，這些路由看的是
+# 全站資料，不是「呼叫者自己被指定的」。
+
+def _admin_write(fn):
+    """管理員寫入路由共用的殼：開連線、跑、成功就 commit、
+    BookingError 回 400 並 rollback。"""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        body = request.get_json(silent=True) or {}
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                try:
+                    result = fn(cur, body, *args, **kwargs)
+                except BookingError as exc:
+                    conn.rollback()
+                    return jsonify({"error": str(exc)}), 400
+                conn.commit()
+        return result
+    return wrapper
+
+
+@app.get("/api/admin/mmg")
+@require_role(1)
+def admin_list_mmg():
+    """全部劇本，含停用的。同時附上可指派的主持人名單，讓前端的
+    「新增主持人」下拉選單不用另外打一支 API。"""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            return jsonify({
+                "items": mmg_admin.list_all(cur),
+                "host_candidates": mmg_admin.list_host_candidates(cur),
+            })
+
+
+@app.put("/api/admin/mmg/<int:mmg_id>")
+@require_role(1)
+@_admin_write
+def admin_update_mmg(cur, body, mmg_id: int):
+    changed = mmg_admin.update(cur, mmg_id, body)
+    return jsonify({"changed": changed, "item": mmg_admin.get(cur, mmg_id)})
+
+
+@app.post("/api/admin/mmg")
+@require_role(1)
+@_admin_write
+def admin_create_mmg(cur, body):
+    new_id = mmg_admin.create(cur, body)
+    return jsonify(mmg_admin.get(cur, new_id)), 201
+
+
+@app.get("/api/admin/users")
+@require_role(1)
+def admin_list_users():
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            return jsonify({"items": users_admin.list_all(cur)})
+
+
+@app.put("/api/admin/users/<int:user_id>")
+@require_role(1)
+@_admin_write
+def admin_update_user(cur, body, user_id: int):
+    changed = users_admin.update(cur, user_id, body)
+    return jsonify({"changed": changed, "item": users_admin.get(cur, user_id)})
+
+
+@app.post("/api/admin/users")
+@require_role(1)
+@_admin_write
+def admin_create_user(cur, body):
+    new_id = users_admin.create(cur, body)
+    return jsonify(users_admin.get(cur, new_id)), 201
+
+
+@app.get("/api/admin/bookings")
+@require_role(1)
+def admin_bookings_overview():
+    """初次載入：五個子頁籤各第一頁。翻頁與篩選走 /tab/<tab>。"""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            return jsonify({
+                "tabs": bookings_admin.TABS,
+                "data": bookings_admin.overview(cur),
+            })
+
+
+@app.get("/api/admin/bookings/tab/<tab>")
+@require_role(1)
+def admin_bookings_tab(tab: str):
+    try:
+        start = int(request.args.get("start", 1))
+    except ValueError:
+        return jsonify({"error": "start 必須是數字"}), 400
+    if start < 1:
+        return jsonify({"error": "start 必須大於 0"}), 400
+
+    try:
+        # status 由子頁籤決定，篩選器沒有這一項（見 bookings_admin）
+        filters = _parse_filters(request.args)
+        filters.pop("status", None)
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                return jsonify(
+                    bookings_admin.list_tab(cur, tab, start=start, filters=filters)
+                )
+    except BookingError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.put("/api/admin/bookings/<int:booking_id>")
+@require_role(1)
+@_admin_write
+def admin_update_booking(cur, body, booking_id: int):
+    data = dict(body)
+    # 日期時間從 JSON 進來是字串，轉成 date/time 才能跟資料庫的值比對
+    if data.get("session_date") or data.get("session_time"):
+        try:
+            d, t = _parse_slot(data)
+            data["session_date"], data["session_time"] = d, t
+        except BookingError:
+            raise
+    changed = bookings_admin.update(cur, booking_id, data)
+    return jsonify({"changed": changed, "item": bookings_db.get_booking(cur, booking_id)})
 
 
 if __name__ == "__main__":
