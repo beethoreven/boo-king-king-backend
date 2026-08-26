@@ -206,3 +206,131 @@ def list_slot(cur, mmg_id: int, session_date, session_time) -> list[tuple]:
         (mmg_id, session_date, session_time),
     )
     return cur.fetchall()
+
+
+# 允許的狀態值。與 schema.py 的說明一致：
+#   gm_confirm   等待主持人確認
+#   gm_reviewed  主持人已審閱
+#   booked       已成立
+#   cancelled    已取消
+VALID_STATUSES = ("gm_confirm", "gm_reviewed", "booked", "cancelled")
+
+
+def get_booking(cur, booking_id: int) -> dict | None:
+    """單筆預約的完整資料，含玩家與劇本名稱。"""
+    cur.execute(
+        """
+        SELECT b.id, b.mmg_id, m.name, b.player_id, u.name, u.email,
+               b.session_date, b.session_time, b.status, b.deposit,
+               m.booking_cost, b.note, b.created_at,
+               b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id
+          FROM booking_record b
+          JOIN mmg m   ON m.id = b.mmg_id
+          JOIN users u ON u.id = b.player_id
+         WHERE b.id = %s
+        """,
+        (booking_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row[0],
+        "mmg_id": row[1],
+        "mmg_name": row[2],
+        "player_id": row[3],
+        "player_name": row[4],
+        "player_email": row[5],
+        "session_date": row[6].isoformat(),
+        "session_time": row[7].strftime("%H:%M"),
+        "status": row[8],
+        "deposit": row[9],
+        "booking_cost": row[10],
+        "note": row[11],
+        "created_at": row[12].isoformat(),
+        "gm_user_ids": list(row[13:17]),
+    }
+
+
+def list_player_bookings(cur, player_id: int, *, include_cancelled: bool = False) -> list[dict]:
+    """某位玩家的預約，新的在前。順位即時算出來，不從欄位讀。"""
+    cur.execute(
+        """
+        SELECT b.id, m.name, b.session_date, b.session_time, b.status,
+               b.deposit, m.booking_cost, b.note, b.created_at,
+               CASE WHEN b.status = 'cancelled' THEN NULL ELSE (
+                   SELECT COUNT(*) + 1 FROM booking_record x
+                    WHERE x.mmg_id = b.mmg_id
+                      AND x.session_date = b.session_date
+                      AND x.session_time = b.session_time
+                      AND x.status <> 'cancelled'
+                      AND x.created_at < b.created_at
+               ) END AS position
+          FROM booking_record b
+          JOIN mmg m ON m.id = b.mmg_id
+         WHERE b.player_id = %s
+           AND (%s OR b.status <> 'cancelled')
+         ORDER BY b.session_date DESC, b.session_time DESC, b.created_at DESC
+        """,
+        (player_id, include_cancelled),
+    )
+    out = []
+    for r in cur.fetchall():
+        out.append({
+            "id": r[0], "mmg_name": r[1],
+            "session_date": r[2].isoformat(), "session_time": r[3].strftime("%H:%M"),
+            "status": r[4], "deposit": r[5], "booking_cost": r[6],
+            "note": r[7], "created_at": r[8].isoformat(),
+            "position": r[9],
+            "is_confirmed": r[9] == 1 if r[9] is not None else False,
+        })
+    return out
+
+
+def cancel_booking(cur, booking_id: int, *, note: str | None = None) -> dict:
+    """取消一筆預約。
+
+    只改自己這一列的 status，**不做任何遞補處理**——順位是每次由
+    created_at 算出來的，後面的人自動往前遞補。這正是不存 priority 欄位
+    換來的好處：這裡沒有「把下一位升上來」的第二次寫入可以失敗。
+    """
+    cur.execute(
+        """
+        UPDATE booking_record
+           SET status = 'cancelled',
+               note = COALESCE(%s, note)
+         WHERE id = %s AND status <> 'cancelled'
+        RETURNING id
+        """,
+        (note, booking_id),
+    )
+    if cur.fetchone() is None:
+        cur.execute("SELECT 1 FROM booking_record WHERE id = %s", (booking_id,))
+        if cur.fetchone() is None:
+            raise BookingError(f"預約 id={booking_id} 不存在")
+        raise BookingError("這筆預約已經取消過了")
+    return get_booking(cur, booking_id)
+
+
+def set_status(cur, booking_id: int, status: str, *, note: str | None = None) -> dict:
+    """更新狀態。取消請走 cancel_booking，不要用這支。"""
+    if status not in VALID_STATUSES:
+        raise BookingError(f"未知的狀態「{status}」")
+    if status == "cancelled":
+        raise BookingError("取消請用 cancel_booking，它會一併處理備註")
+
+    cur.execute(
+        """
+        UPDATE booking_record SET status = %s, note = COALESCE(%s, note)
+         WHERE id = %s AND status <> 'cancelled'
+        RETURNING id
+        """,
+        (status, note, booking_id),
+    )
+    if cur.fetchone() is None:
+        cur.execute("SELECT status FROM booking_record WHERE id = %s", (booking_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise BookingError(f"預約 id={booking_id} 不存在")
+        raise BookingError("已取消的預約不能再改狀態")
+    return get_booking(cur, booking_id)

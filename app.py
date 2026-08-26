@@ -1,13 +1,13 @@
 """
 booking-king 後端。
 
-目前只有基礎建設：健康檢查、保活端點、以及 Google 登入與 session 層。
-業務路由（劇本、場次、預約）尚未加入。
+健康檢查、保活端點、Google 登入與 session 層，以及劇本查詢與預約路由。
 """
 
 from __future__ import annotations
 
 import os
+from datetime import date, time
 
 from dotenv import load_dotenv
 
@@ -21,6 +21,9 @@ from flask_cors import CORS  # noqa: E402
 from auth_utils import sessions, whitelist  # noqa: E402
 from auth_utils.decorators import require_auth, require_role  # noqa: E402
 from auth_utils.google_auth import extract_bearer_token, verify_google_id_token  # noqa: E402
+from db import bookings as bookings_db  # noqa: E402
+from db import mmg as mmg_db  # noqa: E402
+from db.bookings import BookingError  # noqa: E402
 from db.connection import pool  # noqa: E402
 from db.schema import ensure_schema  # noqa: E402
 
@@ -168,6 +171,224 @@ def me():
 def admin_ping():
     """僅管理員。用來驗證階層式權限判斷。"""
     return jsonify({"status": "ok", "as": g.user["email"]})
+
+
+# ── 劇本 ────────────────────────────────────────────────────────
+
+@app.get("/api/mmg")
+@require_auth
+def list_mmg():
+    """可預約的劇本清單，含每個主持人角色有哪些人可帶。"""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            return jsonify(mmg_db.list_active(cur))
+
+
+@app.get("/api/mmg/<int:mmg_id>")
+@require_auth
+def get_mmg(mmg_id: int):
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            item = mmg_db.get(cur, mmg_id)
+    if item is None:
+        return jsonify({"error": "找不到這個劇本"}), 404
+    return jsonify(item)
+
+
+# ── 預約 ────────────────────────────────────────────────────────
+
+def _parse_slot(source) -> tuple:
+    """從 request 參數取出 (date, time)，格式錯誤丟 BookingError。"""
+    raw_date = (source.get("session_date") or "").strip()
+    raw_time = (source.get("session_time") or "").strip()
+    if not raw_date or not raw_time:
+        raise BookingError("需要 session_date 與 session_time")
+    try:
+        d = date.fromisoformat(raw_date)
+    except ValueError:
+        raise BookingError(f"日期格式錯誤：{raw_date}（需要 YYYY-MM-DD）") from None
+    try:
+        # 允許 HH:MM 與 HH:MM:SS 兩種寫法
+        t = time.fromisoformat(raw_time if len(raw_time) > 5 else raw_time + ":00")
+    except ValueError:
+        raise BookingError(f"時間格式錯誤：{raw_time}（需要 HH:MM）") from None
+    return d, t
+
+
+@app.get("/api/mmg/<int:mmg_id>/slot")
+@require_auth
+def get_slot(mmg_id: int):
+    """某個劇本某個時段目前的排隊狀況。
+
+    這是開賣尖峰時最熱的讀取路徑（大量玩家重複整理看還有沒有位子）。
+    之後要接 Redis 快取的話就是快取這一支，寫入路徑不動。
+    """
+    try:
+        d, t = _parse_slot(request.args)
+    except BookingError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            item = mmg_db.get(cur, mmg_id)
+            if item is None:
+                return jsonify({"error": "找不到這個劇本"}), 404
+            queue = bookings_db.list_slot(cur, mmg_id, d, t)
+
+    capacity = 1 + item["waitlist_limit"]
+    return jsonify({
+        "mmg_id": mmg_id,
+        "mmg_name": item["name"],
+        "session_date": d.isoformat(),
+        "session_time": t.strftime("%H:%M"),
+        "capacity": capacity,
+        "taken": len(queue),
+        "is_full": len(queue) >= capacity,
+        "queue": [
+            {"position": p, "booking_id": bid, "player_name": nm,
+             "status": st, "is_confirmed": p == 1}
+            for p, bid, nm, st, _dep, _ts, _rq in queue
+        ],
+    })
+
+
+@app.post("/api/bookings")
+@require_auth
+def create_booking_route():
+    """建立預約。
+
+    request_id 是必填的冪等鍵，前端應該在玩家「按下預約」當下產生一組，
+    該次意圖的所有重試都沿用同一組。刻意不允許省略：如果這裡自動產生，
+    每次重試都會變成一次新的意圖，冪等保護就形同虛設——玩家網路不穩
+    重送一次就可能佔到兩個名額，而名額是有限且被搶的。
+    """
+    body = request.get_json(silent=True) or {}
+
+    request_id = (body.get("request_id") or "").strip()
+    if not request_id:
+        return jsonify({"error": "缺少 request_id（冪等鍵），請由前端產生一組 UUID"}), 400
+
+    mmg_id = body.get("mmg_id")
+    if not isinstance(mmg_id, int):
+        return jsonify({"error": "需要 mmg_id"}), 400
+
+    try:
+        d, t = _parse_slot(body)
+    except BookingError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    gm_user_ids = body.get("gm_user_ids")
+    if not isinstance(gm_user_ids, list) or len(gm_user_ids) != 4:
+        return jsonify({"error": "gm_user_ids 需要是長度 4 的陣列，沒有的角色填 null"}), 400
+
+    # 玩家一律是自己。主持人與管理員（role <= 2）可以代訂——電話預約
+    # 是真實情境。但一般玩家不能指定別人，否則就能用別人的名義佔位。
+    player_id = g.user["id"]
+    if body.get("player_id") is not None:
+        if g.user["role"] > 2:
+            return jsonify({"error": "只有主持人或管理員可以代其他玩家預約"}), 403
+        player_id = body["player_id"]
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            # ★ fresh=True：跳過 30 秒權限快取。這是會佔用稀缺資源的寫入，
+            #   在快取窗口內成立的預約會真的佔住名額，而停用帳號並不會
+            #   把它吐回來。理由詳見 auth_utils/whitelist.get_user。
+            if not whitelist.is_permitted_user(cur, g.user["email"], fresh=True):
+                return jsonify({"error": "此帳號未獲授權"}), 403
+            try:
+                result = bookings_db.create_booking(
+                    cur,
+                    mmg_id=mmg_id, player_id=player_id,
+                    session_date=d, session_time=t,
+                    gm_user_ids=gm_user_ids,
+                    request_id=request_id,
+                    deposit=int(body.get("deposit") or 0),
+                    note=body.get("note"),
+                )
+            except BookingError as exc:
+                conn.rollback()
+                return jsonify({"error": str(exc)}), 409
+            booking = bookings_db.get_booking(cur, result.id)
+            conn.commit()
+
+    return jsonify({
+        **booking,
+        "position": result.position,
+        "is_confirmed": result.is_confirmed,
+        "label": result.label,
+        # 重試時是 200 而不是 201——這一次沒有真的建立東西。
+        "already_existed": result.already_existed,
+    }), (200 if result.already_existed else 201)
+
+
+@app.get("/api/bookings/mine")
+@require_auth
+def my_bookings():
+    include_cancelled = request.args.get("include_cancelled") == "1"
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            rows = bookings_db.list_player_bookings(
+                cur, g.user["id"], include_cancelled=include_cancelled
+            )
+    return jsonify(rows)
+
+
+@app.get("/api/bookings/<int:booking_id>")
+@require_auth
+def get_booking_route(booking_id: int):
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            booking = bookings_db.get_booking(cur, booking_id)
+    if booking is None:
+        return jsonify({"error": "找不到這筆預約"}), 404
+    if booking["player_id"] != g.user["id"] and g.user["role"] > 2:
+        return jsonify({"error": "只能查看自己的預約"}), 403
+    return jsonify(booking)
+
+
+@app.post("/api/bookings/<int:booking_id>/cancel")
+@require_auth
+def cancel_booking_route(booking_id: int):
+    """取消預約。玩家可以取消自己的，主持人與管理員可以取消任何一筆。
+
+    取消之後候補會自動遞補——順位是每次由 created_at 算出來的，
+    這裡不需要、也沒有任何「把下一位升上來」的寫入。
+    """
+    body = request.get_json(silent=True) or {}
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            booking = bookings_db.get_booking(cur, booking_id)
+            if booking is None:
+                return jsonify({"error": "找不到這筆預約"}), 404
+            if booking["player_id"] != g.user["id"] and g.user["role"] > 2:
+                return jsonify({"error": "只能取消自己的預約"}), 403
+            try:
+                updated = bookings_db.cancel_booking(cur, booking_id, note=body.get("note"))
+            except BookingError as exc:
+                conn.rollback()
+                return jsonify({"error": str(exc)}), 409
+            conn.commit()
+    return jsonify(updated)
+
+
+@app.patch("/api/bookings/<int:booking_id>/status")
+@require_role(2)
+def set_booking_status(booking_id: int):
+    """主持人與管理員更新預約狀態。取消請走 /cancel。"""
+    body = request.get_json(silent=True) or {}
+    status = (body.get("status") or "").strip()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            try:
+                updated = bookings_db.set_status(
+                    cur, booking_id, status, note=body.get("note")
+                )
+            except BookingError as exc:
+                conn.rollback()
+                return jsonify({"error": str(exc)}), 400
+            conn.commit()
+    return jsonify(updated)
 
 
 if __name__ == "__main__":
