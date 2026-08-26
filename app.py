@@ -292,13 +292,16 @@ def create_booking_route():
     if not isinstance(gm_user_ids, list) or len(gm_user_ids) != 4:
         return jsonify({"error": "gm_user_ids 需要是長度 4 的陣列，沒有的角色填 null"}), 400
 
-    # 玩家一律是自己。主持人與管理員（role <= 2）可以代訂——電話預約
-    # 是真實情境。但一般玩家不能指定別人，否則就能用別人的名義佔位。
+    # 玩家一律是自己，沒有例外——這裡不存在「代訂」這個動作。任何角色
+    # （包含主持人、管理員）建立預約時都是為自己訂。
+    #
+    # 管理員事後要把某筆預約轉給別人，走的是另一條路：管理員先用自己的
+    # 身份正常訂好，之後在管理員介面把這筆既有紀錄的訂場者改掉——那是
+    # 「編輯一筆已存在的預約」，不是「建立當下代替別人下單」，兩者刻意
+    # 分開，因為後者等於任何有 body 存取權的人都能塞一個 player_id
+    # 幫任何人佔位，前者則是有明確操作紀錄、事後可追溯的單一動作。
+    # 那支編輯端點屬於管理員介面，尚未實作。
     player_id = g.user["id"]
-    if body.get("player_id") is not None:
-        if g.user["role"] > 2:
-            return jsonify({"error": "只有主持人或管理員可以代其他玩家預約"}), 403
-        player_id = body["player_id"]
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
