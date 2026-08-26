@@ -22,6 +22,11 @@ from google.oauth2 import id_token as google_id_token
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
+# 在模組層建立一次就好。這個物件內部包著一個 HTTP session，重複使用可以
+# 沿用已經建立的連線去取 Google 的公開金鑰；每次驗證都 new 一個等於每次
+# 重新握手。google-auth 會自己處理金鑰的取得與輪替，不用我們管。
+_google_request = google_requests.Request()
+
 
 def extract_bearer_token(request) -> str | None:
     """從 Authorization: Bearer <token> 取出 token。"""
@@ -46,9 +51,13 @@ def verify_google_id_token(token: str) -> str | None:
         return None
     try:
         payload = google_id_token.verify_oauth2_token(
-            token, google_requests.Request(), GOOGLE_CLIENT_ID
+            token, _google_request, GOOGLE_CLIENT_ID
         )
-    except Exception:  # noqa: BLE001 - 任何驗證失敗都一視同仁，不洩漏細節
+    except Exception:  # noqa: BLE001
+        # 刻意不只攔 ValueError（google-auth 對格式錯誤／簽章不符／過期／
+        # audience 不對都是丟這個）：取金鑰那段是真的網路請求，連不上時
+        # 丟的是別的型別，只攔 ValueError 會讓它一路變成 500。
+        # 對呼叫端而言兩者都是「這張憑證現在不能用」，回同樣的結果即可。
         return None
 
     if not payload.get("email_verified"):

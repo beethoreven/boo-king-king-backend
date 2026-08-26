@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -25,7 +26,13 @@ import time
 # 每次請求都要多一次資料庫往返。30 秒是「撤銷權限多快生效」與
 # 「省下多少往返」之間的取捨——夠短到管理員停用帳號後幾乎立刻有感，
 # 又夠長到把輪詢類的重複查詢吸收掉。
-_CACHE_TTL_SECONDS = 30
+#
+# 註（承自 zh-cn-to-tw 的教訓）：那邊當初訂 TTL 的量化理由是「單次連線+
+# 查詢實測 1.2-1.6 秒」，但那個數字有 99% 來自 Render 與 Neon 跨區部署，
+# 同區之後降到約 30ms。本專案從第一天就同區（都在 ap-southeast-1），
+# 所以那個理由在這裡從來就不成立——快取留著是為了省 Neon 免費方案的
+# 連線數與 CU 用量，不是為了省那 1.5 秒。要調 TTL 之前請先量現況。
+_CACHE_TTL_SECONDS = int(os.environ.get("AUTH_CACHE_TTL_SECONDS", "30"))
 
 # email -> (到期時間戳, 使用者資料 dict 或 None)
 _cache: dict[str, tuple[float, dict | None]] = {}
