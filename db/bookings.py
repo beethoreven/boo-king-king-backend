@@ -525,6 +525,55 @@ _HOST_CONFIRMED = """
 
 PAGE_SIZE = 50
 
+# 「狀態」篩選器給前端的選項。刻意只有這三個：
+# 待確認頁籤永遠只有 gm_confirm、已結束頁籤永遠只有 ended，
+# 對那兩個頁籤篩狀態等於沒篩，所以這個篩選器只出現在已確認頁籤，
+# 而已確認頁籤只可能出現這三種狀態。
+CONFIRMED_TAB_STATUSES = ("gm_confirm", "gm_reviewed", "booked")
+
+
+def _filter_clauses(f: dict | None) -> tuple[str, dict]:
+    """把篩選條件轉成 SQL 片段與參數。空值一律視為「不篩」。
+
+    字串比對用 ILIKE '%值%'（包含、不分大小寫）。實測過這不會是效能
+    瓶頸：字串比對只作用在 mmg（劇本）與 users（會員）這兩張小表上，
+    筆數取決於店裡有幾齣劇本、幾個會員，不隨場次紀錄增長。兩萬筆
+    booking_record 加上兩個 ILIKE 實測 17ms，其中 ILIKE 的部分因為
+    對象只有個位數列、且被 Memoize 快取，成本可以忽略。
+
+    值裡的 % 和 _ 會先跳脫掉：不跳脫的話，使用者輸入 "%" 會變成
+    「符合任何東西」，輸入 "_" 會變成「任何單一字元」——那不是篩選器
+    該有的行為，使用者打進去的字元應該就是字面意思。
+    """
+    if not f:
+        return "", {}
+
+    def like(v: str) -> str:
+        return "%" + v.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+    sql, params = [], {}
+    if f.get("mmg_name"):
+        sql.append("AND m.name ILIKE %(f_mmg)s")
+        params["f_mmg"] = like(f["mmg_name"])
+    if f.get("player_name"):
+        sql.append("AND u.name ILIKE %(f_player)s")
+        params["f_player"] = like(f["player_name"])
+    if f.get("role_name"):
+        # 只比對「我擔任的那個角色」的名稱，不是這場所有角色——
+        # 這一欄在畫面上顯示的就是我自己的角色，篩選要跟顯示一致。
+        sql.append(f"AND {_HOST_ROLE_NAME} ILIKE %(f_role)s")
+        params["f_role"] = like(f["role_name"])
+    if f.get("session_date"):
+        sql.append("AND b.session_date = %(f_date)s")
+        params["f_date"] = f["session_date"]
+    if f.get("session_time"):
+        sql.append("AND b.session_time = %(f_time)s")
+        params["f_time"] = f["session_time"]
+    if f.get("status"):
+        sql.append("AND b.status = %(f_status)s")
+        params["f_status"] = f["status"]
+    return "\n           ".join(sql), params
+
 
 def _paged(cur, sql: str, params: dict, row_to_item) -> dict:
     """撈一頁，多要一筆判斷還有沒有下一頁，回傳前把那多要的一筆丟掉。
@@ -540,7 +589,13 @@ def _paged(cur, sql: str, params: dict, row_to_item) -> dict:
 
 
 def host_dashboard(
-    cur, host_id: int, *, pending_start: int = 1, confirmed_start: int = 1, ended_start: int = 1
+    cur,
+    host_id: int,
+    *,
+    pending_start: int = 1,
+    confirmed_start: int = 1,
+    ended_start: int = 1,
+    filters: dict | None = None,
 ) -> dict:
     """主持人介面三個頁籤要的資料，一次撈完（一支函式對應一支 API）。
 
@@ -556,6 +611,15 @@ def host_dashboard(
     因為這個分野不是單純的 status 相等，待確認/已確認拆成兩支各自
     獨立的 SQL，各自的 WHERE 直接表達自己的條件，而不是撈同一批
     再用 Python 拆——那樣做分頁的話，兩包的 LIMIT/OFFSET 會互相打架。
+
+    filters 是選填的篩選條件（全部欄位都可省略，省略＝不篩）：
+        mmg_name / player_name / role_name  字串，包含比對、不分大小寫
+        session_date                        date，精確等於
+        session_time                        time，精確等於
+        status                              只作用於已確認頁籤
+    篩選是使用者按下「篩選」按鈕才送出的（不是每改一格就打一次），
+    換條件時前端應該把三包的 *_start 都重設回 1——舊的頁碼在新條件下
+    可能根本不存在。
     """
 
     def item(r):
@@ -564,6 +628,14 @@ def host_dashboard(
             "session_date": r[3].isoformat(), "session_time": r[4].strftime("%H:%M"),
             "status": r[5], "status_label": STATUS_LABEL[r[5]], "role_name": r[6],
         }
+
+    where, fp = _filter_clauses(filters)
+    # 「狀態」篩選只對已確認頁籤有意義（另兩個頁籤各自只有一種狀態），
+    # 所以待確認／已結束在套用篩選時把它拿掉，避免使用者在已確認頁籤
+    # 選了狀態之後，另外兩包被一個對它們沒有意義的條件清空。
+    where_no_status, fp_no_status = _filter_clauses(
+        {k: v for k, v in (filters or {}).items() if k != "status"}
+    )
 
     pending = _paged(
         cur,
@@ -576,10 +648,11 @@ def host_dashboard(
          WHERE %(host)s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
            AND b.status = 'gm_confirm'
            AND NOT COALESCE({_HOST_CONFIRMED}, false)
+           {where_no_status}
          ORDER BY b.session_date, b.session_time
          LIMIT %(limit)s OFFSET %(offset)s
         """,
-        {"host": host_id, "offset": pending_start - 1},
+        {"host": host_id, "offset": pending_start - 1, **fp_no_status},
         item,
     )
 
@@ -596,10 +669,11 @@ def host_dashboard(
                  b.status IN ('gm_reviewed', 'booked')
                  OR (b.status = 'gm_confirm' AND {_HOST_CONFIRMED})
                )
+           {where}
          ORDER BY b.session_date, b.session_time
          LIMIT %(limit)s OFFSET %(offset)s
         """,
-        {"host": host_id, "offset": confirmed_start - 1},
+        {"host": host_id, "offset": confirmed_start - 1, **fp},
         item,
     )
 
@@ -613,10 +687,11 @@ def host_dashboard(
           JOIN users u ON u.id = b.player_id
          WHERE %(host)s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
            AND b.status = 'ended'
+           {where_no_status}
          ORDER BY b.session_date DESC, b.session_time DESC
          LIMIT %(limit)s OFFSET %(offset)s
         """,
-        {"host": host_id, "offset": ended_start - 1},
+        {"host": host_id, "offset": ended_start - 1, **fp_no_status},
         item,
     )
 
