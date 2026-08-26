@@ -92,7 +92,18 @@ def login():
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            user = whitelist.get_user(cur, email)
+            # ★ fresh=True 在這裡是必要的，不是保險。
+            #
+            # 停用帳號的流程是「改 status + 刪掉該帳號所有 session」，讓對方
+            # 立刻被登出。但如果簽發新 session 的這一步讀的是 30 秒快取，
+            # 對方被踢出去之後可以馬上重新登入、拿到一張全新的 session——
+            # 刪 session 那一步就完全白做了，停用還是要等快取過期才生效。
+            #
+            # 換句話說：撤銷的效果取決於「重新取得憑證」這條路徑有多新，
+            # 而不是取決於「舊憑證被刪掉」。登入頻率低，多一次查詢沒有成本。
+            #
+            # 這個縫是 zh-cn-to-tw 實作停用撤銷時踩到並回報的。
+            user = whitelist.get_user(cur, email, fresh=True)
             if not user or user["status"] != "active":
                 # 帳號不存在或已停用。刻意不自動建立帳號——這個系統的
                 # 使用者是由管理員建立的，不是自助註冊。
