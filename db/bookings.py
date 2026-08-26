@@ -400,6 +400,48 @@ def cancel_booking(cur, booking_id: int, *, note: str | None = None) -> dict:
     return get_booking(cur, booking_id)
 
 
+def record_deposit(cur, booking_id: int, amount: int) -> dict:
+    """記錄實際收到的訂金金額。
+
+    通知玩家繳訂金、確認款項是否已到帳，是管理員在系統外做的事；這裡
+    只負責把金額寫進去。狀態要不要跟著跳到 booked，在同一句 UPDATE 裡
+    讓資料庫判斷，不由呼叫端另外決定：
+
+        目前 status = 'gm_reviewed'，且新金額 >= 該劇本的 booking_cost
+        → 這句 UPDATE 一併把 status 轉成 'booked'
+
+    只在 gm_reviewed 這個狀態才會自動轉——主持人都還沒審過的場次，
+    就算訂金收滿了也不該直接跳過審核變成成立。若 mmg.booking_cost
+    是 NULL（劇本沒設訂金金額），比較結果恆為 NULL、CASE 不會命中，
+    狀態就停在原地，需要用 set_status() 另外手動處理。
+
+    用 >=（達到即可）而不是嚴格等於：多收一點不該卡住轉態，也允許
+    分兩次記錄金額湊足（先記一部分、之後補到滿額）。如果你要的是
+    金額必須跟劇本要求分毫不差才轉態，這裡改成 = 即可。
+    """
+    cur.execute(
+        """
+        UPDATE booking_record b
+           SET deposit = %s,
+               status = CASE
+                          WHEN b.status = 'gm_reviewed'
+                               AND %s >= (SELECT booking_cost FROM mmg WHERE id = b.mmg_id)
+                          THEN 'booked'
+                          ELSE b.status
+                        END
+         WHERE b.id = %s AND b.status <> 'cancelled'
+        RETURNING id
+        """,
+        (amount, amount, booking_id),
+    )
+    if cur.fetchone() is None:
+        cur.execute("SELECT 1 FROM booking_record WHERE id = %s", (booking_id,))
+        if cur.fetchone() is None:
+            raise BookingError(f"預約 id={booking_id} 不存在")
+        raise BookingError("已取消的預約不能記錄訂金")
+    return get_booking(cur, booking_id)
+
+
 def set_status(cur, booking_id: int, status: str, *, note: str | None = None) -> dict:
     """更新狀態。取消請走 cancel_booking，不要用這支。"""
     if status not in VALID_STATUSES:
