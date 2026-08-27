@@ -536,6 +536,78 @@ def host_tab_route(tab: str):
         return jsonify({"error": str(exc)}), 400
 
 
+@app.get("/api/bookings/<int:booking_id>/detail")
+@require_role(2)
+def booking_detail_route(booking_id: int):
+    """主持人介面點「預定者名稱」或「指定的角色名稱」時要的資料。
+
+    兩個對話框的內容合成一支：預定者的聯絡方式，以及這場所有角色與
+    對應的主持人。分開做會變成點兩個地方各打一次 API，但兩者都是
+    「這一筆預約的細節」，一次拿完比較合理。
+
+    權限是 role<=2，但只有被指定為這場主持人的人（或管理員）能看——
+    預定者的 email 與電話是個資，不該讓任何一位主持人查到別人的場次。
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id,
+                       b.gm1_confirmed, b.gm2_confirmed, b.gm3_confirmed, b.gm4_confirmed,
+                       m.gm1_name, m.gm2_name, m.gm3_name, m.gm4_name,
+                       u.name, u.email, u.line_id, u.phone,
+                       m.name, b.session_date, b.session_time, b.status, b.note
+                  FROM booking_record b
+                  JOIN mmg m   ON m.id = b.mmg_id
+                  JOIN users u ON u.id = b.player_id
+                 WHERE b.id = %s
+                """,
+                (booking_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return jsonify({"error": "找不到這筆預約"}), 404
+
+            host_ids = list(row[0:4])
+            if g.user["role"] > 1 and g.user["id"] not in host_ids:
+                return jsonify({"error": "只能查看自己被指定的場次"}), 403
+
+            # 把有指派的主持人名字一次查出來，避免四次單筆查詢
+            present = [h for h in host_ids if h is not None]
+            names = {}
+            if present:
+                cur.execute("SELECT id, name FROM users WHERE id = ANY(%s)", (present,))
+                names = dict(cur.fetchall())
+
+    confirmed = list(row[4:8])
+    role_names = list(row[8:12])
+    return jsonify({
+        "id": booking_id,
+        "mmg_name": row[16],
+        "session_date": row[17].isoformat(),
+        "session_time": row[18].strftime("%H:%M"),
+        "status": row[19],
+        "status_label": bookings_db.STATUS_LABEL.get(row[19], row[19]),
+        "note": row[20],
+        "player": {
+            "name": row[12], "email": row[13],
+            "line_id": row[14], "phone": row[15],
+        },
+        # 只回傳這齣戲真的有的角色（gm{n}_name 不是 NULL 的）
+        "gm_slots": [
+            {
+                "slot": i + 1,
+                "role_name": role_names[i],
+                "user_id": host_ids[i],
+                "user_name": names.get(host_ids[i]),
+                "confirmed": confirmed[i],
+            }
+            for i in range(4)
+            if role_names[i] is not None
+        ],
+    })
+
+
 @app.post("/api/bookings/<int:booking_id>/confirm")
 @require_role(2)
 def confirm_booking_route(booking_id: int):
