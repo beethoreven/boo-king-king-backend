@@ -96,7 +96,7 @@ def _has_mmg_conflict(cur, mmg_id: int, session_date, session_time, start, end) 
     return cur.fetchone()[0]
 
 
-def _conflicting_host(
+def conflicting_host(
     cur, host_ids: list[int], mmg_id: int, session_date, session_time, start, end
 ) -> int | None:
     """host_ids 裡任何一位在這段時間有沒有別的（不同場次的）已成立預約，
@@ -200,7 +200,7 @@ def create_booking(
     if _has_mmg_conflict(cur, mmg_id, session_date, session_time, start, end):
         raise BookingError(f"《{mms_name}》這段時間已經排了另一場，時段衝突")
 
-    conflicting = _conflicting_host(cur, host_ids, mmg_id, session_date, session_time, start, end)
+    conflicting = conflicting_host(cur, host_ids, mmg_id, session_date, session_time, start, end)
     if conflicting is not None:
         cur.execute("SELECT name FROM users WHERE id = %s", (conflicting,))
         host_name = cur.fetchone()[0]

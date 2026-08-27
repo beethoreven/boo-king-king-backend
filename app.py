@@ -7,7 +7,7 @@ booking-king 後端。
 from __future__ import annotations
 
 import os
-from datetime import date, time
+from datetime import date, datetime, time, timedelta
 from functools import wraps
 
 from dotenv import load_dotenv
@@ -270,6 +270,49 @@ def get_slot(mmg_id: int):
             for p, bid, nm, st, _dep, _ts, _rq in queue
         ],
     })
+
+
+@app.get("/api/bookings/check-host")
+@require_auth
+def check_host_route():
+    """玩家在預約畫面選了某位主持人時，即時確認他這個時段有沒有空。
+
+    跟送出時的檢查是同一個函式（conflicting_host），只是提早跑一次，
+    讓玩家在填表當下就知道，而不是全部填完按下送出才被退回。這裡不做
+    任何寫入，也不取任何鎖——真正的把關仍然在 create_booking() 裡，
+    那裡才有 advisory lock 保證「檢查到寫入」之間沒有人插隊。
+    """
+    try:
+        mmg_id = int(request.args.get("mmg_id", ""))
+        user_id = int(request.args.get("user_id", ""))
+    except ValueError:
+        return jsonify({"error": "需要 mmg_id 與 user_id"}), 400
+
+    try:
+        d, t = _parse_slot(request.args)
+    except BookingError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT period FROM mmg WHERE id = %s", (mmg_id,))
+            row = cur.fetchone()
+            if row is None:
+                return jsonify({"error": "找不到這個劇本"}), 404
+            start = datetime.combine(d, t)
+            end = start + timedelta(hours=float(row[0]))
+
+            conflicting = bookings_db.conflicting_host(
+                cur, [user_id], mmg_id, d, t, start, end
+            )
+            if conflicting is None:
+                return jsonify({"ok": True})
+
+            cur.execute("SELECT name FROM users WHERE id = %s", (conflicting,))
+            name_row = cur.fetchone()
+            host_name = name_row[0] if name_row else f"id={conflicting}"
+
+    return jsonify({"error": f"{host_name}在這個時間有場次無法預定"}), 409
 
 
 @app.post("/api/bookings")
