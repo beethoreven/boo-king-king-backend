@@ -20,16 +20,22 @@ class BookingError(Exception):
 @dataclass
 class BookingResult:
     id: int
-    position: int          # 1 = 正選，2 以上 = 候補
+    position: int          # 這一組在該時段的序位，1 是最先預定的
     already_existed: bool  # True 代表這個 request_id 先前就成功過
 
     @property
-    def is_confirmed(self) -> bool:
+    def is_first(self) -> bool:
+        """是不是該時段的第 1 序位。
+
+        刻意不叫 is_confirmed——那個字在這個專案已經被主持人的
+        gm{n}_confirmed 用掉了，兩個意思不同的 confirmed 並存會看錯。
+        序位是「排在第幾個」，跟審核流程無關。
+        """
         return self.position == 1
 
     @property
     def label(self) -> str:
-        return "正選" if self.is_confirmed else f"候補 {self.position - 1}"
+        return f"第 {self.position} 序位"
 
 
 def _lock_slot(cur, mmg_id: int, session_date, session_time) -> None:
@@ -76,7 +82,7 @@ def _has_mmg_conflict(cur, mmg_id: int, session_date, session_time, start, end) 
     （status='booked'）的場次跟它重疊——包含首尾相接（無縫接軌也算衝突）。
 
     刻意排除跟候選時段完全相同的 (session_date, session_time)：那些是
-    同一場遊戲的正選／候補隊伍，是候補容量機制在管的事，不是這裡要擋的
+    同一場遊戲各序位的隊伍，是容量上限在管的事，不是這裡要擋的
     「劇本被排成兩場」。
     """
     cur.execute(
@@ -103,7 +109,7 @@ def conflicting_host(
     回傳第一個撞期的 user id；都沒撞回傳 None。
 
     排除條件是「跟候選場次完全相同的 (mmg_id, session_date, session_time)」，
-    不是「這位主持人」本身——同一場遊戲底下正選＋候補掛的是同一位主持人，
+    不是「這位主持人」本身——同一場遊戲底下各序位掛的是同一位主持人，
     那是同一件事被記錄很多次，不是這位主持人被排了兩場不同的戲。
     """
     for host_id in host_ids:
@@ -188,7 +194,8 @@ def create_booking(
     _lock_hosts(cur, host_ids)
     _validate_gm_choice(cur, mmg_id, gm_user_ids)
 
-    # 容量 = 1 組正選 + waitlist_limit 組候補；period 用來換算這場實際
+    # 容量 = 1 + waitlist_limit 組（欄位名沿用，指的是第 2 序位之後的上限）；
+    # period 用來換算這場實際
     # 佔用到幾點，供劇本／主持人的排程衝突檢查用。
     cur.execute("SELECT name, waitlist_limit, period FROM mmg WHERE id = %s", (mmg_id,))
     mms_name, waitlist_limit, period = cur.fetchone()
@@ -241,7 +248,7 @@ def create_booking(
         if current >= capacity:
             raise BookingError(
                 f"《{mms_name}》{session_date} {session_time} 已額滿"
-                f"（1 組正選 + {waitlist_limit} 組候補）"
+                f"（最多 {1 + waitlist_limit} 組）"
             )
         booking_id = row[0]
         already_existed = False
@@ -251,7 +258,7 @@ def create_booking(
 
 
 def get_position(cur, booking_id: int) -> int:
-    """算出某筆預約在它那個時段的順位。1 = 正選。
+    """算出某筆預約在它那個時段的序位。1 是最先預定的那一組。
 
     順位不存欄位、每次算——取消時只要把自己的 status 改掉，後面的人
     就自動遞補，沒有第二個地方需要同步（理由見 schema.py）。
@@ -370,7 +377,7 @@ def list_player_bookings(cur, player_id: int, *, include_cancelled: bool = False
             "status": r[4], "deposit": r[5], "booking_cost": r[6],
             "note": r[7], "created_at": r[8].isoformat(),
             "position": r[9],
-            "is_confirmed": r[9] == 1 if r[9] is not None else False,
+            "is_first": r[9] == 1 if r[9] is not None else False,
         })
     return out
 
@@ -607,7 +614,7 @@ def paged(cur, sql: str, params: dict, row_to_item) -> dict:
     """撈一頁，多要一筆判斷還有沒有下一頁，回傳前把那多要的一筆丟掉。
 
     不用 COUNT(*) 另外查總數——分頁箭頭只需要知道「有沒有下一頁」，
-    不需要知道「總共幾頁」，COUNT 一次全表在候補/場次這種會員不斷長大
+    不需要知道「總共幾頁」，COUNT 一次全表在場次這種會不斷長大
     的表上是白花的成本。
     """
     cur.execute(sql, {**params, "limit": PAGE_SIZE + 1})

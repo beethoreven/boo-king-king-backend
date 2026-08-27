@@ -104,10 +104,10 @@ def show_counts(cur) -> None:
 
 
 def seed(cur) -> None:
-    """塞一組互相關聯的範例資料，用來確認外鍵與候補順位真的能運作。
+    """塞一組互相關聯的範例資料，用來確認外鍵與序位計算真的能運作。
 
     情境：一個需要兩位主持人的劇本，第一個角色有兩位主持人可選；
-    三組玩家搶同一個時段——第一組是正選，後兩組是候補。
+    三組玩家搶同一個時段——依先後順序分別是第 1、2、3 序位。
     """
     _print_header("寫入範例資料")
 
@@ -164,14 +164,14 @@ def seed(cur) -> None:
             """,
             (mmg_id, user_ids[label], user_ids["gm-alice"], user_ids["gm-alice"]),
         )
-    print("    booking_record 新增 3 筆 (同一時段，測試候補順位)")
+    print("    booking_record 新增 3 筆 (同一時段，測試序位計算)")
 
     return mmg_id
 
 
-def show_waitlist(cur) -> None:
-    """用實際資料驗證候補順位的算法（schema.py 裡記載的那段查詢）。"""
-    _print_header("候補順位驗算")
+def show_positions(cur) -> None:
+    """用實際資料驗證序位的算法（schema.py 裡記載的那段查詢）。"""
+    _print_header("序位驗算")
     cur.execute(
         """
         SELECT b.session_date, b.session_time, u.name, b.status,
@@ -192,8 +192,7 @@ def show_waitlist(cur) -> None:
         print("    （沒有範例資料，用 --seed 產生）")
         return
     for date, time, name, status, position in rows:
-        tag = "正選" if position == 1 else f"候補 {position - 1}"
-        print(f"    {date} {time}  #{position} {name:<12} {status:<12} {tag}")
+        print(f"    {date} {time}  第 {position} 序位  {name:<12} {status}")
 
 
 def check_gm_constraint(cur) -> bool:
@@ -302,7 +301,7 @@ def main() -> int:
                     conn.commit()
 
                 show_counts(cur)
-                show_waitlist(cur)
+                show_positions(cur)
                 constraint_ok = check_gm_constraint(cur)
                 sequences_ok = check_sequences(cur)
                 conn.commit()

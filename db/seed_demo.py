@@ -148,7 +148,7 @@ def show(cur) -> None:
         gm_users = rest[4:8]
         print(f"    id={mid}  《{name}》  {status}")
         print(f"           時長 {period} 小時 ／ 售價 {price} ／ 訂金 {cost} ／ 人數 {players}")
-        print(f"           候補上限 {wl} 組")
+        print(f"           序位上限 {wl} 組（第 1 序位之外）")
         print(f"    {'-' * 56}")
         for i, (gname, gusers) in enumerate(zip(gm_names, gm_users), start=1):
             if gname is None:

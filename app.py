@@ -266,7 +266,7 @@ def get_slot(mmg_id: int):
         "is_full": len(queue) >= capacity,
         "queue": [
             {"position": p, "booking_id": bid, "player_name": nm,
-             "status": st, "is_confirmed": p == 1}
+             "status": st, "is_first": p == 1}
             for p, bid, nm, st, _dep, _ts, _rq in queue
         ],
     })
@@ -381,7 +381,7 @@ def create_booking_route():
     return jsonify({
         **booking,
         "position": result.position,
-        "is_confirmed": result.is_confirmed,
+        "is_first": result.is_first,
         "label": result.label,
         # 重試時是 200 而不是 201——這一次沒有真的建立東西。
         "already_existed": result.already_existed,
@@ -418,7 +418,7 @@ def get_booking_route(booking_id: int):
 def cancel_booking_route(booking_id: int):
     """取消預約。玩家可以取消自己的，主持人與管理員可以取消任何一筆。
 
-    取消之後候補會自動遞補——順位是每次由 created_at 算出來的，
+    取消之後後面的序位會自動往前遞補——序位是每次由 created_at 算出來的，
     這裡不需要、也沒有任何「把下一位升上來」的寫入。
     """
     body = request.get_json(silent=True) or {}

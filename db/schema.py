@@ -159,7 +159,9 @@ def _ensure_mmg(cur) -> None:
             -- 不要改成數字型別——它不參與任何計算或比對。
             players TEXT,
 
-            -- 每個場次時段最多可以排幾組候補（不含已成立的那一組）。
+            -- 每個場次時段，第 2 序位之後最多還能排幾組（不含第 1 序位）。
+            -- 欄位名沿用 waitlist_limit——它是資料庫識別碼，改名要遷移，
+            -- 而使用者看不到欄位名；顯示層一律用「第 N 序位」。
             -- 放在 mmg 而不是全域設定，因為熱門劇本可能想放寬、冷門的想收緊。
             -- 要改成全站統一調整的話，改動這一欄的預設值即可。
             waitlist_limit INTEGER NOT NULL DEFAULT 3 CHECK (waitlist_limit >= 0),
@@ -250,7 +252,7 @@ def _ensure_booking_record(cur) -> None:
     寫進資料庫的 status 才是唯一事實，批次工作負責讓它跟上時間，
     不是每次讀取都重新猜一次。
 
-    候補順位刻意「不存欄位、每次由 created_at 算出來」：
+    序位刻意「不存欄位、每次由 created_at 算出來」：
 
         SELECT id, player_id,
                ROW_NUMBER() OVER (
@@ -261,7 +263,7 @@ def _ensure_booking_record(cur) -> None:
         WHERE mmg_id = ? AND session_date = ? AND session_time = ?
           AND status <> 'cancelled'
 
-    position = 1 是成立的那一組，其餘依序是候補。
+    position 就是序位：1 是最先預定的那一組，其餘依序往後。
 
     為什麼不存一個 priority 欄位（或 waitlist_position 數字）：
     那會讓「誰是第一位」有兩個來源——created_at 的先後，和欄位裡的值——
@@ -276,7 +278,7 @@ def _ensure_booking_record(cur) -> None:
     1 + waitlist_limit 列（預設 4 列），對 4 列做 ROW_NUMBER 的成本可以忽略，
     而玩家瀏覽用的熱查詢本來就走 Redis 快取、不會打到這裡。
 
-    候補上限的檢查（這是真正需要小心的地方）：
+    容量上限的檢查（這是真正需要小心的地方）：
     「這個時段還沒滿」這件事無法用唯一約束表達——要擋的是「第 N+1 筆」，
     而那筆資料在檢查當下還不存在，沒有東西可以鎖（典型的 phantom read）。
     正確做法是在交易一開始先取得該時段的 advisory lock：
@@ -290,13 +292,13 @@ def _ensure_booking_record(cur) -> None:
     COUNT 現有未取消的筆數、跟 mmg.waitlist_limit 比較，才 INSERT。
 
     刻意沒有對 (mmg_id, session_date, session_time) 建唯一約束——這一點
-    很容易被後人誤判成漏了約束而「補上」，補了會直接讓候補功能失效，
+    很容易被後人誤判成漏了約束而「補上」，補了會直接讓排序功能失效，
     所以說清楚：
 
     一個劇本在同一個時段**只會開一場遊戲**，這一點沒有例外。但這張表
     允許同一個 (劇本, 日期, 時間) 存在多筆資料，因為那多筆代表的是
-    「1 組正選 + N 組候補」對同一場的排隊，不是多場遊戲並行。
-    唯一性語意在「同一時段只有 position = 1 那一組會真的開場」這件事上，
+    同一場的多個序位在排隊，不是多場遊戲並行。
+    唯一性語意在「同一時段只有第 1 序位那一組會真的開場」這件事上，
     由上面的上限檢查與順位計算負責，不是由資料庫的唯一約束負責。
     """
     cur.execute(
@@ -371,7 +373,7 @@ def _ensure_booking_record(cur) -> None:
         )
         """
     )
-    # 場次查詢與候補順位計算共用這一個索引。結尾帶 created_at 是刻意的：
+    # 場次查詢與序位計算共用這一個索引。結尾帶 created_at 是刻意的：
     # 上面那段 ROW_NUMBER 的 ORDER BY 就是 created_at，索引順序對上之後
     # 排序可以直接走索引，不需要額外的 sort 步驟。
     cur.execute(
