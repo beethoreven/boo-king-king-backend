@@ -630,6 +630,31 @@ def booking_detail_route(booking_id: int):
     })
 
 
+@app.get("/api/bookings/<int:booking_id>/conflicts")
+@require_role(2)
+def booking_conflicts_route(booking_id: int):
+    """這筆預約的主持人，有沒有人已經被別的已成立場次佔住。
+
+    純查詢，不寫入也不擋任何動作。主持人按確認、管理員切狀態之前各呼叫
+    一次，撞期就跳對話框讓人自己決定要不要繼續——這兩個畫面的用途就是
+    人工判斷，系統該做的是把資訊攤開，不是替他決定。
+
+    回傳 conflicts 陣列而不是單一結果：一場戲可能有四位主持人，只講第一
+    個撞到的，處理完才發現還有下一個。
+
+    每一筆帶 is_me，標出這筆是不是呼叫者自己的撞期。主持人畫面只在意
+    自己撞到什麼，管理員要看全部。在這裡標而不是讓前端自己比對，是因為
+    前端目前拿不到自己的 user id（登入回應只給 email/name/role），為了
+    這件事去改動登入回應的形狀不划算，而後端本來就知道自己是誰。
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            conflicts = bookings_db.find_conflicts(cur, booking_id)
+    for c in conflicts:
+        c["is_me"] = c["host_id"] == g.user["id"]
+    return jsonify({"conflicts": conflicts})
+
+
 @app.post("/api/bookings/<int:booking_id>/confirm")
 @require_role(2)
 def confirm_booking_route(booking_id: int):
