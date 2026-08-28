@@ -160,17 +160,17 @@ def login():
             # ★ 被停權的擋在這裡，而且要擋在發 session 之前。
             #   放行的話他手上會有一張有效憑證，就算每支路由都會再擋一次，
             #   那也是多開了一道不需要存在的門。
-            if user is not None and user["status"] != "active":
-                # ★ 擋在發 session 之前。放行的話他手上會有一張有效憑證，
-                #   就算每支路由都會再擋一次，那也是多開了一道不需要存在的
-                #   門。已刪除的帳號尤其如此——需求明講「不會存他的
-                #   authentication」，最乾脆的做法就是根本不發。
-                deleted = user["status"] == "deleted"
+            # ★ 已刪除的帳號不發 session。他刪掉自己之後除了找店家沒有
+            #   別的路，發一張只能用來看空畫面的憑證沒有意義，還得多存
+            #   一份不該存的東西。
+            if user is not None and user["status"] == "deleted":
                 return jsonify({
-                    "error": "此帳號已刪除" if deleted else "此帳號未獲授權",
-                    "code": "deleted" if deleted else "deactivated",
-                    "email": email,
+                    "error": "此帳號已刪除", "code": "deleted", "email": email,
                 }), 403
+
+            # 被停權的照樣發。他要能進到畫面看見「未授權」這件事本身——
+            # 直接擋在登入頁只會讓他一直重登。每一支受保護的路由仍然會
+            # 擋下他，這張憑證換不到任何資料。
 
             # 沒在名單裡的照樣發 session。他的身分 Google 已經驗過了，
             # 缺的只是聯絡資料——那要靠 /auth/register 補，而註冊本身就需要
@@ -185,6 +185,15 @@ def login():
             "registered": False,
         })
 
+    if user["status"] != "active":
+        return jsonify({
+            "session_token": token,
+            "email": user["email"],
+            "registered": True,
+            "authorized": False,
+            "status": user["status"],
+        })
+
     return jsonify(
         {
             "session_token": token,
@@ -193,6 +202,8 @@ def login():
             "role": user["role"],
             "is_admin": user["role"] == 1,
             "registered": True,
+            "authorized": True,
+            "status": user["status"],
         }
     )
 
