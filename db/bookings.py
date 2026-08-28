@@ -133,20 +133,21 @@ def conflicting_host(
     return None
 
 
-def find_conflicts(cur, booking_id: int) -> list[dict]:
-    """這筆預約指派到的主持人，在這個時段是不是已經有別的已成立場次。
+def find_conflicts(cur, booking_id: int) -> dict:
+    """這筆預約有沒有撞到已經成立的場次。分成兩種，因為它們是兩件事：
 
-    問的事情跟 conflicting_host() 一樣，差別在回傳什麼：那一支只說「撞到
-    了、是哪位主持人」，因為它的用途是擋下寫入；這一支要餵給對話框，所以
-    連撞到的是哪一場、幾點都得帶回去——畫面只說「有衝突」而講不出衝突在
-    哪裡，等於要人自己去翻。
+    script —— 這個「劇本」在這段時間已經有另一場成立了。劇本是實體資源
+        （同一套本、同一間房），一次只能開一場，跟誰主持無關。這條規則
+        跟玩家預訂時擋人的 _has_mmg_conflict() 是同一條。
 
-    只看 status = 'booked'。同一個時段有好幾組在排隊是正常的（那正是序位
-    的意義），真正的衝突是「已經成立的那一場把這位主持人佔住了」。
+    hosts —— 這筆的某位「主持人」在這段時間已經被別的成立場次佔住。
+        不限同一個劇本：他可能被指定去帶另一齣戲，時間一樣會撞。
 
-    這是提醒用的查詢，不是把關：主持人按確認、管理員切狀態，都不會因為
-    撞期就被系統擋下來（那些畫面存在的目的就是人工判斷）。真正會擋的是
-    create_booking()，那裡有 advisory lock。
+    兩者可以各自成立，也可以同時發生。分開回傳讓呼叫端決定各自要怎麼
+    處置——目前是劇本衝突可以放行、主持人自己撞期不能放行。
+
+    都只看 status = 'booked'。同一個時段有好幾組在排隊是正常的（那正是
+    序位的意義），真正的衝突是「已經成立的那一場把資源佔住了」。
     """
     cur.execute(
         """
@@ -162,49 +163,75 @@ def find_conflicts(cur, booking_id: int) -> list[dict]:
         raise BookingError(f"預約 id={booking_id} 不存在")
 
     mmg_id, session_date, session_time, period = row[0], row[1], row[2], row[3]
-    host_ids = [h for h in row[4:8] if h is not None]
-    if not host_ids or period is None:
-        return []
+    if period is None:
+        return {"script": [], "hosts": []}
 
+    host_ids = [h for h in row[4:8] if h is not None]
     start = datetime.combine(session_date, session_time)
     end = start + timedelta(hours=float(period))
 
-    cur.execute(
-        """
-        SELECT u.id, u.name, m2.name, b2.session_date, b2.session_time
-          FROM booking_record b2
-          JOIN mmg m2  ON m2.id = b2.mmg_id
-          JOIN users u ON u.id = ANY(%(host_ids)s)
-                      AND u.id IN (b2.gm1_user_id, b2.gm2_user_id,
-                                   b2.gm3_user_id, b2.gm4_user_id)
-         WHERE b2.status = 'booked'
-           AND b2.id <> %(booking_id)s
-           -- 排除「同一場遊戲的其他序位」：那是同一件事被記錄很多次，
-           -- 不是這位主持人被排了兩場不同的戲。跟 conflicting_host()
-           -- 用同一條排除條件。
+    # 兩段查詢共用的重疊條件與排除條件。排除「同一個劇本的同一個時段」
+    # 是因為那是同一場遊戲的各個序位，不是被排了兩場。
+    overlap = """
            AND NOT (b2.mmg_id = %(mmg_id)s
                     AND b2.session_date = %(d)s
                     AND b2.session_time = %(t)s)
            AND (b2.session_date + b2.session_time)::timestamp <= %(end)s
            AND %(start)s <= (b2.session_date + b2.session_time)::timestamp
                             + (m2.period * interval '1 hour')
+    """
+    params = {
+        "booking_id": booking_id, "mmg_id": mmg_id,
+        "d": session_date, "t": session_time, "start": start, "end": end,
+    }
+
+    # ── 劇本本身被排了兩場 ──
+    cur.execute(
+        f"""
+        SELECT DISTINCT b2.session_date, b2.session_time
+          FROM booking_record b2
+          JOIN mmg m2 ON m2.id = b2.mmg_id
+         WHERE b2.status = 'booked'
+           AND b2.id <> %(booking_id)s
+           AND b2.mmg_id = %(mmg_id)s
+           {overlap}
          ORDER BY b2.session_date, b2.session_time
         """,
-        {
-            "host_ids": host_ids, "booking_id": booking_id, "mmg_id": mmg_id,
-            "d": session_date, "t": session_time, "start": start, "end": end,
-        },
+        params,
     )
-    return [
-        {
-            "host_id": r[0],
-            "host_name": r[1],
-            "mmg_name": r[2],
-            "session_date": r[3].isoformat(),
-            "session_time": r[4].strftime("%H:%M"),
-        }
+    script = [
+        {"session_date": r[0].isoformat(), "session_time": r[1].strftime("%H:%M")}
         for r in cur.fetchall()
     ]
+
+    # ── 某位主持人同時段已經有場 ──
+    hosts = []
+    if host_ids:
+        cur.execute(
+            f"""
+            SELECT DISTINCT u.id, u.name, m2.name, b2.session_date, b2.session_time
+              FROM booking_record b2
+              JOIN mmg m2  ON m2.id = b2.mmg_id
+              JOIN users u ON u.id = ANY(%(host_ids)s)
+                          AND u.id IN (b2.gm1_user_id, b2.gm2_user_id,
+                                       b2.gm3_user_id, b2.gm4_user_id)
+             WHERE b2.status = 'booked'
+               AND b2.id <> %(booking_id)s
+               {overlap}
+             ORDER BY b2.session_date, b2.session_time
+            """,
+            {**params, "host_ids": host_ids},
+        )
+        hosts = [
+            {
+                "host_id": r[0], "host_name": r[1], "mmg_name": r[2],
+                "session_date": r[3].isoformat(),
+                "session_time": r[4].strftime("%H:%M"),
+            }
+            for r in cur.fetchall()
+        ]
+
+    return {"script": script, "hosts": hosts}
 
 
 def _validate_gm_choice(cur, mmg_id: int, gm_user_ids: list[int | None]) -> None:

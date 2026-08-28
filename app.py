@@ -639,20 +639,22 @@ def booking_conflicts_route(booking_id: int):
     一次，撞期就跳對話框讓人自己決定要不要繼續——這兩個畫面的用途就是
     人工判斷，系統該做的是把資訊攤開，不是替他決定。
 
-    回傳 conflicts 陣列而不是單一結果：一場戲可能有四位主持人，只講第一
-    個撞到的，處理完才發現還有下一個。
+    回傳兩組（見 find_conflicts）：script 是這個劇本被排了兩場，hosts 是
+    某位主持人同時段已經有別的場。兩者的嚴重程度不同——劇本撞期是排班
+    問題，人可以判斷後放行；主持人自己撞期是他分身乏術，不該放行——所以
+    分開給，不合併成一份清單。
 
-    每一筆帶 is_me，標出這筆是不是呼叫者自己的撞期。主持人畫面只在意
-    自己撞到什麼，管理員要看全部。在這裡標而不是讓前端自己比對，是因為
-    前端目前拿不到自己的 user id（登入回應只給 email/name/role），為了
-    這件事去改動登入回應的形狀不划算，而後端本來就知道自己是誰。
+    hosts 的每一筆帶 is_me，標出是不是呼叫者自己。主持人只在意自己撞到
+    什麼。在這裡標而不是讓前端比對，是因為前端拿不到自己的 user id
+    （登入回應只給 email/name/role），為了這件事改動登入回應的形狀不
+    划算，而後端本來就知道自己是誰。
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            conflicts = bookings_db.find_conflicts(cur, booking_id)
-    for c in conflicts:
+            result = bookings_db.find_conflicts(cur, booking_id)
+    for c in result["hosts"]:
         c["is_me"] = c["host_id"] == g.user["id"]
-    return jsonify({"conflicts": conflicts})
+    return jsonify(result)
 
 
 @app.post("/api/bookings/<int:booking_id>/confirm")
