@@ -324,11 +324,10 @@ def get_slot(mmg_id: int):
         #   管理員與主持人要看細節，走 /api/bookings/<id>/conflicts，
         #   那一支有 role <= 2 的把關。
         "has_conflict": clash is not None,
-        "queue": [
-            {"position": p, "booking_id": bid, "player_name": nm,
-             "status": st, "is_first": p == 1}
-            for p, bid, nm, st, _dep, _ts, _rq in queue
-        ],
+        # ★ 刻意不回排隊清單。玩家需要知道的只有「排了幾組、我會是第幾個、
+        #   訂不訂得成」——前面排的是誰、他們的預約在什麼狀態，那是別的
+        #   客人的資料，跟他要做的決定無關。
+        #   管理員與主持人的畫面各自有完整清單，那兩支都有權限把關。
     })
 
 
