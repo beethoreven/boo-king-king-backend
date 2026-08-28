@@ -43,8 +43,18 @@ def _authenticate() -> tuple[dict | None, tuple | None]:
             user = whitelist.get_user(cur, email)
             conn.commit()  # resolve_session 可能更新了 last_seen_at
 
-    if not user or user["status"] != "active":
-        return None, (jsonify({"error": "此帳號未獲授權"}), 403)
+    # ★ 兩種 403 要分得開。
+    #
+    #   還沒註冊——Google 驗過身分了，只是還沒在這個系統留下聯絡資料。
+    #             前端該做的是把註冊表單給他，不是叫他去找店家。
+    #   被停權——名單裡有他，但管理員關掉了。這才是真正的「未獲授權」，
+    #           自己註冊一次也救不回來（見 /auth/register）。
+    #
+    # 兩者都回 403，但帶不同的 code；訊息文字會變，code 不會，前端據此分流。
+    if user is None:
+        return None, (jsonify({"error": "尚未完成註冊", "code": "unregistered"}), 403)
+    if user["status"] != "active":
+        return None, (jsonify({"error": "此帳號未獲授權", "code": "deactivated"}), 403)
     return user, None
 
 

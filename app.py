@@ -157,12 +157,26 @@ def login():
             #
             # 這個縫是 zh-cn-to-tw 實作停用撤銷時踩到並回報的。
             user = whitelist.get_user(cur, email, fresh=True)
-            if not user or user["status"] != "active":
-                # 帳號不存在或已停用。刻意不自動建立帳號——這個系統的
-                # 使用者是由管理員建立的，不是自助註冊。
-                return jsonify({"error": "此帳號未獲授權", "email": email}), 403
+            # ★ 被停權的擋在這裡，而且要擋在發 session 之前。
+            #   放行的話他手上會有一張有效憑證，就算每支路由都會再擋一次，
+            #   那也是多開了一道不需要存在的門。
+            if user is not None and user["status"] != "active":
+                return jsonify(
+                    {"error": "此帳號未獲授權", "code": "deactivated", "email": email}
+                ), 403
+
+            # 沒在名單裡的照樣發 session。他的身分 Google 已經驗過了，
+            # 缺的只是聯絡資料——那要靠 /auth/register 補，而註冊本身就需要
+            # 一張憑證來證明「填這份表的人就是剛才登入的那個 email」。
             token = sessions.create_session(cur, email)
             conn.commit()
+
+    if user is None:
+        return jsonify({
+            "session_token": token,
+            "email": email,
+            "registered": False,
+        })
 
     return jsonify(
         {
@@ -171,6 +185,7 @@ def login():
             "name": user["name"],
             "role": user["role"],
             "is_admin": user["role"] == 1,
+            "registered": True,
         }
     )
 
@@ -215,12 +230,54 @@ def auth_status():
     return jsonify(
         {
             "authorized": authorized,
+            # registered 與 authorized 是兩件事：沒註冊的人不算授權，但他
+            # 該看到的是註冊表單；被停權的人也不算授權，他該看到的是
+            # 「請聯絡店家」。前端靠這個欄位分流。
+            "registered": user is not None,
             "email": user["email"] if user else email,
             "name": user["name"] if user else None,
             "role": user["role"] if user else None,
             "is_admin": bool(user and user["role"] == 1),
         }
     )
+
+
+@app.post("/auth/register")
+def register():
+    """自助註冊。用登入時拿到的 session token 認身分，補齊聯絡資料。
+
+    ★ 刻意不掛 require_auth：那支要求「名單裡有這個人且是 active」，而這
+      支存在的目的正是「名單裡還沒有這個人」。這裡只驗 session 有效，
+      email 取自 session，不取請求內容。
+
+    註冊完成後原本那張 session 立刻可用——email 沒變，只是 users 多了一
+    列，下一次 require_auth 查就會通過。不需要重新登入。
+    """
+    token = extract_bearer_token(request)
+    if not token:
+        return jsonify({"error": "未提供登入憑證"}), 401
+
+    body = request.get_json(silent=True) or {}
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            email = sessions.resolve_session(cur, token)
+            if email is None:
+                conn.commit()
+                return jsonify({"error": "登入憑證無效或已過期"}), 401
+            try:
+                user = whitelist.register_self(cur, email, body)
+            except ValueError as exc:
+                conn.rollback()
+                return jsonify({"error": str(exc)}), 400
+            conn.commit()
+
+    return jsonify({
+        "email": user["email"],
+        "name": user["name"],
+        "role": user["role"],
+        "is_admin": user["role"] == 1,
+        "registered": True,
+    }), 201
 
 
 @app.get("/api/me")

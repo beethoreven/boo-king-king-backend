@@ -124,3 +124,46 @@ def invalidate(email: str | None = None) -> None:
             _cache.clear()
         else:
             _cache.pop(email.lower().strip(), None)
+
+
+def register_self(cur, email: str, data: dict) -> dict:
+    """使用者自己填完聯絡資料、建立帳號。回傳新建的使用者。
+
+    ★ email 一律取自呼叫端傳進來的「session 裡那個」，不是使用者送上來的
+      欄位。前端的 email 欄位是唯讀的顯示用途，就算有人改了它、或直接打
+      API 帶別的 email，也影響不到這裡——身分只由 Google 驗過的那一個決定。
+
+    ★ 角色寫死 3（一般玩家）。開放讓呼叫端指定，等於讓任何人自己註冊成
+      管理員。
+
+    ★ 已經在名單裡就拒絕，不論狀態。這條是給停權用的：如果被停權的人
+      可以重新註冊一次把自己變回 active，停權就完全沒有意義了。
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        raise ValueError("缺少 email")
+
+    cur.execute("SELECT status FROM users WHERE lower(email) = %s", (email,))
+    row = cur.fetchone()
+    if row is not None:
+        raise ValueError("這個帳號已經註冊過了")
+
+    name = (data.get("name") or "").strip()
+    line_id = (data.get("line_id") or "").strip()
+    phone = (data.get("phone") or "").strip()
+    missing = [
+        label for label, v in (("稱呼", name), ("LINE ID", line_id), ("電話", phone))
+        if not v
+    ]
+    if missing:
+        raise ValueError("以下欄位不能空白：" + "、".join(missing))
+
+    cur.execute(
+        "INSERT INTO users (email, name, role, status, line_id, phone) "
+        "VALUES (%s, %s, 3, 'active', %s, %s) "
+        "RETURNING id, email, name, role, status",
+        (email, name, line_id, phone),
+    )
+    uid, mail, nm, role, status = cur.fetchone()
+    invalidate(email)
+    return {"id": uid, "email": mail, "name": nm, "role": role, "status": status}
