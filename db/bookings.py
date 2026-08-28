@@ -525,19 +525,57 @@ def get_booking(cur, booking_id: int) -> dict | None:
     }
 
 
-def list_player_bookings(
-    cur, player_id: int, *, include_cancelled: bool = False, start: int = 1
-) -> dict:
-    """某位玩家的預約，新的在前。順位即時算出來，不從欄位讀。
+# 玩家自己的場次清單分頁。跟主持人／管理員一樣按狀態分，但用玩家看得懂
+# 的說法：他不需要知道「待收訂金」是店家的動作，他要知道的是「該去付了」。
+PLAYER_TABS = {
+    "gm_confirm": "等待主持人確認",
+    "gm_reviewed": "等待支付訂金",
+    "booked": "預約完成",
+    "ended": "已結束",
+    "cancelled": "已取消",
+}
 
-    跟主持人與管理員的場次清單走同一套分頁（一頁 PAGE_SIZE 筆、多撈一筆
-    判斷有沒有下一頁），回傳 {"items": [...], "has_more": bool}。常客累積
-    幾年的預約一次全吐出來，對手機來說是純粹的浪費。
+# 已結束與已取消看最近的，其餘看最早的——待處理的先做舊的，已完結的
+# 通常是查最近那幾筆。跟主持人與管理員的清單同一個原則。
+_PLAYER_DESC_TABS = ("ended", "cancelled")
+
+
+def list_player_tab(
+    cur, player_id: int, tab: str, *, start: int = 1, filters: dict | None = None
+) -> dict:
+    """某位玩家在某個狀態下的預約，一次一頁。
+
+    序位即時算出來，不存欄位——玩家最在意的就是「我排第幾」，而那個值會
+    因為前面的人取消而改變。存起來就得在每次取消時回頭更新所有後面的人，
+    漏一次就永遠錯。
+
+    篩選只開放劇本名稱與日期時間。預定者一定是他自己，角色是主持人那邊
+    的概念，狀態則由頁籤決定——多給的選項只會讓人試出空集合。
     """
-    cur.execute(
-        """
+    if tab not in PLAYER_TABS:
+        raise BookingError(f"未知的頁籤「{tab}」")
+
+    allowed = {k: v for k, v in (filters or {}).items()
+               if k in ("mmg_name", "session_date", "session_time")}
+    where, fp = filter_clauses(allowed)
+    order = ("b.session_date DESC, b.session_time DESC"
+             if tab in _PLAYER_DESC_TABS else "b.session_date, b.session_time")
+
+    def item(r):
+        return {
+            "id": r[0], "mmg_name": r[1],
+            "session_date": r[2].isoformat(), "session_time": r[3].strftime("%H:%M"),
+            "status": r[4], "status_label": PLAYER_TABS.get(r[4], r[4]),
+            "deposit": r[5], "booking_cost": r[6], "note": r[7],
+            "position": r[8],
+            "gm_names": [n for n in r[9:13] if n],
+        }
+
+    return paged(
+        cur,
+        f"""
         SELECT b.id, m.name, b.session_date, b.session_time, b.status,
-               b.deposit, m.booking_cost, b.note, b.created_at,
+               b.deposit, m.booking_cost, b.note,
                CASE WHEN b.status = 'cancelled' THEN NULL ELSE (
                    SELECT COUNT(*) + 1 FROM booking_record x
                     WHERE x.mmg_id = b.mmg_id
@@ -545,28 +583,23 @@ def list_player_bookings(
                       AND x.session_time = b.session_time
                       AND x.status <> 'cancelled'
                       AND x.created_at < b.created_at
-               ) END AS position
+               ) END AS position,
+               u1.name, u2.name, u3.name, u4.name
           FROM booking_record b
           JOIN mmg m ON m.id = b.mmg_id
-         WHERE b.player_id = %s
-           AND (%s OR b.status <> 'cancelled')
-         ORDER BY b.session_date DESC, b.session_time DESC, b.created_at DESC
-         LIMIT %s OFFSET %s
+          LEFT JOIN users u1 ON u1.id = b.gm1_user_id
+          LEFT JOIN users u2 ON u2.id = b.gm2_user_id
+          LEFT JOIN users u3 ON u3.id = b.gm3_user_id
+          LEFT JOIN users u4 ON u4.id = b.gm4_user_id
+         WHERE b.player_id = %(player)s
+           AND b.status = %(tab)s
+           {where}
+         ORDER BY {order}
+         LIMIT %(limit)s OFFSET %(offset)s
         """,
-        (player_id, include_cancelled, PAGE_SIZE + 1, start - 1),
+        {"player": player_id, "tab": tab, "offset": start - 1, **fp},
+        item,
     )
-    out = []
-    for r in cur.fetchall():
-        out.append({
-            "id": r[0], "mmg_name": r[1],
-            "session_date": r[2].isoformat(), "session_time": r[3].strftime("%H:%M"),
-            "status": r[4], "deposit": r[5], "booking_cost": r[6],
-            "note": r[7], "created_at": r[8].isoformat(),
-            "position": r[9],
-            "is_first": r[9] == 1 if r[9] is not None else False,
-        })
-    has_more = len(out) > PAGE_SIZE
-    return {"items": out[:PAGE_SIZE], "has_more": has_more}
 
 
 def cancel_booking(cur, booking_id: int, *, note: str | None = None) -> dict:

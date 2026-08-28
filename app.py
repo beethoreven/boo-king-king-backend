@@ -591,10 +591,22 @@ def create_booking_route():
     }), (200 if result.already_existed else 201)
 
 
-@app.get("/api/bookings/mine")
+@app.get("/api/bookings/mine/tabs")
 @require_auth
-def my_bookings():
-    include_cancelled = request.args.get("include_cancelled") == "1"
+def my_booking_tabs():
+    """頁籤清單。只是把後端定義的順序與標籤交給前端，讓兩邊不會各寫一份。"""
+    return jsonify({"tabs": bookings_db.PLAYER_TABS})
+
+
+@app.get("/api/bookings/mine/tab/<tab>")
+@require_auth
+def my_bookings_tab(tab: str):
+    """自己在某個狀態下的預約，一次一頁。
+
+    ★ 一次只給一個頁籤，不像管理員那支一口氣回五包。玩家的畫面同一時間
+      只看得到一個頁籤，先把另外四包撈出來是替他決定他要看什麼——而每一
+      包都是一次查詢。切過去再抓就好。
+    """
     try:
         start = int(request.args.get("start", 1))
     except ValueError:
@@ -602,11 +614,15 @@ def my_bookings():
     if start < 1:
         return jsonify({"error": "start 必須大於 0"}), 400
 
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            return jsonify(bookings_db.list_player_bookings(
-                cur, g.user["id"], include_cancelled=include_cancelled, start=start,
-            ))
+    try:
+        filters = _parse_filters(request.args)
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                return jsonify(bookings_db.list_player_tab(
+                    cur, g.user["id"], tab, start=start, filters=filters,
+                ))
+    except BookingError as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.get("/api/bookings/<int:booking_id>")
