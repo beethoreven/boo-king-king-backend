@@ -453,8 +453,15 @@ def get_booking(cur, booking_id: int) -> dict | None:
     }
 
 
-def list_player_bookings(cur, player_id: int, *, include_cancelled: bool = False) -> list[dict]:
-    """某位玩家的預約，新的在前。順位即時算出來，不從欄位讀。"""
+def list_player_bookings(
+    cur, player_id: int, *, include_cancelled: bool = False, start: int = 1
+) -> dict:
+    """某位玩家的預約，新的在前。順位即時算出來，不從欄位讀。
+
+    跟主持人與管理員的場次清單走同一套分頁（一頁 PAGE_SIZE 筆、多撈一筆
+    判斷有沒有下一頁），回傳 {"items": [...], "has_more": bool}。常客累積
+    幾年的預約一次全吐出來，對手機來說是純粹的浪費。
+    """
     cur.execute(
         """
         SELECT b.id, m.name, b.session_date, b.session_time, b.status,
@@ -472,8 +479,9 @@ def list_player_bookings(cur, player_id: int, *, include_cancelled: bool = False
          WHERE b.player_id = %s
            AND (%s OR b.status <> 'cancelled')
          ORDER BY b.session_date DESC, b.session_time DESC, b.created_at DESC
+         LIMIT %s OFFSET %s
         """,
-        (player_id, include_cancelled),
+        (player_id, include_cancelled, PAGE_SIZE + 1, start - 1),
     )
     out = []
     for r in cur.fetchall():
@@ -485,7 +493,8 @@ def list_player_bookings(cur, player_id: int, *, include_cancelled: bool = False
             "position": r[9],
             "is_first": r[9] == 1 if r[9] is not None else False,
         })
-    return out
+    has_more = len(out) > PAGE_SIZE
+    return {"items": out[:PAGE_SIZE], "has_more": has_more}
 
 
 def cancel_booking(cur, booking_id: int, *, note: str | None = None) -> dict:

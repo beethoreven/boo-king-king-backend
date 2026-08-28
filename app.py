@@ -440,12 +440,18 @@ def create_booking_route():
 @require_auth
 def my_bookings():
     include_cancelled = request.args.get("include_cancelled") == "1"
+    try:
+        start = int(request.args.get("start", 1))
+    except ValueError:
+        return jsonify({"error": "start 必須是數字"}), 400
+    if start < 1:
+        return jsonify({"error": "start 必須大於 0"}), 400
+
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            rows = bookings_db.list_player_bookings(
-                cur, g.user["id"], include_cancelled=include_cancelled
-            )
-    return jsonify(rows)
+            return jsonify(bookings_db.list_player_bookings(
+                cur, g.user["id"], include_cancelled=include_cancelled, start=start,
+            ))
 
 
 @app.get("/api/bookings/<int:booking_id>")
