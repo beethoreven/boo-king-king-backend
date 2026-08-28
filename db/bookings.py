@@ -186,9 +186,11 @@ def find_conflicts(cur, booking_id: int) -> dict:
     }
 
     # ── 劇本本身被排了兩場 ──
+    # 撞到的必然是同一個劇本（WHERE 就是這樣寫的），名稱仍然帶回去：
+    # 對話框上只寫時間，讀的人得自己回想「哪一齣」，而那個資訊我們手上有。
     cur.execute(
         f"""
-        SELECT DISTINCT b2.session_date, b2.session_time
+        SELECT DISTINCT m2.name, b2.session_date, b2.session_time
           FROM booking_record b2
           JOIN mmg m2 ON m2.id = b2.mmg_id
          WHERE b2.status = 'booked'
@@ -200,7 +202,8 @@ def find_conflicts(cur, booking_id: int) -> dict:
         params,
     )
     script = [
-        {"session_date": r[0].isoformat(), "session_time": r[1].strftime("%H:%M")}
+        {"mmg_name": r[0], "session_date": r[1].isoformat(),
+         "session_time": r[2].strftime("%H:%M")}
         for r in cur.fetchall()
     ]
 
