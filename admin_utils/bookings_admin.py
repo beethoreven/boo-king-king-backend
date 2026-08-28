@@ -15,6 +15,7 @@ from db.bookings import (
     PAGE_SIZE,
     VALID_STATUSES,
     BookingError,
+    create_booking,
     filter_clauses,
     paged,
     record_deposit,
@@ -83,6 +84,40 @@ def list_tab(cur, tab: str, *, start: int = 1, filters: dict | None = None) -> d
 def overview(cur) -> dict:
     """初次載入：五個子頁籤各第一頁。"""
     return {tab: list_tab(cur, tab) for tab in TABS}
+
+
+def create(cur, data: dict) -> int:
+    """管理員手動建立一筆場次（電話預約之類的）。回傳新的 id。
+
+    刻意走 create_booking() 而不是自己 INSERT：那支帶著 advisory lock、
+    容量檢查與撞期檢查。繞過去等於讓管理員這條路做得出玩家那條路會被
+    擋下來的事——超賣、把同一位主持人排進兩場重疊的戲。管理員真的要
+    覆寫的話，建立完再進編輯畫面改，那裡才是人工介入的地方。
+
+    request_id 這裡自己產生（create_booking 沒收到就會自己給一組）：
+    冪等保護是為了「玩家網路不穩重按送出」而存在的，管理員在後台一筆
+    一筆建，沒有那個情境。
+
+    建立之後再套一次 update()，把狀態、訂金、備註、確認勾這些
+    create_booking() 不收的欄位寫進去。
+    """
+    gm_user_ids = data.get("gm_user_ids") or [None] * 4
+    if len(gm_user_ids) != 4:
+        raise BookingError("gm_user_ids 需要剛好 4 個元素")
+
+    result = create_booking(
+        cur,
+        mmg_id=data.get("mmg_id"),
+        player_id=data.get("player_id"),
+        session_date=data.get("session_date"),
+        session_time=data.get("session_time"),
+        gm_user_ids=list(gm_user_ids),
+        deposit=int(data.get("deposit") or 0),
+        note=(data.get("note") or "").strip() or None,
+    )
+    # 狀態預設是 gm_confirm；管理員若指定了別的（或勾了確認），補一次更新。
+    update(cur, result.id, data)
+    return result.id
 
 
 def update(cur, booking_id: int, data: dict) -> bool:

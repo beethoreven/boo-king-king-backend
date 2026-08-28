@@ -788,6 +788,18 @@ def admin_bookings_tab(tab: str):
         return jsonify({"error": str(exc)}), 400
 
 
+@app.post("/api/admin/bookings")
+@require_role(1)
+@_admin_write
+def admin_create_booking(cur, body):
+    """管理員手動建立場次。日期時間在這裡就解析成 date/time 物件，
+    底下的 create/update 都以物件比對，不處理字串。"""
+    d, t = _parse_slot(body)
+    body = {**body, "session_date": d, "session_time": t}
+    new_id = bookings_admin.create(cur, body)
+    return jsonify(bookings_db.get_booking(cur, new_id)), 201
+
+
 @app.put("/api/admin/bookings/<int:booking_id>")
 @require_role(1)
 @_admin_write
