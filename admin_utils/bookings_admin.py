@@ -114,6 +114,8 @@ def create(cur, data: dict) -> int:
         gm_user_ids=list(gm_user_ids),
         deposit=int(data.get("deposit") or 0),
         note=(data.get("note") or "").strip() or None,
+        # 管理員要看得到是什麼撞到才處理得了；玩家那條路走預設值。
+        detailed_conflict=True,
     )
     # 狀態預設是 gm_confirm；管理員若指定了別的（或勾了確認），補一次更新。
     update(cur, result.id, data)

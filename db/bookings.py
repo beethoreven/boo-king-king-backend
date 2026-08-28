@@ -339,6 +339,7 @@ def create_booking(
     request_id: str | None = None,
     deposit: int = 0,
     note: str | None = None,
+    detailed_conflict: bool = False,
 ) -> BookingResult:
     """建立一筆預約，回傳它的順位。
 
@@ -372,6 +373,11 @@ def create_booking(
 
     clash = has_room_conflict(cur, mmg_id, session_date, session_time)
     if clash is not None:
+        # ★ 預設不講是被什麼撞到。這支同時服務玩家與管理員兩條路徑，
+        #   而玩家不該知道包廂裡在演什麼、誰訂的、演到幾點——那是別的
+        #   客人的預約。管理員要處理衝突，才傳 detailed_conflict=True。
+        if not detailed_conflict:
+            raise BookingError("本時段有衝突場次，請改選其他時間")
         other_name, other_d, other_t, other_period, other_reset = clash
         raise BookingError(
             f"包廂在這段時間已經排了《{other_name}》"
