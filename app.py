@@ -732,6 +732,22 @@ def _admin_write(fn):
     return wrapper
 
 
+@app.post("/api/admin/bookings/tidy")
+@require_role(1)
+def admin_tidy_bookings():
+    """管理員手動的「場次整理」。
+
+    跟每日排程做同一件事，差別只在時間範圍：這支不設回看窗口，把所有
+    今天以前的場次一次處理完。排程漏跑幾天之後用這個補，不必為了防漏
+    再疊一層自動補償機制。
+
+    跟排程那支分開路由而不是加個參數：這支的授權方式不同（管理員登入
+    session，不是 JOB_TOKEN），混在一起會讓「誰能觸發什麼」變得不明顯。
+    """
+    result = jobs.run_full(pool)
+    return jsonify(result), (500 if result.get("errors") else 200)
+
+
 @app.get("/api/admin/mmg")
 @require_role(1)
 def admin_list_mmg():

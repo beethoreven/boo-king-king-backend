@@ -864,7 +864,7 @@ def mark_ended(cur, booking_id: int) -> dict:
 ENDED_LOOKBACK_DAYS = 2
 
 
-def mark_ended_batch(cur, *, lookback_days: int = ENDED_LOOKBACK_DAYS) -> int:
+def mark_ended_batch(cur, *, lookback_days = ENDED_LOOKBACK_DAYS) -> int:
     """把所有「已成立、且場次時間加上劇本時長已經過去」的預約批次轉成
     ended。設計成排程呼叫（建議每天 00:00 一次），不是每次查詢時即時
     判斷——理由見 schema.py：status 欄位裡存的值才是唯一事實，不該讓
@@ -894,10 +894,14 @@ def mark_ended_batch(cur, *, lookback_days: int = ENDED_LOOKBACK_DAYS) -> int:
            -- cancel_expired_batch 又刻意跳過 booked，於是它會永遠停在
            -- booked。run_daily() 因此回報 stale_booked，讓漏掉的場次至少
            -- 是看得見的，而不是安靜地卡著。
-           AND b.session_date >= (NOW() AT TIME ZONE 'Asia/Taipei')::date
-                                 - %s::int
+           --
+           -- lookback_days 傳 None 就不設窗口，全部歷史一起處理——管理員
+           -- 介面的「場次整理」走這條，用來手動補上漏跑的那幾天。
+           AND (%(lookback)s::int IS NULL
+                OR b.session_date >= (NOW() AT TIME ZONE 'Asia/Taipei')::date
+                                     - %(lookback)s::int)
         """,
-        (lookback_days,),
+        {"lookback": lookback_days},
     )
     return cur.rowcount
 
@@ -927,7 +931,47 @@ def cancel_expired_batch(cur) -> int:
     return cur.rowcount
 
 
-def count_stale_booked(cur, *, lookback_days: int = ENDED_LOOKBACK_DAYS) -> int:
+# 候補的保存期限。玩家在加入一個「已經有人成立」的時段時被告知：正選沒
+# 取消的話，這張候補三天後自動失效。這個天數就是那句話的依據，改這裡的
+# 同時要改 booking.js 的 slotMessage()。
+WAITLIST_EXPIRY_DAYS = 3
+
+
+def expire_stale_waitlist_batch(cur, *, days: int = WAITLIST_EXPIRY_DAYS) -> int:
+    """把「排在已成立場次後面、且掛太久」的候補批次轉成 cancelled。
+
+    對應玩家看到的那句「若排定預約未取消，候補將於三天後自動失效」。
+    在這支存在之前那是一張空頭支票——訊息這樣寫，但沒有任何東西在做。
+
+    天數從**這張候補自己建立的時間**算起，不是從正選成立算起：那句話是
+    在玩家按下預約的當下對他說的，他理解的三天當然從那一刻開始。
+
+    只在「該時段真的有一組 booked」時才失效。正選後來取消了的話，這張
+    候補實際上已經遞補上去，沒有理由讓它過期。
+
+    跟 cancel_expired_batch 一樣跳過 booked／cancelled／ended。
+    """
+    cur.execute(
+        """
+        UPDATE booking_record w
+           SET status = 'cancelled'
+         WHERE w.status NOT IN ('booked', 'cancelled', 'ended')
+           AND w.created_at < NOW() - (%s::int * interval '1 day')
+           AND EXISTS (
+                 SELECT 1 FROM booking_record p
+                  WHERE p.mmg_id = w.mmg_id
+                    AND p.session_date = w.session_date
+                    AND p.session_time = w.session_time
+                    AND p.id <> w.id
+                    AND p.status = 'booked'
+               )
+        """,
+        (days,),
+    )
+    return cur.rowcount
+
+
+def count_stale_booked(cur, *, lookback_days = ENDED_LOOKBACK_DAYS) -> int:
     """已經結束、卻因為超出回看窗口而不會再被轉成 ended 的場次數。
 
     正常運作下永遠是 0。不是 0 就代表排程漏跑過，而那些場次靠自己不會
