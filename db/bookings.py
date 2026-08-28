@@ -847,7 +847,12 @@ def mark_ended(cur, booking_id: int) -> dict:
     return get_booking(cur, booking_id)
 
 
-def mark_ended_batch(cur) -> int:
+# 往回看幾天。遊戲可能跨一個夜（晚上開場、隔天早上結束），但不會跨兩個，
+# 所以兩天足以涵蓋任何一場「昨天開、今天才結束」的場次。
+ENDED_LOOKBACK_DAYS = 2
+
+
+def mark_ended_batch(cur, *, lookback_days: int = ENDED_LOOKBACK_DAYS) -> int:
     """把所有「已成立、且場次時間加上劇本時長已經過去」的預約批次轉成
     ended。設計成排程呼叫（建議每天 00:00 一次），不是每次查詢時即時
     判斷——理由見 schema.py：status 欄位裡存的值才是唯一事實，不該讓
@@ -872,9 +877,61 @@ def mark_ended_batch(cur) -> int:
            AND b.status = 'booked'
            AND (b.session_date + b.session_time) AT TIME ZONE 'Asia/Taipei'
                  + (m.period * interval '1 hour') <= NOW()
+           -- 只往回看幾天。★ 這道限制會在 job 連續數天沒跑時留下漏網之魚：
+           -- 超出窗口的 booked 場次不會再被這支轉成 ended，而下面那支
+           -- cancel_expired_batch 又刻意跳過 booked，於是它會永遠停在
+           -- booked。run_daily() 因此回報 stale_booked，讓漏掉的場次至少
+           -- 是看得見的，而不是安靜地卡著。
+           AND b.session_date >= (NOW() AT TIME ZONE 'Asia/Taipei')::date
+                                 - %s::int
+        """,
+        (lookback_days,),
+    )
+    return cur.rowcount
+
+
+def cancel_expired_batch(cur) -> int:
+    """把「日期已經過去、卻還沒成立也沒取消」的預約批次轉成 cancelled。
+
+    針對的是 gm_confirm 與 gm_reviewed：場次日期都過了還沒走完流程，那場
+    就是沒發生。留著它們會讓待辦清單愈積愈多，也會讓容量計算把早就作廢的
+    組別繼續算進去（容量看的是「沒取消」）。
+
+    刻意跳過 booked：那些是真的有開的場次，該由 mark_ended_batch() 轉成
+    ended，不是取消。也跳過 ended 與 cancelled，它們已經是終點。
+
+    比的是「日期」不是「日期加時間」：一場昨天 23:00 的預約，今天 00:00
+    跑的時候場次才過了一小時，但日期已經翻頁——沒人在那個時間點還會來確認
+    它。用日期比對讓這條規則跟排程的節奏一致（每天 00:00 一次）。
+    """
+    cur.execute(
+        """
+        UPDATE booking_record
+           SET status = 'cancelled'
+         WHERE status NOT IN ('booked', 'cancelled', 'ended')
+           AND session_date < (NOW() AT TIME ZONE 'Asia/Taipei')::date
         """
     )
     return cur.rowcount
+
+
+def count_stale_booked(cur, *, lookback_days: int = ENDED_LOOKBACK_DAYS) -> int:
+    """已經結束、卻因為超出回看窗口而不會再被轉成 ended 的場次數。
+
+    正常運作下永遠是 0。不是 0 就代表排程漏跑過，而那些場次靠自己不會
+    再回到正軌——這個數字是用來讓那件事被看見的。
+    """
+    cur.execute(
+        """
+        SELECT COUNT(*) FROM booking_record b JOIN mmg m ON m.id = b.mmg_id
+         WHERE b.status = 'booked'
+           AND (b.session_date + b.session_time) AT TIME ZONE 'Asia/Taipei'
+                 + (m.period * interval '1 hour') <= NOW()
+           AND b.session_date < (NOW() AT TIME ZONE 'Asia/Taipei')::date - %s::int
+        """,
+        (lookback_days,),
+    )
+    return cur.fetchone()[0]
 
 
 def set_status(cur, booking_id: int, status: str, *, note: str | None = None) -> dict:

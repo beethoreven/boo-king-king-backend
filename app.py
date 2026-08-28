@@ -23,6 +23,7 @@ from auth_utils import sessions, whitelist  # noqa: E402
 from auth_utils.decorators import require_auth, require_role  # noqa: E402
 from auth_utils.google_auth import extract_bearer_token, verify_google_id_token  # noqa: E402
 from admin_utils import bookings_admin, mmg_admin, users_admin  # noqa: E402
+import jobs  # noqa: E402
 from db import bookings as bookings_db  # noqa: E402
 from db import mmg as mmg_db  # noqa: E402
 from db.bookings import BookingError  # noqa: E402
@@ -89,6 +90,27 @@ def health():
     workspace 的免費服務停用到下個月——保活範圍要收窄，不要全天候。
     """
     return jsonify({"status": "ok"})
+
+
+@app.post("/api/jobs/daily")
+def run_daily_jobs():
+    """每日排程的觸發點（cron-job.org 每天 00:00 打這一支）。
+
+    用 JOB_TOKEN 保護，不掛 require_role：這支不是由人呼叫的，沒有登入
+    session 可用。token 從環境變數讀，沒設就一律拒絕——預設關閉，不是
+    預設開放。
+
+    任何一段出錯就回 500，讓排程服務按它自己的設定重試。重跑是安全的
+    （見 jobs.py），所以重試不會有副作用。
+    """
+    expected = os.environ.get("JOB_TOKEN")
+    if not expected:
+        return jsonify({"error": "JOB_TOKEN 未設定，排程端點停用"}), 503
+    if request.headers.get("X-Job-Token") != expected:
+        return jsonify({"error": "未授權"}), 401
+
+    result = jobs.run_daily(pool)
+    return jsonify(result), (500 if result.get("errors") else 200)
 
 
 @app.get("/api/ready")
