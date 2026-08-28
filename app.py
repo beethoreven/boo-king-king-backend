@@ -176,6 +176,10 @@ def login():
             # 缺的只是聯絡資料——那要靠 /auth/register 補，而註冊本身就需要
             # 一張憑證來證明「填這份表的人就是剛才登入的那個 email」。
             token = sessions.create_session(cur, email)
+            has_contact = (
+                profile.has_complete_contact(profile.get(cur, user["id"]))
+                if user is not None else False
+            )
             conn.commit()
 
     if user is None:
@@ -204,6 +208,7 @@ def login():
             "registered": True,
             "authorized": True,
             "status": user["status"],
+            "has_contact": has_contact,
         }
     )
 
@@ -242,6 +247,12 @@ def auth_status():
                 conn.commit()
                 return jsonify({"error": "登入憑證無效或已過期"}), 401
             user = whitelist.get_user(cur, email)
+            # 聯絡資料是否齊全。只回一個布林值，不回內容——前端只需要知道
+            # 「能不能訂場」，而 line_id/phone 也不該進權限快取（那份快取
+            # 在每個請求的熱路徑上，聯絡資料只有兩個畫面要用）。
+            has_contact = False
+            if user is not None:
+                has_contact = profile.has_complete_contact(profile.get(cur, user["id"]))
             conn.commit()
 
     authorized = bool(user and user["status"] == "active")
@@ -259,6 +270,7 @@ def auth_status():
             "name": user["name"] if user else None,
             "role": user["role"] if user else None,
             "is_admin": bool(user and user["role"] == 1),
+            "has_contact": has_contact,
         }
     )
 
