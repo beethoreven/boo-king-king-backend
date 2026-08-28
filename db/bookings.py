@@ -295,12 +295,17 @@ def create_booking(
     _lock_hosts(cur, host_ids)
     _validate_gm_choice(cur, mmg_id, gm_user_ids)
 
-    # 容量 = 1 + waitlist_limit 組（欄位名沿用，指的是第 2 序位之後的上限）；
-    # period 用來換算這場實際
-    # 佔用到幾點，供劇本／主持人的排程衝突檢查用。
+    # waitlist_limit 就是這個時段的總容量，不是「第 1 序位之外還能排幾組」。
+    # 設 3 就是最多 3 組，第 4 組會被擋下。
+    #
+    # 計數的基準是「沒有取消」，不是「還沒成立」——已成立的那一組同樣佔著
+    # 一個位子。這是刻意的：容量要擋的是「這個時段總共排了幾組人」，一組
+    # 已經成立的預約不會因為成立了就不佔位。
+    #
+    # period 用來換算這場實際佔用到幾點，供劇本／主持人的排程衝突檢查用。
     cur.execute("SELECT name, waitlist_limit, period FROM mmg WHERE id = %s", (mmg_id,))
     mms_name, waitlist_limit, period = cur.fetchone()
-    capacity = 1 + waitlist_limit
+    capacity = waitlist_limit
 
     start = datetime.combine(session_date, session_time)
     end = start + timedelta(hours=float(period))
@@ -349,7 +354,7 @@ def create_booking(
         if current >= capacity:
             raise BookingError(
                 f"《{mms_name}》{session_date} {session_time} 已額滿"
-                f"（最多 {1 + waitlist_limit} 組）"
+                f"（最多 {waitlist_limit} 組）"
             )
         booking_id = row[0]
         already_existed = False

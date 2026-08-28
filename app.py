@@ -277,7 +277,10 @@ def get_slot(mmg_id: int):
                 return jsonify({"error": "找不到這個劇本"}), 404
             queue = bookings_db.list_slot(cur, mmg_id, d, t)
 
-    capacity = 1 + item["waitlist_limit"]
+    capacity = item["waitlist_limit"]
+    # 這個時段有沒有已經成立的那一組。玩家看到的說法差很多：已經有人
+    # 成立了，後面排的就是候補；都還沒成立的話，大家只是先後順序不同。
+    has_booked = any(st == "booked" for _p, _b, _n, st, _d, _t2, _r in queue)
     return jsonify({
         "mmg_id": mmg_id,
         "mmg_name": item["name"],
@@ -285,6 +288,7 @@ def get_slot(mmg_id: int):
         "session_time": t.strftime("%H:%M"),
         "capacity": capacity,
         "taken": len(queue),
+        "has_booked": has_booked,
         "is_full": len(queue) >= capacity,
         "queue": [
             {"position": p, "booking_id": bid, "player_name": nm,
