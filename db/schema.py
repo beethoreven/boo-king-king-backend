@@ -180,6 +180,14 @@ def _ensure_mmg(cur) -> None:
             -- 遊戲時長（小時），允許小數點以下一位，例如 3.5
             period NUMERIC(3, 1),
 
+            -- 開演前的場地佈置時間、散場後的還原時間，單位與精度同 period。
+            -- 這兩段時間包廂一樣是被佔著的，所以一場戲實際佔用的區間是
+            --   [開始 - ready_time_cost, 開始 + period + reset_time_cost]
+            -- 衝突判定比的就是這個區間，不是 period 本身（見 db/bookings.py
+            -- 的 _has_room_conflict）。
+            ready_time_cost NUMERIC(3, 1) NOT NULL DEFAULT 0.5,
+            reset_time_cost NUMERIC(3, 1) NOT NULL DEFAULT 0.5,
+
             -- 金額與訂金，都是整數（新台幣元，不處理角）
             price INTEGER,
             booking_cost INTEGER,
@@ -229,6 +237,13 @@ def _ensure_mmg(cur) -> None:
     # 順序的語法，只能重建整張表。要讓現有資料庫也變成相鄰排列，
     # 跑一次 db/migrate_reorder_mms.py。
     existing = _existing_columns(cur, "mmg")
+    for col in ("ready_time_cost", "reset_time_cost"):
+        if col not in existing:
+            # 既有資料一律 0.5 小時。DEFAULT 會把現有的列一起填上，
+            # 不需要另外 UPDATE。
+            cur.execute(
+                f"ALTER TABLE mmg ADD COLUMN {col} NUMERIC(3, 1) NOT NULL DEFAULT 0.5"
+            )
     if "room_id" not in existing:
         # 既有資料一律歸到第一間包廂：導入這個欄位之前只有一間，
         # 所有劇本本來就都在那裡演。

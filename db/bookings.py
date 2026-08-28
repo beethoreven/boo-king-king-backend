@@ -77,79 +77,113 @@ def _lock_hosts(cur, host_ids: list[int]) -> None:
         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"host|{host_id}",))
 
 
-def _has_room_conflict(cur, mmg_id: int, session_date, session_time, start, end) -> tuple | None:
+# 一場戲實際佔用包廂的區間。
+#
+#   [開始 - ready_time_cost, 開始 + period + reset_time_cost]
+#
+# 佈置與還原期間包廂一樣不能給別人用，所以佔用的不只是 period。兩場戲的
+# 佔用區間有重疊就是衝突。
+#
+# ★ 這個寫法讓「往前」與「往後」自動都對，不必分開判斷。展開來看，X 較早、
+#   Y 較晚時，重疊的條件會化簡成
+#       Y.開始 < X.開始 + X.period + X.reset + Y.ready
+#   ——正是「前一場做完、收完，再加上我要的佈置時間」。反過來由 X 看出去
+#   是同一條不等式，所以兩個方向不會有不一致的答案。
+#
+# ★ 用 < 而不是 <=：緩衝時間現在由 ready/reset 明確表達了，端點剛好相接
+#   代表「收拾完、也佈置完，下一場正好開始」，那是允許的。改成 <= 等於把
+#   同一段緩衝算兩次。（在有這兩個欄位之前，規則是 <=，靠它來擠出換場
+#   時間；那個理由已經不存在。）
+_OCCUPY_START = "(b.session_date + b.session_time)::timestamp - (m2.ready_time_cost * interval '1 hour')"
+_OCCUPY_END = ("(b.session_date + b.session_time)::timestamp "
+               "+ ((m2.period + m2.reset_time_cost) * interval '1 hour')")
+
+
+def _has_room_conflict(cur, mmg_id: int, session_date, session_time) -> tuple | None:
     """這齣戲要用的那間包廂，在這段時間內是不是已經被別的成立場次佔著。
-    撞到的話回傳 (劇本名, 日期, 時間, 時長)，沒撞回傳 None。
+    撞到的話回傳 (劇本名, 日期, 時間, period, reset)，沒撞回傳 None。
 
     ★ 比對的對象是「包廂」不是「劇本」。同一間包廂裡，10:00 開演的 12
-      小時本做到 22:00，20:00 就不能再開另一齣戲——即使那是完全不同的
-      劇本。舊版比對的是 b.mmg_id = 當前劇本，只擋得住「同一齣戲被排兩
-      場」，所有跨劇本的重疊都會漏掉。
+      小時本做到 22:00、收到 22:30，20:00 就不能再開另一齣戲——即使那是
+      完全不同的劇本。
 
-    往前與往後用的時長不同，這是重點：
-      往後看——我這場從 start 做到 end，用的是「我的」period（呼叫端算好
-               傳進來）
-      往前看——前一場從它的開始時間做到它的開始時間加「它的」period
-               （m2.period，join 的是對方那筆的劇本）
-    兩邊各用自己的長度，才是正確的區間重疊判定。這一點舊版其實已經寫對
-    了，只是因為範圍限制在同一個劇本、period 必然相同，看不出差別。
-
-    含首尾相接（<= 而不是 <）：22:00 結束的場，22:00 不能開下一場。當初
-    定的規則是「避免無縫接軌」，中間要留得下收拾與換場的時間。
+    佔用區間包含佈置與還原時間，兩邊各用自己的（見上方 _OCCUPY_*）。
+    候選場次的區間直接在 SQL 裡從 mmg 讀，不由呼叫端算好傳進來：時長、
+    佈置、還原三個值都在資料庫，繞出去一趟只是多一個會不同步的地方。
 
     排除「同一個劇本的同一個時段」：那是同一場遊戲的各個序位，不是被排了
     兩場。不同劇本在同一個時段就是真的撞了，不能排除。
     """
     cur.execute(
-        """
-        SELECT m2.name, b.session_date, b.session_time, m2.period
+        f"""
+        WITH me AS (
+            SELECT room_id,
+                   (%(d)s + %(t)s)::timestamp - (ready_time_cost * interval '1 hour') AS occupy_start,
+                   (%(d)s + %(t)s)::timestamp
+                     + ((period + reset_time_cost) * interval '1 hour') AS occupy_end
+              FROM mmg WHERE id = %(mmg)s
+        )
+        SELECT m2.name, b.session_date, b.session_time, m2.period, m2.reset_time_cost
           FROM booking_record b
           JOIN mmg m2 ON m2.id = b.mmg_id
+          CROSS JOIN me
          WHERE b.status = 'booked'
-           AND m2.room_id = (SELECT room_id FROM mmg WHERE id = %(mmg)s)
+           AND m2.room_id = me.room_id
            AND NOT (b.mmg_id = %(mmg)s
                     AND b.session_date = %(d)s
                     AND b.session_time = %(t)s)
-           AND (b.session_date + b.session_time)::timestamp <= %(end)s
-           AND %(start)s <= (b.session_date + b.session_time)::timestamp
-                            + (m2.period * interval '1 hour')
+           AND {_OCCUPY_START} < me.occupy_end
+           AND me.occupy_start < {_OCCUPY_END}
          ORDER BY b.session_date, b.session_time
          LIMIT 1
         """,
-        {"mmg": mmg_id, "d": session_date, "t": session_time, "start": start, "end": end},
+        {"mmg": mmg_id, "d": session_date, "t": session_time},
     )
     return cur.fetchone()
 
 
 def conflicting_host(
-    cur, host_ids: list[int], mmg_id: int, session_date, session_time, start, end
+    cur, host_ids: list[int], mmg_id: int, session_date, session_time
 ) -> int | None:
     """host_ids 裡任何一位在這段時間有沒有別的（不同場次的）已成立預約，
     回傳第一個撞期的 user id；都沒撞回傳 None。
+
+    佔用區間的定義與包廂那支完全相同（見 _OCCUPY_*）：主持人一樣要在場地
+    佈置與還原的時間裡待著，不是遊戲結束就能立刻去帶下一場。
 
     排除條件是「跟候選場次完全相同的 (mmg_id, session_date, session_time)」，
     不是「這位主持人」本身——同一場遊戲底下各序位掛的是同一位主持人，
     那是同一件事被記錄很多次，不是這位主持人被排了兩場不同的戲。
     """
-    for host_id in host_ids:
-        cur.execute(
-            """
-            SELECT EXISTS (
-                SELECT 1 FROM booking_record b
-                JOIN mmg m ON m.id = b.mmg_id
-                WHERE b.status = 'booked'
-                  AND %s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
-                  AND NOT (b.mmg_id = %s AND b.session_date = %s AND b.session_time = %s)
-                  AND (b.session_date + b.session_time)::timestamp <= %s
-                  AND %s <= (b.session_date + b.session_time)::timestamp
-                            + (m.period * interval '1 hour')
-            )
-            """,
-            (host_id, mmg_id, session_date, session_time, end, start),
+    if not host_ids:
+        return None
+    cur.execute(
+        f"""
+        WITH me AS (
+            SELECT (%(d)s + %(t)s)::timestamp - (ready_time_cost * interval '1 hour') AS occupy_start,
+                   (%(d)s + %(t)s)::timestamp
+                     + ((period + reset_time_cost) * interval '1 hour') AS occupy_end
+              FROM mmg WHERE id = %(mmg)s
         )
-        if cur.fetchone()[0]:
-            return host_id
-    return None
+        SELECT u.id
+          FROM booking_record b
+          JOIN mmg m2 ON m2.id = b.mmg_id
+          JOIN users u ON u.id = ANY(%(hosts)s)
+                      AND u.id IN (b.gm1_user_id, b.gm2_user_id,
+                                   b.gm3_user_id, b.gm4_user_id)
+          CROSS JOIN me
+         WHERE b.status = 'booked'
+           AND NOT (b.mmg_id = %(mmg)s
+                    AND b.session_date = %(d)s
+                    AND b.session_time = %(t)s)
+           AND {_OCCUPY_START} < me.occupy_end
+           AND me.occupy_start < {_OCCUPY_END}
+         LIMIT 1
+        """,
+        {"hosts": host_ids, "mmg": mmg_id, "d": session_date, "t": session_time},
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
 
 
 def find_conflicts(cur, booking_id: int) -> dict:
@@ -163,17 +197,20 @@ def find_conflicts(cur, booking_id: int) -> dict:
         不限同一個劇本：他可能被指定去帶另一齣戲，時間一樣會撞。
 
     兩者可以各自成立，也可以同時發生。分開回傳讓呼叫端決定各自要怎麼
-    處置——目前是劇本衝突可以放行、主持人自己撞期不能放行。
+    處置——目前是包廂衝突可以放行、主持人自己撞期不能放行。
+
+    佔用區間含佈置與還原時間，與 _has_room_conflict／conflicting_host
+    用的是同一組定義（_OCCUPY_*）。三支必須一致：一支說可以、另一支說
+    不行，畫面就會自相矛盾。
 
     都只看 status = 'booked'。同一個時段有好幾組在排隊是正常的（那正是
     序位的意義），真正的衝突是「已經成立的那一場把資源佔住了」。
     """
     cur.execute(
         """
-        SELECT b.mmg_id, b.session_date, b.session_time, m.period,
+        SELECT b.mmg_id, b.session_date, b.session_time,
                b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id
-          FROM booking_record b JOIN mmg m ON m.id = b.mmg_id
-         WHERE b.id = %s
+          FROM booking_record b WHERE b.id = %s
         """,
         (booking_id,),
     )
@@ -181,41 +218,40 @@ def find_conflicts(cur, booking_id: int) -> dict:
     if row is None:
         raise BookingError(f"預約 id={booking_id} 不存在")
 
-    mmg_id, session_date, session_time, period = row[0], row[1], row[2], row[3]
-    if period is None:
-        return {"room": [], "hosts": []}
+    mmg_id, session_date, session_time = row[0], row[1], row[2]
+    host_ids = [h for h in row[3:7] if h is not None]
 
-    host_ids = [h for h in row[4:8] if h is not None]
-    start = datetime.combine(session_date, session_time)
-    end = start + timedelta(hours=float(period))
-
-    # 兩段查詢共用的重疊條件與排除條件。排除「同一個劇本的同一個時段」
-    # 是因為那是同一場遊戲的各個序位，不是被排了兩場；不同劇本在同一個
-    # 時段則是真的撞了，不排除。
-    overlap = """
+    # 候選場次自己的佔用區間，跟另外兩支用同一個定義。
+    me_cte = """
+        WITH me AS (
+            SELECT room_id,
+                   (%(d)s + %(t)s)::timestamp - (ready_time_cost * interval '1 hour') AS occupy_start,
+                   (%(d)s + %(t)s)::timestamp
+                     + ((period + reset_time_cost) * interval '1 hour') AS occupy_end
+              FROM mmg WHERE id = %(mmg_id)s
+        )
+    """
+    overlap = f"""
            AND NOT (b2.mmg_id = %(mmg_id)s
                     AND b2.session_date = %(d)s
                     AND b2.session_time = %(t)s)
-           AND (b2.session_date + b2.session_time)::timestamp <= %(end)s
-           AND %(start)s <= (b2.session_date + b2.session_time)::timestamp
-                            + (m2.period * interval '1 hour')
+           AND {_OCCUPY_START.replace('b.', 'b2.')} < me.occupy_end
+           AND me.occupy_start < {_OCCUPY_END.replace('b.', 'b2.')}
     """
-    params = {
-        "booking_id": booking_id, "mmg_id": mmg_id,
-        "d": session_date, "t": session_time, "start": start, "end": end,
-    }
+    params = {"booking_id": booking_id, "mmg_id": mmg_id,
+              "d": session_date, "t": session_time}
 
     # ── 包廂被兩場戲同時佔著 ──
-    # 撞到的可能是完全不同的劇本，所以名稱一定要帶回去——只寫時間的話，
-    # 讀的人根本不知道是哪一齣戲佔著。
     cur.execute(
         f"""
+        {me_cte}
         SELECT DISTINCT m2.name, b2.session_date, b2.session_time
           FROM booking_record b2
           JOIN mmg m2 ON m2.id = b2.mmg_id
+          CROSS JOIN me
          WHERE b2.status = 'booked'
            AND b2.id <> %(booking_id)s
-           AND m2.room_id = (SELECT room_id FROM mmg WHERE id = %(mmg_id)s)
+           AND m2.room_id = me.room_id
            {overlap}
          ORDER BY b2.session_date, b2.session_time
         """,
@@ -232,12 +268,14 @@ def find_conflicts(cur, booking_id: int) -> dict:
     if host_ids:
         cur.execute(
             f"""
+            {me_cte}
             SELECT DISTINCT u.id, u.name, m2.name, b2.session_date, b2.session_time
               FROM booking_record b2
               JOIN mmg m2  ON m2.id = b2.mmg_id
               JOIN users u ON u.id = ANY(%(host_ids)s)
                           AND u.id IN (b2.gm1_user_id, b2.gm2_user_id,
                                        b2.gm3_user_id, b2.gm4_user_id)
+              CROSS JOIN me
              WHERE b2.status = 'booked'
                AND b2.id <> %(booking_id)s
                {overlap}
@@ -325,23 +363,23 @@ def create_booking(
     # 一個位子。這是刻意的：容量要擋的是「這個時段總共排了幾組人」，一組
     # 已經成立的預約不會因為成立了就不佔位。
     #
-    # period 用來換算這場實際佔用到幾點，供劇本／主持人的排程衝突檢查用。
-    cur.execute("SELECT name, waitlist_limit, period FROM mmg WHERE id = %s", (mmg_id,))
-    mms_name, waitlist_limit, period = cur.fetchone()
+    # 衝突檢查的兩支自己會去讀 period／ready／reset，這裡不必先算好時間
+    # 區間再傳進去——那三個值都在資料庫，繞出來一趟只是多一個會不同步的
+    # 地方。
+    cur.execute("SELECT name, waitlist_limit FROM mmg WHERE id = %s", (mmg_id,))
+    mms_name, waitlist_limit = cur.fetchone()
     capacity = waitlist_limit
 
-    start = datetime.combine(session_date, session_time)
-    end = start + timedelta(hours=float(period))
-
-    clash = _has_room_conflict(cur, mmg_id, session_date, session_time, start, end)
+    clash = _has_room_conflict(cur, mmg_id, session_date, session_time)
     if clash is not None:
-        other_name, other_d, other_t, other_period = clash
+        other_name, other_d, other_t, other_period, other_reset = clash
         raise BookingError(
             f"包廂在這段時間已經排了《{other_name}》"
-            f"（{other_d} {other_t:%H:%M} 起 {other_period:g} 小時），時段衝突"
+            f"（{other_d} {other_t:%H:%M} 起 {other_period:g} 小時"
+            f"，另需 {other_reset:g} 小時還原場地），時段衝突"
         )
 
-    conflicting = conflicting_host(cur, host_ids, mmg_id, session_date, session_time, start, end)
+    conflicting = conflicting_host(cur, host_ids, mmg_id, session_date, session_time)
     if conflicting is not None:
         cur.execute("SELECT name FROM users WHERE id = %s", (conflicting,))
         host_name = cur.fetchone()[0]

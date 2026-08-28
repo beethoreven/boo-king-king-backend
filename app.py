@@ -343,15 +343,12 @@ def check_host_route():
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT period FROM mmg WHERE id = %s", (mmg_id,))
-            row = cur.fetchone()
-            if row is None:
+            cur.execute("SELECT 1 FROM mmg WHERE id = %s", (mmg_id,))
+            if cur.fetchone() is None:
                 return jsonify({"error": "找不到這個劇本"}), 404
-            start = datetime.combine(d, t)
-            end = start + timedelta(hours=float(row[0]))
 
             conflicting = bookings_db.conflicting_host(
-                cur, [user_id], mmg_id, d, t, start, end
+                cur, [user_id], mmg_id, d, t
             )
             if conflicting is None:
                 return jsonify({"ok": True})

@@ -13,22 +13,32 @@ from db.bookings import BookingError
 
 # 可編輯的欄位。id 不在裡面——主鍵不給改，改了等於換一齣劇本，
 # 而所有 booking_record 都還指著舊的 id。
+# 逐欄比對「有沒有真的改到東西」時要看哪些欄位。
+#
+# ★ 新增可編輯欄位時務必同步加進來。漏掉的欄位不會報錯，只會讓改動被
+#   判定成「無任何修改」而不寫入——使用者改了、按了儲存、看到提示，
+#   資料卻沒變。ready/reset/room_id 就是這樣漏過一次。
 EDITABLE = (
-    "name", "period", "price", "booking_cost", "players",
-    "waitlist_limit", "status",
+    "name", "period", "ready_time_cost", "reset_time_cost",
+    "price", "booking_cost", "players",
+    "waitlist_limit", "status", "room_id",
 )
 
 SELECTABLE_STATUSES = ("active", "inactive")
 
 
 def _row_to_dict(row) -> dict:
-    (mid, name, period, price, cost, players, wl, status, room_id,
+    (mid, name, period, ready, reset, price, cost, players, wl, status, room_id,
      n1, u1, n2, u2, n3, u3, n4, u4) = row
     return {
         "id": mid,
         "name": name,
         # NUMERIC 在 psycopg 是 Decimal，JSON 序列化不了
         "period": float(period) if period is not None else None,
+        # 佈置與還原時間。包廂的佔用區間是 [開始-ready, 開始+period+reset]，
+        # 衝突判定比的是這個，不是 period 本身。
+        "ready_time_cost": float(ready) if ready is not None else 0.0,
+        "reset_time_cost": float(reset) if reset is not None else 0.0,
         "price": price,
         "booking_cost": cost,
         "players": players,
@@ -51,7 +61,8 @@ def _row_to_dict(row) -> dict:
 
 
 _COLUMNS = (
-    "id, name, period, price, booking_cost, players, waitlist_limit, status, room_id, "
+    "id, name, period, ready_time_cost, reset_time_cost, "
+    "price, booking_cost, players, waitlist_limit, status, room_id, "
     "gm1_name, gm1_user, gm2_name, gm2_user, gm3_name, gm3_user, gm4_name, gm4_user"
 )
 
@@ -134,6 +145,8 @@ def update(cur, mmg_id: int, data: dict) -> bool:
     new = {
         "name": data["name"].strip(),
         "period": data.get("period"),
+        "ready_time_cost": data.get("ready_time_cost"),
+        "reset_time_cost": data.get("reset_time_cost"),
         "price": data.get("price"),
         "booking_cost": data.get("booking_cost"),
         "players": data.get("players"),
@@ -146,7 +159,8 @@ def update(cur, mmg_id: int, data: dict) -> bool:
     # 兩邊都轉成 float 再比。
     unchanged = all(
         (float(new[k]) == float(current[k]))
-        if k == "period" and new[k] is not None and current[k] is not None
+        if k in ("period", "ready_time_cost", "reset_time_cost")
+           and new[k] is not None and current[k] is not None
         else new[k] == current[k]
         for k in EDITABLE
     )
@@ -161,7 +175,8 @@ def update(cur, mmg_id: int, data: dict) -> bool:
     cur.execute(
         """
         UPDATE mmg SET
-            name = %s, period = %s, price = %s, booking_cost = %s,
+            name = %s, period = %s, ready_time_cost = %s, reset_time_cost = %s,
+            price = %s, booking_cost = %s,
             players = %s, waitlist_limit = %s, status = %s, room_id = %s,
             gm1_name = %s, gm1_user = %s,
             gm2_name = %s, gm2_user = %s,
@@ -170,7 +185,9 @@ def update(cur, mmg_id: int, data: dict) -> bool:
          WHERE id = %s
         """,
         (
-            new["name"], new["period"], new["price"], new["booking_cost"],
+            new["name"], new["period"],
+            new["ready_time_cost"], new["reset_time_cost"],
+            new["price"], new["booking_cost"],
             new["players"], new["waitlist_limit"], new["status"], new["room_id"],
             names[0], user_ids[0],
             names[1], user_ids[1],
@@ -195,14 +212,17 @@ def create(cur, data: dict) -> int:
     cur.execute(
         """
         INSERT INTO mmg
-            (name, period, price, booking_cost, players, waitlist_limit, status, room_id,
+            (name, period, ready_time_cost, reset_time_cost,
+             price, booking_cost, players, waitlist_limit, status, room_id,
              gm1_name, gm1_user, gm2_name, gm2_user,
              gm3_name, gm3_user, gm4_name, gm4_user)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
-            data["name"].strip(), data.get("period"), data.get("price"),
+            data["name"].strip(), data.get("period"),
+            data.get("ready_time_cost", 0.5), data.get("reset_time_cost", 0.5),
+            data.get("price"),
             data.get("booking_cost"), data.get("players"),
             data.get("waitlist_limit", 3), data.get("status", "active"),
             data.get("room_id") or 1,
