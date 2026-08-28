@@ -317,13 +317,13 @@ def get_slot(mmg_id: int):
         "taken": len(queue),
         "has_booked": has_booked,
         "is_full": len(queue) >= capacity,
-        "room_conflict": None if clash is None else {
-            "mmg_name": clash[0],
-            "session_date": clash[1].isoformat(),
-            "session_time": clash[2].strftime("%H:%M"),
-            "period": float(clash[3]),
-            "reset_time_cost": float(clash[4]),
-        },
+        # ★ 只回一個布林值，不回是哪一場撞到。
+        #   玩家不需要知道包廂裡在演什麼、誰訂的、演到幾點——那是別的
+        #   客人的預約。前端就算不顯示，送出去的東西打開開發者工具就
+        #   看得到，所以不顯示的資訊也不要送。
+        #   管理員與主持人要看細節，走 /api/bookings/<id>/conflicts，
+        #   那一支有 role <= 2 的把關。
+        "has_conflict": clash is not None,
         "queue": [
             {"position": p, "booking_id": bid, "player_name": nm,
              "status": st, "is_first": p == 1}
