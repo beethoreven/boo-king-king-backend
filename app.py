@@ -19,7 +19,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 from flask import Flask, g, jsonify, request  # noqa: E402
 from flask_cors import CORS  # noqa: E402
 
-from auth_utils import sessions, whitelist  # noqa: E402
+from auth_utils import profile, sessions, whitelist  # noqa: E402
 from auth_utils.decorators import require_auth, require_role  # noqa: E402
 from auth_utils.google_auth import extract_bearer_token, verify_google_id_token  # noqa: E402
 from admin_utils import bookings_admin, mmg_admin, users_admin  # noqa: E402
@@ -161,9 +161,16 @@ def login():
             #   放行的話他手上會有一張有效憑證，就算每支路由都會再擋一次，
             #   那也是多開了一道不需要存在的門。
             if user is not None and user["status"] != "active":
-                return jsonify(
-                    {"error": "此帳號未獲授權", "code": "deactivated", "email": email}
-                ), 403
+                # ★ 擋在發 session 之前。放行的話他手上會有一張有效憑證，
+                #   就算每支路由都會再擋一次，那也是多開了一道不需要存在的
+                #   門。已刪除的帳號尤其如此——需求明講「不會存他的
+                #   authentication」，最乾脆的做法就是根本不發。
+                deleted = user["status"] == "deleted"
+                return jsonify({
+                    "error": "此帳號已刪除" if deleted else "此帳號未獲授權",
+                    "code": "deleted" if deleted else "deactivated",
+                    "email": email,
+                }), 403
 
             # 沒在名單裡的照樣發 session。他的身分 Google 已經驗過了，
             # 缺的只是聯絡資料——那要靠 /auth/register 補，而註冊本身就需要
@@ -234,6 +241,9 @@ def auth_status():
             # 該看到的是註冊表單；被停權的人也不算授權，他該看到的是
             # 「請聯絡店家」。前端靠這個欄位分流。
             "registered": user is not None,
+            # 前端要靠這個分辨「停權」與「已刪除」——兩者都是 authorized
+            # false，但畫面與訊息不同。
+            "status": user["status"] if user else None,
             "email": user["email"] if user else email,
             "name": user["name"] if user else None,
             "role": user["role"] if user else None,
@@ -285,6 +295,52 @@ def register():
 def me():
     """目前登入者的資料。也是驗證 require_auth 有沒有正常運作的最小路由。"""
     return jsonify(g.user)
+
+
+@app.get("/api/profile")
+@require_auth
+def get_profile():
+    """自己的完整資料。比 /api/me 多了聯絡欄位——那兩欄不放進權限快取，
+    因為快取在每個請求的熱路徑上，而聯絡資料只有這一頁要用。"""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            data = profile.get(cur, g.user["id"])
+    return jsonify(data)
+
+
+@app.put("/api/profile")
+@require_auth
+def update_profile():
+    """改自己的聯絡資料。只吃 name / line_id / phone，其餘欄位忽略。"""
+    body = request.get_json(silent=True) or {}
+    errors = profile.validate_contact(body)
+    if errors:
+        return jsonify({"error": "格式不正確", "fields": errors}), 400
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            data = profile.update(cur, g.user["id"], body)
+            conn.commit()
+    return jsonify(data)
+
+
+@app.post("/api/profile/delete")
+@require_auth
+def delete_profile():
+    """刪除自己的帳號。還有已成立的場次就拒絕。"""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            try:
+                cancelled = profile.delete_self(cur, g.user["id"])
+            except profile.HasActiveBookings:
+                conn.rollback()
+                return jsonify({
+                    "error": "你尚有未進行的場次，請與店家聯繫，或場次結束後再刪除",
+                    "code": "has_active_bookings",
+                }), 409
+            # 帳號沒了，手上那張憑證也不該還能用。
+            sessions.delete_sessions_for_email(cur, g.user["email"])
+            conn.commit()
+    return jsonify({"deleted": True, "cancelled_bookings": cancelled})
 
 
 @app.get("/api/admin/ping")
@@ -467,6 +523,17 @@ def create_booking_route():
     # 幫任何人佔位，前者則是有明確操作紀錄、事後可追溯的單一動作。
     # 那支編輯端點屬於管理員介面，尚未實作。
     player_id = g.user["id"]
+
+    # ★ 聯絡資料不完整就不給訂。前端也會擋（訊息比較清楚），但那是化妝品：
+    #   任何人都能直接打這支 API。店家聯絡不到人的預約等於沒有預約。
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            me = profile.get(cur, g.user["id"])
+    if not profile.has_complete_contact(me):
+        return jsonify({
+            "error": "你沒有填寫基本聯絡資料，無法預定場次",
+            "code": "incomplete_contact",
+        }), 400
 
     with pool.connection() as conn:
         with conn.cursor() as cur:

@@ -53,6 +53,10 @@ def _authenticate() -> tuple[dict | None, tuple | None]:
     # 兩者都回 403，但帶不同的 code；訊息文字會變，code 不會，前端據此分流。
     if user is None:
         return None, (jsonify({"error": "尚未完成註冊", "code": "unregistered"}), 403)
+    if user["status"] == "deleted":
+        # 自己刪掉的帳號。跟停權分開講：停權是店家的決定，刪除是他自己的，
+        # 兩者要走的復原路徑不同（都得找店家，但說法不該一樣）。
+        return None, (jsonify({"error": "此帳號已刪除", "code": "deleted"}), 403)
     if user["status"] != "active":
         return None, (jsonify({"error": "此帳號未獲授權", "code": "deactivated"}), 403)
     return user, None
