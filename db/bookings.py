@@ -723,7 +723,7 @@ def confirm_host(cur, booking_id: int, host_id: int) -> dict:
 STATUS_LABEL = {
     "gm_confirm": "等待其他主持確認",
     "gm_reviewed": "等待訂金支付",
-    "booked": "場次已確認",
+    "booked": "場次已預約完成",
     "ended": "已結束",
     "cancelled": "已取消",
 }
