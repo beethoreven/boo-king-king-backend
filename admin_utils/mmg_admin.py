@@ -22,7 +22,7 @@ SELECTABLE_STATUSES = ("active", "inactive")
 
 
 def _row_to_dict(row) -> dict:
-    (mid, name, period, price, cost, players, wl, status,
+    (mid, name, period, price, cost, players, wl, status, room_id,
      n1, u1, n2, u2, n3, u3, n4, u4) = row
     return {
         "id": mid,
@@ -34,6 +34,9 @@ def _row_to_dict(row) -> dict:
         "players": players,
         "waitlist_limit": wl,
         "status": status,
+        # 場次衝突比對的是包廂被佔用，不是同一齣戲被排兩場——見
+        # db/bookings.py 的 _has_room_conflict()。
+        "room_id": room_id,
         # 四個角色一律回傳，包含名稱為 NULL 的——管理員介面要能編輯
         # 「這個劇本原本沒有第 3 個角色，現在要加一個」，所以不能只回
         # 有名字的那幾個。名稱為 None 代表這個角色不存在，前端據此
@@ -48,7 +51,7 @@ def _row_to_dict(row) -> dict:
 
 
 _COLUMNS = (
-    "id, name, period, price, booking_cost, players, waitlist_limit, status, "
+    "id, name, period, price, booking_cost, players, waitlist_limit, status, room_id, "
     "gm1_name, gm1_user, gm2_name, gm2_user, gm3_name, gm3_user, gm4_name, gm4_user"
 )
 
@@ -63,6 +66,12 @@ def get(cur, mmg_id: int) -> dict | None:
     cur.execute(f"SELECT {_COLUMNS} FROM mmg WHERE id = %s", (mmg_id,))
     row = cur.fetchone()
     return _row_to_dict(row) if row else None
+
+
+def list_rooms(cur) -> list[dict]:
+    """所有包廂。給管理員編輯劇本時選用。"""
+    cur.execute("SELECT id, name FROM rooms ORDER BY id")
+    return [{"id": r[0], "name": r[1]} for r in cur.fetchall()]
 
 
 def list_host_candidates(cur) -> list[dict]:
@@ -130,6 +139,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
         "players": data.get("players"),
         "waitlist_limit": data.get("waitlist_limit"),
         "status": data["status"],
+        "room_id": data.get("room_id") or 1,
     }
 
     # 逐欄比對。period 是 Decimal vs float，直接比會誤判成有變動，
@@ -152,7 +162,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
         """
         UPDATE mmg SET
             name = %s, period = %s, price = %s, booking_cost = %s,
-            players = %s, waitlist_limit = %s, status = %s,
+            players = %s, waitlist_limit = %s, status = %s, room_id = %s,
             gm1_name = %s, gm1_user = %s,
             gm2_name = %s, gm2_user = %s,
             gm3_name = %s, gm3_user = %s,
@@ -161,7 +171,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
         """,
         (
             new["name"], new["period"], new["price"], new["booking_cost"],
-            new["players"], new["waitlist_limit"], new["status"],
+            new["players"], new["waitlist_limit"], new["status"], new["room_id"],
             names[0], user_ids[0],
             names[1], user_ids[1],
             names[2], user_ids[2],
@@ -185,16 +195,17 @@ def create(cur, data: dict) -> int:
     cur.execute(
         """
         INSERT INTO mmg
-            (name, period, price, booking_cost, players, waitlist_limit, status,
+            (name, period, price, booking_cost, players, waitlist_limit, status, room_id,
              gm1_name, gm1_user, gm2_name, gm2_user,
              gm3_name, gm3_user, gm4_name, gm4_user)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
             data["name"].strip(), data.get("period"), data.get("price"),
             data.get("booking_cost"), data.get("players"),
             data.get("waitlist_limit", 3), data.get("status", "active"),
+            data.get("room_id") or 1,
             names[0], user_ids[0],
             names[1], user_ids[1],
             names[2], user_ids[2],

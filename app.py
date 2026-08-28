@@ -758,6 +758,7 @@ def admin_list_mmg():
             return jsonify({
                 "items": mmg_admin.list_all(cur),
                 "host_candidates": mmg_admin.list_host_candidates(cur),
+                "rooms": mmg_admin.list_rooms(cur),
             })
 
 

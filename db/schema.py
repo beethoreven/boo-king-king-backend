@@ -44,6 +44,8 @@ def ensure_schema(cur) -> None:
             return
 
         _ensure_users(cur)
+        # rooms 要在 mmg 之前——mmg.room_id 參照它。
+        _ensure_rooms(cur)
         _ensure_mmg(cur)
         _ensure_booking_record(cur)
         _ensure_sessions(cur)
@@ -120,6 +122,33 @@ def _ensure_users(cur) -> None:
     )
 
 
+def _ensure_rooms(cur) -> None:
+    """包廂。
+
+    場次衝突的真正對象是「包廂被佔用」，不是「同一個劇本被排兩場」——
+    同一間包廂裡，10:00 開演的 12 小時本會做到 22:00，20:00 就不能再開
+    另一齣戲，即使那是完全不同的劇本。沒有這張表的話這件事表達不出來，
+    只能退而求其次比對「同劇本」，而那會漏掉所有跨劇本的重疊。
+
+    先只有一間。欄位也只有 id 與名字：現階段不需要容納人數、設備之類的
+    屬性，那些等真的有多間、而且需要據此篩選時再加。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rooms (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+        """
+    )
+    # 至少要有一間，否則 mmg.room_id 的預設值 1 會指向不存在的列。
+    cur.execute("SELECT COUNT(*) FROM rooms")
+    if cur.fetchone()[0] == 0:
+        cur.execute("INSERT INTO rooms (id, name) VALUES (1, %s)", ("包廂",))
+        # 手動指定 id 不會推進序列，下一次 INSERT 會撞號。
+        cur.execute("SELECT setval('rooms_id_seq', (SELECT MAX(id) FROM rooms))")
+
+
 def _ensure_mmg(cur) -> None:
     """可提供服務的劇本。
 
@@ -187,7 +216,11 @@ def _ensure_mmg(cur) -> None:
             gm4_name TEXT,
             gm4_user INTEGER[] NOT NULL DEFAULT '{}',
 
-            status TEXT NOT NULL DEFAULT 'active'
+            status TEXT NOT NULL DEFAULT 'active',
+
+            -- 這齣戲在哪一間包廂演。場次衝突比對的是包廂的佔用，不是
+            -- 劇本本身——見 _ensure_rooms 的說明。
+            room_id INTEGER NOT NULL DEFAULT 1 REFERENCES rooms(id)
         )
         """
     )
@@ -196,6 +229,13 @@ def _ensure_mmg(cur) -> None:
     # 順序的語法，只能重建整張表。要讓現有資料庫也變成相鄰排列，
     # 跑一次 db/migrate_reorder_mms.py。
     existing = _existing_columns(cur, "mmg")
+    if "room_id" not in existing:
+        # 既有資料一律歸到第一間包廂：導入這個欄位之前只有一間，
+        # 所有劇本本來就都在那裡演。
+        cur.execute(
+            "ALTER TABLE mmg ADD COLUMN room_id INTEGER NOT NULL DEFAULT 1 "
+            "REFERENCES rooms(id)"
+        )
     for n in (1, 2, 3, 4):
         if f"gm{n}_user" not in existing:
             cur.execute(
