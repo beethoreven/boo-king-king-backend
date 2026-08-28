@@ -177,6 +177,10 @@ def _ensure_mmg(cur) -> None:
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
 
+            -- 這齣戲在哪一間包廂演。場次衝突比對的是包廂的佔用，不是
+            -- 劇本本身——見 _ensure_rooms 的說明。
+            room_id INTEGER NOT NULL DEFAULT 1 REFERENCES rooms(id),
+
             -- 遊戲時長（小時），允許小數點以下一位，例如 3.5
             period NUMERIC(3, 1),
 
@@ -224,11 +228,7 @@ def _ensure_mmg(cur) -> None:
             gm4_name TEXT,
             gm4_user INTEGER[] NOT NULL DEFAULT '{}',
 
-            status TEXT NOT NULL DEFAULT 'active',
-
-            -- 這齣戲在哪一間包廂演。場次衝突比對的是包廂的佔用，不是
-            -- 劇本本身——見 _ensure_rooms 的說明。
-            room_id INTEGER NOT NULL DEFAULT 1 REFERENCES rooms(id)
+            status TEXT NOT NULL DEFAULT 'active'
         )
         """
     )
