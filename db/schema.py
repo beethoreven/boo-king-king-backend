@@ -188,7 +188,7 @@ def _ensure_mmg(cur) -> None:
             -- 這兩段時間包廂一樣是被佔著的，所以一場戲實際佔用的區間是
             --   [開始 - ready_time_cost, 開始 + period + reset_time_cost]
             -- 衝突判定比的就是這個區間，不是 period 本身（見 db/bookings.py
-            -- 的 _has_room_conflict）。
+            -- 的 has_room_conflict）。
             ready_time_cost NUMERIC(3, 1) NOT NULL DEFAULT 0.5,
             reset_time_cost NUMERIC(3, 1) NOT NULL DEFAULT 0.5,
 

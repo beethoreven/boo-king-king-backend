@@ -99,7 +99,7 @@ _OCCUPY_END = ("(b.session_date + b.session_time)::timestamp "
                "+ ((m2.period + m2.reset_time_cost) * interval '1 hour')")
 
 
-def _has_room_conflict(cur, mmg_id: int, session_date, session_time) -> tuple | None:
+def has_room_conflict(cur, mmg_id: int, session_date, session_time) -> tuple | None:
     """這齣戲要用的那間包廂，在這段時間內是不是已經被別的成立場次佔著。
     撞到的話回傳 (劇本名, 日期, 時間, period, reset)，沒撞回傳 None。
 
@@ -191,7 +191,7 @@ def find_conflicts(cur, booking_id: int) -> dict:
 
     room —— 這齣戲要用的那間「包廂」在這段時間已經被佔著了。包廂才是
         實體資源，一次只能開一場，跟是哪一齣戲、誰主持都無關。這條規則
-        跟玩家預訂時擋人的 _has_room_conflict() 是同一條。
+        跟玩家預訂時擋人的 has_room_conflict() 是同一條。
 
     hosts —— 這筆的某位「主持人」在這段時間已經被別的成立場次佔住。
         不限同一個劇本：他可能被指定去帶另一齣戲，時間一樣會撞。
@@ -199,7 +199,7 @@ def find_conflicts(cur, booking_id: int) -> dict:
     兩者可以各自成立，也可以同時發生。分開回傳讓呼叫端決定各自要怎麼
     處置——目前是包廂衝突可以放行、主持人自己撞期不能放行。
 
-    佔用區間含佈置與還原時間，與 _has_room_conflict／conflicting_host
+    佔用區間含佈置與還原時間，與 has_room_conflict／conflicting_host
     用的是同一組定義（_OCCUPY_*）。三支必須一致：一支說可以、另一支說
     不行，畫面就會自相矛盾。
 
@@ -370,7 +370,7 @@ def create_booking(
     mms_name, waitlist_limit = cur.fetchone()
     capacity = waitlist_limit
 
-    clash = _has_room_conflict(cur, mmg_id, session_date, session_time)
+    clash = has_room_conflict(cur, mmg_id, session_date, session_time)
     if clash is not None:
         other_name, other_d, other_t, other_period, other_reset = clash
         raise BookingError(

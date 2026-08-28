@@ -298,6 +298,11 @@ def get_slot(mmg_id: int):
             if item is None:
                 return jsonify({"error": "找不到這個劇本"}), 404
             queue = bookings_db.list_slot(cur, mmg_id, d, t)
+            # ★ 這一支也要問撞期，不能只回報排隊人數。
+            #   容量沒滿不代表訂得成——包廂可能被別齣戲佔著。少了這個，
+            #   玩家會看到「可進行預約」、把主持人也選完，直到按下送出
+            #   才被 create_booking() 退回來。錯誤要出現在他還能改的時候。
+            clash = bookings_db.has_room_conflict(cur, mmg_id, d, t)
 
     capacity = item["waitlist_limit"]
     # 這個時段有沒有已經成立的那一組。玩家看到的說法差很多：已經有人
@@ -312,6 +317,13 @@ def get_slot(mmg_id: int):
         "taken": len(queue),
         "has_booked": has_booked,
         "is_full": len(queue) >= capacity,
+        "room_conflict": None if clash is None else {
+            "mmg_name": clash[0],
+            "session_date": clash[1].isoformat(),
+            "session_time": clash[2].strftime("%H:%M"),
+            "period": float(clash[3]),
+            "reset_time_cost": float(clash[4]),
+        },
         "queue": [
             {"position": p, "booking_id": bid, "player_name": nm,
              "status": st, "is_first": p == 1}

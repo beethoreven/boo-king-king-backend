@@ -45,7 +45,7 @@ def _row_to_dict(row) -> dict:
         "waitlist_limit": wl,
         "status": status,
         # 場次衝突比對的是包廂被佔用，不是同一齣戲被排兩場——見
-        # db/bookings.py 的 _has_room_conflict()。
+        # db/bookings.py 的 has_room_conflict()。
         "room_id": room_id,
         # 四個角色一律回傳，包含名稱為 NULL 的——管理員介面要能編輯
         # 「這個劇本原本沒有第 3 個角色，現在要加一個」，所以不能只回
