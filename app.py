@@ -731,6 +731,30 @@ def my_bookings_tab(tab: str):
         return jsonify({"error": str(exc)}), 400
 
 
+def _is_assigned_host(booking: dict, user_id: int) -> bool:
+    """這個人是不是這筆預約指定的主持人之一。"""
+    return user_id in (booking.get("gm_user_ids") or [])
+
+
+def _may_read_booking(booking: dict, user: dict) -> bool:
+    """誰讀得到某一筆預約。
+
+    管理員：全部。經營者要處理任何一筆，這是職務範圍。
+    主持人：自己被指定的那幾場，加上自己以玩家身分訂的。
+    玩家　：只有自己訂的。
+
+    ★ 主持人不再是「role<=2 就看得到全部」。他在畫面上本來就只看得到
+      自己的場（host_tab 的 WHERE 已經限定），但按 id 的端點沒有跟著限，
+      等於留了一條用開發者工具改個數字就能翻別人資料的路。畫面帶不到的
+      地方，不代表到不了。
+    """
+    if user["role"] <= 1:
+        return True
+    if booking["player_id"] == user["id"]:
+        return True
+    return user["role"] <= 2 and _is_assigned_host(booking, user["id"])
+
+
 @app.get("/api/bookings/<int:booking_id>")
 @require_auth
 def get_booking_route(booking_id: int):
@@ -739,7 +763,7 @@ def get_booking_route(booking_id: int):
             booking = bookings_db.get_booking(cur, booking_id)
     if booking is None:
         return jsonify({"error": "找不到這筆預約"}), 404
-    if booking["player_id"] != g.user["id"] and g.user["role"] > 2:
+    if not _may_read_booking(booking, g.user):
         return jsonify({"error": "只能查看自己的預約"}), 403
     return jsonify(booking)
 
@@ -747,7 +771,13 @@ def get_booking_route(booking_id: int):
 @app.post("/api/bookings/<int:booking_id>/cancel")
 @require_auth
 def cancel_booking_route(booking_id: int):
-    """取消預約。玩家可以取消自己的，主持人與管理員可以取消任何一筆。
+    """取消預約。玩家取消自己的，管理員可以取消任何一筆。
+
+    ★ 主持人不能取消別人的預約。他唯一比一般使用者多出來的寫入能力，
+      是確認自己被指定的那一場（/confirm）。取消牽涉到訂金、名額與客人
+      權益，那是店家的決定，不是單一主持人的——真的需要動的時候，打電話
+      給店家才是對的流程。
+      主持人以玩家身分自己訂的場，他仍然取消得掉，因為那是「自己的預約」。
 
     取消之後後面的序位會自動往前遞補——序位是每次由 created_at 算出來的，
     這裡不需要、也沒有任何「把下一位升上來」的寫入。
@@ -758,7 +788,7 @@ def cancel_booking_route(booking_id: int):
             booking = bookings_db.get_booking(cur, booking_id)
             if booking is None:
                 return jsonify({"error": "找不到這筆預約"}), 404
-            if booking["player_id"] != g.user["id"] and g.user["role"] > 2:
+            if booking["player_id"] != g.user["id"] and g.user["role"] > 1:
                 return jsonify({"error": "只能取消自己的預約"}), 403
             try:
                 updated = bookings_db.cancel_booking(cur, booking_id, note=body.get("note"))
@@ -770,9 +800,14 @@ def cancel_booking_route(booking_id: int):
 
 
 @app.patch("/api/bookings/<int:booking_id>/status")
-@require_role(2)
+@require_role(1)
 def set_booking_status(booking_id: int):
-    """主持人與管理員更新預約狀態。取消請走 /cancel。"""
+    """管理員更新預約狀態。取消請走 /cancel。
+
+    ★ 曾經是 require_role(2)，也就是任何主持人都能把任何一場改成任何
+      狀態——包含跟他毫無關係的場。改狀態會牽動訂金與名額，那是店家的
+      決定。主持人的寫入能力只剩 /confirm 那一支，且限定自己被指定的場。
+    """
     body = request.get_json(silent=True) or {}
     status = (body.get("status") or "").strip()
     with pool.connection() as conn:
@@ -957,9 +992,19 @@ def booking_conflicts_route(booking_id: int):
     什麼。在這裡標而不是讓前端比對，是因為前端拿不到自己的 user id
     （登入回應只給 email/name/role），為了這件事改動登入回應的形狀不
     划算，而後端本來就知道自己是誰。
+
+    ★ 跟 /detail 一樣限定「自己被指定的場」。這支回傳的是別人的場次
+      名稱、日期時間，以及哪幾位主持人被佔住——把 id 換個數字就能一筆
+      一筆問出全店的排班。畫面只會帶主持人到自己的場，但畫面帶不到的
+      地方不代表到不了。
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
+            booking = bookings_db.get_booking(cur, booking_id)
+            if booking is None:
+                return jsonify({"error": "找不到這筆預約"}), 404
+            if g.user["role"] > 1 and not _is_assigned_host(booking, g.user["id"]):
+                return jsonify({"error": "只能查看自己被指定的場次"}), 403
             result = bookings_db.find_conflicts(cur, booking_id)
     for c in result["hosts"]:
         c["is_me"] = c["host_id"] == g.user["id"]
