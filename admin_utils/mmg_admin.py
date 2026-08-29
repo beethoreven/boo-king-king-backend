@@ -22,6 +22,8 @@ EDITABLE = (
     "name", "period", "ready_time_cost", "reset_time_cost",
     "price", "booking_cost", "players",
     "waitlist_limit", "status", "room_id",
+    # 上下架日期。排期判斷的第 0 層，絕對外框——見 db/schedule.py。
+    "start_booking", "end_booking",
 )
 
 SELECTABLE_STATUSES = ("active", "inactive")
@@ -29,6 +31,7 @@ SELECTABLE_STATUSES = ("active", "inactive")
 
 def _row_to_dict(row) -> dict:
     (mid, name, period, ready, reset, price, cost, players, wl, status, room_id,
+     start_booking, end_booking,
      n1, u1, n2, u2, n3, u3, n4, u4) = row
     return {
         "id": mid,
@@ -47,6 +50,10 @@ def _row_to_dict(row) -> dict:
         # 場次衝突比對的是包廂被佔用，不是同一齣戲被排兩場——見
         # db/bookings.py 的 has_room_conflict()。
         "room_id": room_id,
+        # 上下架日期。None 代表那一側沒有限制；填一個很遠的真實日期
+        # 效果完全相同，不要當成 magic value 特別處理。
+        "start_booking": start_booking.isoformat() if start_booking else None,
+        "end_booking": end_booking.isoformat() if end_booking else None,
         # 四個角色一律回傳，包含名稱為 NULL 的——管理員介面要能編輯
         # 「這個劇本原本沒有第 3 個角色，現在要加一個」，所以不能只回
         # 有名字的那幾個。名稱為 None 代表這個角色不存在，前端據此
@@ -63,6 +70,7 @@ def _row_to_dict(row) -> dict:
 _COLUMNS = (
     "id, name, period, ready_time_cost, reset_time_cost, "
     "price, booking_cost, players, waitlist_limit, status, room_id, "
+    "start_booking, end_booking, "
     "gm1_name, gm1_user, gm2_name, gm2_user, gm3_name, gm3_user, gm4_name, gm4_user"
 )
 
@@ -153,6 +161,11 @@ def update(cur, mmg_id: int, data: dict) -> bool:
         "waitlist_limit": data.get("waitlist_limit"),
         "status": data["status"],
         "room_id": data.get("room_id") or 1,
+        # 空字串 → NULL。日期輸入框清空時送過來的是 ""，直接塞進
+        # DATE 欄位會噴型別錯誤；而「清空」的語意本來就是「這一側
+        # 沒有限制」，也就是 NULL。
+        "start_booking": (data.get("start_booking") or "").strip() or None,
+        "end_booking": (data.get("end_booking") or "").strip() or None,
     }
 
     # 逐欄比對。period 是 Decimal vs float，直接比會誤判成有變動，
@@ -178,6 +191,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
             name = %s, period = %s, ready_time_cost = %s, reset_time_cost = %s,
             price = %s, booking_cost = %s,
             players = %s, waitlist_limit = %s, status = %s, room_id = %s,
+            start_booking = %s, end_booking = %s,
             gm1_name = %s, gm1_user = %s,
             gm2_name = %s, gm2_user = %s,
             gm3_name = %s, gm3_user = %s,
@@ -189,6 +203,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
             new["ready_time_cost"], new["reset_time_cost"],
             new["price"], new["booking_cost"],
             new["players"], new["waitlist_limit"], new["status"], new["room_id"],
+            new["start_booking"], new["end_booking"],
             names[0], user_ids[0],
             names[1], user_ids[1],
             names[2], user_ids[2],
@@ -214,9 +229,11 @@ def create(cur, data: dict) -> int:
         INSERT INTO mmg
             (name, period, ready_time_cost, reset_time_cost,
              price, booking_cost, players, waitlist_limit, status, room_id,
+             start_booking, end_booking,
              gm1_name, gm1_user, gm2_name, gm2_user,
              gm3_name, gm3_user, gm4_name, gm4_user)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
@@ -226,6 +243,8 @@ def create(cur, data: dict) -> int:
             data.get("booking_cost"), data.get("players"),
             data.get("waitlist_limit", 3), data.get("status", "active"),
             data.get("room_id") or 1,
+            (data.get("start_booking") or "").strip() or None,
+            (data.get("end_booking") or "").strip() or None,
             names[0], user_ids[0],
             names[1], user_ids[1],
             names[2], user_ids[2],

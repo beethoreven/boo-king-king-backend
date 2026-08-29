@@ -27,6 +27,7 @@ import jobs  # noqa: E402
 from db import bookings as bookings_db  # noqa: E402
 from db import idle_gap  # noqa: E402
 from db import mmg as mmg_db  # noqa: E402
+from db import schedule  # noqa: E402
 from db.bookings import BookingError  # noqa: E402
 from db.connection import pool  # noqa: E402
 from db.schema import ensure_schema  # noqa: E402
@@ -473,6 +474,46 @@ def _parse_slot(source) -> tuple:
     return d, t
 
 
+@app.get("/api/mmg/<int:mmg_id>/availability")
+@require_auth
+def get_availability(mmg_id: int):
+    """一段期間內，這個劇本哪些日期開放、各自有哪些時段。
+
+    給前端的日期／時間選單用：只有這裡回報的日期選得到，選了日期之後
+    時間下拉也只列這裡給的時段。玩家因此不會選到一個註定被退回的時間。
+
+    只回傳有開的日期。一個月裡不開的日子通常比開的多，回一堆
+    is_open=false 的空殼只是把同一份資訊講得更長。
+    """
+    try:
+        start = date.fromisoformat(request.args.get("from", ""))
+        end = date.fromisoformat(request.args.get("to", ""))
+    except ValueError:
+        return bad_request("from 與 to 必須是 YYYY-MM-DD")
+    if end < start:
+        return bad_request("to 不能早於 from")
+    # 一次最多查一季。沒有上限的話，一個 from=1900&to=2999 的請求會讓
+    # 後端逐日跑一百萬圈——這支不碰資料庫做迴圈，但迴圈本身就夠久了。
+    if (end - start).days > 92:
+        return bad_request("一次最多查 92 天")
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if mmg_db.get(cur, mmg_id) is None:
+                return jsonify({"error": "找不到這個劇本"}), 404
+            days, configured = schedule.calendar(cur, mmg_id, start, end)
+    return jsonify({
+        "mmg_id": mmg_id,
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "days": days,
+        # 「還沒設定過」與「設定成全關」的 days 都是空的，但意思完全不同。
+        # 前端要據此決定顯示「店家尚未開放此劇本的預約時段」還是放行——
+        # 沒設定過的劇本不該因為這個功能上線就整個訂不了。
+        "configured": configured,
+    })
+
+
 @app.get("/api/mmg/<int:mmg_id>/slot")
 @require_auth
 def get_slot(mmg_id: int):
@@ -497,6 +538,9 @@ def get_slot(mmg_id: int):
             #   玩家會看到「可進行預約」、把主持人也選完，直到按下送出
             #   才被 create_booking() 退回來。錯誤要出現在他還能改的時候。
             clash = bookings_db.has_room_conflict(cur, mmg_id, d, t)
+            # 排期跟容量、撞期是三件不同的事，各自回一個旗標，訊息的
+            # 優先序交給前端排（見 booking.js 的 slotMessage）。
+            slot_open = schedule.is_open(cur, mmg_id, d, t)
 
     capacity = item["waitlist_limit"]
     # 這個時段有沒有已經成立的那一組。玩家看到的說法差很多：已經有人
@@ -511,6 +555,9 @@ def get_slot(mmg_id: int):
         "taken": len(queue),
         "has_booked": has_booked,
         "is_full": len(queue) >= capacity,
+        # 這個時段在不在店家設定的開放範圍內。不開放時前面那幾個數字
+        # 就沒有意義了——沒開放的時段談「還有幾個位子」是空的。
+        "is_open": slot_open,
         # ★ 只回一個布林值，不回是哪一場撞到。
         #   玩家不需要知道包廂裡在演什麼、誰訂的、演到幾點——那是別的
         #   客人的預約。前端就算不顯示，送出去的東西打開開發者工具就
@@ -1034,8 +1081,15 @@ def admin_list_mmg():
     「新增主持人」下拉選單不用另外打一支 API。"""
     with pool.connection() as conn:
         with conn.cursor() as cur:
+            items = mmg_admin.list_all(cur)
+            # 排期設定兩個查詢一次撈完再貼回去，不是每齣戲各查一次。
+            rules = schedule.list_all_rules(cur)
+            for item in items:
+                item["schedule"] = rules.get(
+                    item["id"], {"weekly": [], "exceptions": []}
+                )
             return jsonify({
-                "items": mmg_admin.list_all(cur),
+                "items": items,
                 "host_candidates": mmg_admin.list_host_candidates(cur),
                 "rooms": mmg_admin.list_rooms(cur),
             })
@@ -1046,7 +1100,8 @@ def admin_list_mmg():
 @_admin_write
 def admin_update_mmg(cur, body, mmg_id: int):
     changed = mmg_admin.update(cur, mmg_id, body)
-    return jsonify({"changed": changed, "item": mmg_admin.get(cur, mmg_id)})
+    changed = _save_schedule(cur, mmg_id, body) or changed
+    return jsonify({"changed": changed, "item": _mmg_with_schedule(cur, mmg_id)})
 
 
 @app.post("/api/admin/mmg")
@@ -1054,7 +1109,39 @@ def admin_update_mmg(cur, body, mmg_id: int):
 @_admin_write
 def admin_create_mmg(cur, body):
     new_id = mmg_admin.create(cur, body)
-    return jsonify(mmg_admin.get(cur, new_id)), 201
+    _save_schedule(cur, new_id, body)
+    return jsonify(_mmg_with_schedule(cur, new_id)), 201
+
+
+def _save_schedule(cur, mmg_id: int, body: dict) -> bool:
+    """寫入排期規則，回傳有沒有真的改到。
+
+    ★ 跟劇本其他欄位在同一個交易裡寫，理由跟主持人名單一樣：畫面上是
+      「改完一起按儲存」。拆成兩支 API 的話，第二支失敗時會留下一齣
+      基本資料已經改好、排期卻還是舊的劇本，而使用者看到的是一句
+      「儲存失敗」——他無從得知有一半已經寫進去了。
+
+    body 沒有 schedule 這個鍵時什麼都不做。這讓還沒更新的舊前端、
+    以及只想改個價格的呼叫端，不會意外把排期規則清空。
+    """
+    rules = body.get("schedule")
+    if rules is None:
+        return False
+    before = schedule.get_rules(cur, mmg_id)
+    try:
+        schedule.set_rules(
+            cur, mmg_id, rules.get("weekly"), rules.get("exceptions")
+        )
+    except schedule.ScheduleError as exc:
+        raise BookingError(str(exc)) from None
+    return schedule.get_rules(cur, mmg_id) != before
+
+
+def _mmg_with_schedule(cur, mmg_id: int) -> dict:
+    item = mmg_admin.get(cur, mmg_id)
+    if item is not None:
+        item["schedule"] = schedule.get_rules(cur, mmg_id)
+    return item
 
 
 @app.get("/api/admin/users")

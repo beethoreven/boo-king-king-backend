@@ -47,6 +47,8 @@ def ensure_schema(cur) -> None:
         # rooms 要在 mmg 之前——mmg.room_id 參照它。
         _ensure_rooms(cur)
         _ensure_mmg(cur)
+        # 排期兩張表都參照 mmg(id)，必須排在 _ensure_mmg 之後。
+        _ensure_schedule(cur)
         _ensure_booking_record(cur)
         _ensure_sessions(cur)
         _ensure_abuse_log(cur)
@@ -256,6 +258,19 @@ def _ensure_mmg(cur) -> None:
             -- 要改成全站統一調整的話，改動這一欄的預設值即可。
             waitlist_limit INTEGER NOT NULL DEFAULT 3 CHECK (waitlist_limit >= 0),
 
+            -- 上架／下架日期。排期判斷的第 0 層，也是唯一一層「絕對外框」：
+            -- 區間外一律不開放，特定日期例外也翻不過來（下架代表這齣戲
+            -- 不賣了，若要再開一場就是把區間拉長，而不是從例外戳一個洞——
+            -- 否則「這齣戲什麼時候有場」要同時看兩個地方才答得出來）。
+            --
+            -- NULL 代表沒有那一側的限制。判斷式一律寫成
+            --     start_booking IS NULL OR session_date >= start_booking
+            -- 所以填一個很遠的真實日期（2999-12-31）跟填 NULL 會得到
+            -- 完全相同的結果——★ 不要把遙遠日期當成 magic value 特別處理，
+            -- 案主明確要求保留「寫真實數字也 OK」的空間。
+            start_booking DATE,
+            end_booking DATE,
+
             -- 每個主持人角色是「名稱 + 會這個角色的人」一組，刻意讓
             -- gm{n}_name 與 gm{n}_user 相鄰，直接看資料表時一眼就能
             -- 把角色跟人對起來，不用左右來回捲。
@@ -287,6 +302,12 @@ def _ensure_mmg(cur) -> None:
             cur.execute(
                 f"ALTER TABLE mmg ADD COLUMN {col} NUMERIC(3, 1) NOT NULL DEFAULT 0.5"
             )
+    for col in ("start_booking", "end_booking"):
+        if col not in existing:
+            # 既有劇本一律留 NULL＝沒有上下架限制。導入這個欄位之前
+            # 本來就沒有任何日期限制，填 NULL 才是保持原本的行為；
+            # 給一個預設日期會讓既有劇本突然有一批日子訂不了。
+            cur.execute(f"ALTER TABLE mmg ADD COLUMN {col} DATE")
     if "room_id" not in existing:
         # 既有資料一律歸到第一間包廂：導入這個欄位之前只有一間，
         # 所有劇本本來就都在那裡演。
@@ -301,6 +322,74 @@ def _ensure_mmg(cur) -> None:
             )
 
     _ensure_mmg_gm_constraints(cur)
+
+
+def _ensure_schedule(cur) -> None:
+    """排期的第 1、2 層。第 0 層（上下架日期）在 mmg 上，見 _ensure_mmg。
+
+    ## 為什麼是兩張表而不是一張，也不是欄位
+
+    第 2 層「每週常態」最多 7 列（週日到週六各一列），不隨時間增長：
+    某個星期沒開，就是**沒有那一列**，不是存一個空陣列。這讓「常態全關、
+    只靠指定日期開」不需要任何額外旗標——沒有任何一列就是那個意思。
+
+    時段跟著星期走而不是跟著劇本走，是因為「平日只開 19:00、週末開
+    10:00/14:00/19:00」是這一行最常見的形狀。把時段放在 mmg 上變成
+    「星期 × 時段」的交叉相乘，就表達不出這件事，只能一天一天設特例補，
+    一年就是一百多筆。
+
+    第 1 層「特定日期例外」則是真的會一直長，所以獨立成表：
+      is_open=false → 那天整天不開（臨時公休、GM 請假）
+      is_open=true  → 那天開，且時段以這一筆的 times 為準（臨時加場，
+                      或當天時段跟平常不一樣）
+
+    ## 為什麼例外的優先序高於常態
+
+    例外是「這一週跟平常不同」，常態是「每週都這樣」。週期性的差異
+    （平日／週末）屬於常態層，單週的臨時變動屬於例外層——這是案主定的
+    分工，也是這個模型能同時保持簡單與完整的原因。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mmg_weekly_slot (
+            mmg_id INTEGER NOT NULL REFERENCES mmg(id) ON DELETE CASCADE,
+
+            -- 0=週日 … 6=週六，跟 Python 的 date.isoweekday()%7 與
+            -- JavaScript 的 Date.getDay() 一致，兩邊都不用換算。
+            weekday SMALLINT NOT NULL CHECK (weekday BETWEEN 0 AND 6),
+
+            -- 這個星期的開場時段。空陣列沒有意義（等於沒開），所以擋掉：
+            -- 「不開」的表達方式是沒有這一列，不是留一列空的。
+            times TIME[] NOT NULL CHECK (array_length(times, 1) >= 1),
+
+            PRIMARY KEY (mmg_id, weekday)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mmg_schedule_exception (
+            mmg_id INTEGER NOT NULL REFERENCES mmg(id) ON DELETE CASCADE,
+            exception_date DATE NOT NULL,
+            is_open BOOLEAN NOT NULL,
+
+            -- is_open=false 時無意義（整天不開，沒有時段可言）；
+            -- is_open=true 時是那天實際開放的時段，必須至少有一個，
+            -- 否則「開放但沒有任何時段」跟「不開」是同一件事的兩種寫法。
+            times TIME[] NOT NULL DEFAULT '{}',
+            CHECK (NOT is_open OR array_length(times, 1) >= 1),
+
+            -- 一天最多一筆。同一天同時有「開」跟「關」兩筆的話，哪一筆
+            -- 說了算就變成看查詢順序的運氣。
+            PRIMARY KEY (mmg_id, exception_date)
+        )
+        """
+    )
+    # 日曆一次要撈一個月的例外，走這個索引。
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mmg_exception_date "
+        "ON mmg_schedule_exception (mmg_id, exception_date)"
+    )
 
 
 def _ensure_mmg_gm_constraints(cur) -> None:

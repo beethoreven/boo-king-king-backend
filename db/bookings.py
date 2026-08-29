@@ -12,6 +12,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from db import schedule
+
 
 class BookingError(Exception):
     """預約無法成立。訊息是給使用者看的。"""
@@ -340,6 +342,7 @@ def create_booking(
     deposit: int = 0,
     note: str | None = None,
     detailed_conflict: bool = False,
+    allow_closed_slot: bool = False,
 ) -> BookingResult:
     """建立一筆預約，回傳它的順位。
 
@@ -352,6 +355,22 @@ def create_booking(
     """
     request_id = request_id or str(uuid.uuid4())
     host_ids = [i for i in gm_user_ids if i is not None]
+
+    # ★ 排期檢查放在最前面，而且一定要在後端做。
+    #
+    #   前端會把不開放的日期反白、時間下拉只給得選的——但那是體驗，不是
+    #   防線。任何人都能直接打這支 API 送一個沒開放的時間，日曆畫得再對
+    #   也擋不住。這裡是最後一道，所以它必須存在，而且必須早於容量與
+    #   衝突檢查：一個根本沒開放的時段，去談「還有幾個位子」是沒意義的。
+    #
+    #   跟前端共用 db/schedule.py 同一支判斷，不各自實作一份——兩邊只要
+    #   差一點，使用者就會看到「畫面上選得到卻訂不下去」。
+    if allow_closed_slot:
+        # 管理員代訂電話客人時可能真的要開一個不在常態內的場。這條路徑
+        # 只有 role 1 走得到（見 app.py），而且畫面上會先跳確認。
+        pass
+    elif not schedule.is_open(cur, mmg_id, session_date, session_time):
+        raise BookingError("此時間未開放")
 
     _lock_slot(cur, mmg_id, session_date, session_time)
     _lock_hosts(cur, host_ids)
