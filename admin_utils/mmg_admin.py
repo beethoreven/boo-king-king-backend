@@ -18,8 +18,10 @@ from db.bookings import BookingError
 _TAIPEI = timezone(timedelta(hours=8))
 
 
-def _today_taipei() -> str:
-    return datetime.now(_TAIPEI).date().isoformat()
+def _now_taipei() -> str:
+    """現在（台北），精確到分。秒數對「上架時刻」沒有意義，留著只會讓
+    管理員看到 14:03:27 這種讀不出用意的值。"""
+    return datetime.now(_TAIPEI).strftime("%Y-%m-%dT%H:%M")
 
 # 可編輯的欄位。id 不在裡面——主鍵不給改，改了等於換一齣劇本，
 # 而所有 booking_record 都還指著舊的 id。
@@ -36,7 +38,10 @@ EDITABLE = (
     "start_booking", "end_booking",
 )
 
-SELECTABLE_STATUSES = ("active", "inactive")
+# preparing＝尚未上架。玩家的清單只列上架中的，preparing 與 inactive
+# 都看不到（見 db/listing.py）。上架時刻到了會自動轉成 active，
+# 下架時刻到了會自動轉成 inactive。
+SELECTABLE_STATUSES = ("preparing", "active", "inactive")
 
 
 def _row_to_dict(row) -> dict:
@@ -62,8 +67,10 @@ def _row_to_dict(row) -> dict:
         "room_id": room_id,
         # 上下架日期。None 代表那一側沒有限制；填一個很遠的真實日期
         # 效果完全相同，不要當成 magic value 特別處理。
-        "start_booking": start_booking.isoformat() if start_booking else None,
-        "end_booking": end_booking.isoformat() if end_booking else None,
+        # datetime-local 吃的是 'YYYY-MM-DDTHH:MM'，多了秒數有些瀏覽器
+        # 會整個不顯示。
+        "start_booking": start_booking.strftime("%Y-%m-%dT%H:%M") if start_booking else None,
+        "end_booking": end_booking.strftime("%Y-%m-%dT%H:%M") if end_booking else None,
         # 四個角色一律回傳，包含名稱為 NULL 的——管理員介面要能編輯
         # 「這個劇本原本沒有第 3 個角色，現在要加一個」，所以不能只回
         # 有名字的那幾個。名稱為 None 代表這個角色不存在，前端據此
@@ -136,6 +143,31 @@ def _validate_slots(gm_slots: list[dict]) -> None:
             raise BookingError(f"角色 {i} 的主持人名單有重複")
 
 
+def _validate_listing(start: str, end: str | None) -> None:
+    """上架必須早於下架。
+
+    ★ 一個結束早於開始的區間，代表它從來不曾開放過——那不是一種設定，
+      是一筆壞資料。在這裡擋是為了回一句看得懂的話；資料庫的
+      mmg_listing_order 約束是最後一道。
+    """
+    if not end:
+        return
+    if _parse_dt(end) <= _parse_dt(start):
+        raise BookingError("下架時間必須晚於上架時間")
+
+
+def _parse_dt(value: str) -> datetime:
+    """接受 'YYYY-MM-DD' 與 'YYYY-MM-DDTHH:MM'（前端 datetime-local 的格式）。
+
+    只有日期時補 00:00——那正是「那一天開始」的意思，跟舊資料的語意一致。
+    """
+    text = str(value).strip().replace(" ", "T")
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        raise BookingError(f"時間格式錯誤「{value}」") from None
+
+
 def _start_for_create(data: dict) -> str:
     """新增時的上架日期。
 
@@ -148,7 +180,7 @@ def _start_for_create(data: dict) -> str:
       而使用者以為自己成功地把它留白了。
     """
     if "start_booking" not in data:
-        return _today_taipei()
+        return _now_taipei()
     return _require_start(data)
 
 
@@ -163,7 +195,8 @@ def _require_start(data: dict) -> str:
     """
     value = (data.get("start_booking") or "").strip()
     if not value:
-        raise BookingError("上架日期不能空白")
+        raise BookingError("上架時間不能空白")
+    _parse_dt(value)   # 格式先驗，錯了要在這裡講，不是丟給 psycopg
     return value
 
 
@@ -209,15 +242,28 @@ def update(cur, mmg_id: int, data: dict) -> bool:
         "end_booking": (data.get("end_booking") or "").strip() or None,
     }
 
-    # 逐欄比對。period 是 Decimal vs float，直接比會誤判成有變動，
-    # 兩邊都轉成 float 再比。
-    unchanged = all(
-        (float(new[k]) == float(current[k]))
-        if k in ("period", "ready_time_cost", "reset_time_cost")
-           and new[k] is not None and current[k] is not None
-        else new[k] == current[k]
-        for k in EDITABLE
-    )
+    _validate_listing(new["start_booking"], new["end_booking"])
+
+    # 逐欄比對，但有兩種欄位不能直接比字面值：
+    #
+    #   period / ready / reset —— Decimal vs float，直接比會誤判成有變動。
+    #
+    #   start_booking / end_booking —— 同一個時刻有多種等價寫法。資料庫
+    #     回來的是 '2999-12-31T00:00'，而呼叫端可能送 '2999-12-31'。
+    #     ★ 比字串會讓這兩者永遠不相等：每次儲存都判定成有變動、下一次
+    #       無謂的 UPDATE，而且永遠跳「已儲存」而不是「無任何修改」。
+    #       兩邊都 parse 成 datetime 再比。
+    def same(k):
+        a, b = new[k], current[k]
+        if k in ("period", "ready_time_cost", "reset_time_cost"):
+            return float(a) == float(b) if a is not None and b is not None else a == b
+        if k in ("start_booking", "end_booking"):
+            if a is None or b is None:
+                return a == b
+            return _parse_dt(a) == _parse_dt(b)
+        return a == b
+
+    unchanged = all(same(k) for k in EDITABLE)
     slots_unchanged = all(
         names[i] == current["gm_slots"][i]["name"]
         and user_ids[i] == current["gm_slots"][i]["user_ids"]
@@ -265,6 +311,10 @@ def create(cur, data: dict) -> int:
     names = [(s.get("name") or "").strip() or None for s in gm_slots]
     user_ids = [list(s.get("user_ids") or []) for s in gm_slots]
 
+    start = _start_for_create(data)
+    end = (data.get("end_booking") or "").strip() or None
+    _validate_listing(start, end)
+
     cur.execute(
         """
         INSERT INTO mmg
@@ -284,8 +334,7 @@ def create(cur, data: dict) -> int:
             data.get("booking_cost"), data.get("players"),
             data.get("waitlist_limit", 3), data.get("status", "active"),
             data.get("room_id") or 1,
-            _start_for_create(data),
-            (data.get("end_booking") or "").strip() or None,
+            start, end,
             names[0], user_ids[0],
             names[1], user_ids[1],
             names[2], user_ids[2],

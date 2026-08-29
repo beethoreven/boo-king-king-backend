@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from db import schedule
+from db import listing, schedule
 
 
 class BookingError(Exception):
@@ -365,6 +365,15 @@ def create_booking(
     #
     #   跟前端共用 db/schedule.py 同一支判斷，不各自實作一份——兩邊只要
     #   差一點，使用者就會看到「畫面上選得到卻訂不下去」。
+    # 未上架或已下架的劇本一律訂不了。玩家的清單裡本來就沒有它，但清單
+    # 是畫面，這裡是防線——舊分頁、書籤、或直接打 API 都繞得過畫面。
+    cur.execute(
+        f"SELECT EXISTS (SELECT 1 FROM mmg WHERE id = %(id)s AND {listing.VISIBLE_SQL})",
+        {"id": mmg_id, "now": listing.now_taipei(cur)},
+    )
+    if not cur.fetchone()[0]:
+        raise BookingError("此劇本目前未開放預約")
+
     if allow_closed_slot:
         # 管理員代訂電話客人時可能真的要開一個不在常態內的場。這條路徑
         # 只有 role 1 走得到（見 app.py），而且畫面上會先跳確認。

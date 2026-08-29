@@ -263,21 +263,37 @@ def _ensure_mmg(cur) -> None:
             -- 不賣了，若要再開一場就是把區間拉長，而不是從例外戳一個洞——
             -- 否則「這齣戲什麼時候有場」要同時看兩個地方才答得出來）。
             --
-            -- ★ start_booking 不可為空，預設是建立當天。
+            -- ★ start_booking 不可為空，預設是建立的當下。
             --
-            --   一齣連上架日期都掛不出來的劇本，代表它還沒有真的要賣，
+            --   一齣連上架時間都掛不出來的劇本，代表它還沒有真的要賣，
             --   那它就不該是可以被預定的。允許留空的話，「先把資料建進去，
             --   哪天再說」的劇本會一直躺在玩家選得到的清單裡。
-            --   DATE 的語意本來就是從那天 00:00 起算——判斷式是
-            --   session_date >= start_booking，整個當天都包含在內。
-            start_booking DATE NOT NULL DEFAULT (NOW() AT TIME ZONE 'Asia/Taipei')::date,
+            --
+            --   ★ 是 TIMESTAMP 不是 DATE：上架是一個明確的時刻。同一天
+            --     14:00 上架的戲，當天 10:00 的場次不該訂得到、19:00 的
+            --     該訂得到——只存日期就表達不出這件事，整個上架日會一次
+            --     全開。裸值一律以台北時間解讀，與 session_date/time 同一
+            --     個約定（見本檔案 _ensure_booking_record 的說明）。
+            start_booking TIMESTAMP NOT NULL
+                DEFAULT (NOW() AT TIME ZONE 'Asia/Taipei'),
 
-            -- 下架日期則可以留空＝沒有上限，因為「不打算下架」是常態。
-            -- 判斷式寫成 end_booking IS NULL OR session_date <= end_booking，
-            -- 所以填一個很遠的真實日期（2999-12-31）跟填 NULL 結果完全相同
-            -- ——★ 不要把遙遠日期當成 magic value 特別處理，案主明確要求
-            -- 保留「寫真實數字也 OK」的空間。
-            end_booking DATE,
+            -- 下架時刻。可以留空＝不打算下架，那是常態，所以這一欄允許
+            -- NULL 而 start_booking 不允許。判斷式寫成
+            --   end_booking IS NULL OR <場次時刻> < end_booking
+            -- 所以填一個很遠的真實時刻（2999-12-31 00:00）跟填 NULL 結果
+            -- 完全相同——★ 不要把遙遠日期當成 magic value 特別處理，
+            -- 案主明確要求保留「寫真實數字也 OK」的空間。
+            --
+            -- 與 start_booking 同樣是 TIMESTAMP：下架也是一個明確的時刻，
+            -- 而且時間到了要自動把狀態切成 inactive（見 db/listing.py）。
+            end_booking TIMESTAMP,
+
+            -- 上下架時刻不能顛倒。應用層會先擋並回一句看得懂的話，這裡是
+            -- 最後一道：一個區間的結束早於開始，代表它從來不曾開放過，
+            -- 那不是一個有意義的設定，是一筆壞資料。
+            CONSTRAINT mmg_listing_order CHECK (
+                end_booking IS NULL OR end_booking > start_booking
+            ),
 
             -- 每個主持人角色是「名稱 + 會這個角色的人」一組，刻意讓
             -- gm{n}_name 與 gm{n}_user 相鄰，直接看資料表時一眼就能
@@ -323,11 +339,34 @@ def _ensure_mmg(cur) -> None:
         "UPDATE mmg SET start_booking = (NOW() AT TIME ZONE 'Asia/Taipei')::date "
         "WHERE start_booking IS NULL"
     )
+    # DATE → TIMESTAMP。舊值是日期，轉過來就是那天 00:00，語意不變
+    # （原本「那一天整天都開放」＝「從那天 00:00 起開放」）。
+    # 預設值要先拆掉再改型別，不然 Postgres 會拒絕轉換舊的 DATE 預設。
+    cur.execute("ALTER TABLE mmg ALTER COLUMN start_booking DROP DEFAULT")
+    cur.execute(
+        "ALTER TABLE mmg ALTER COLUMN start_booking TYPE TIMESTAMP "
+        "USING start_booking::timestamp"
+    )
     cur.execute(
         "ALTER TABLE mmg ALTER COLUMN start_booking SET DEFAULT "
-        "(NOW() AT TIME ZONE 'Asia/Taipei')::date"
+        "(NOW() AT TIME ZONE 'Asia/Taipei')"
     )
     cur.execute("ALTER TABLE mmg ALTER COLUMN start_booking SET NOT NULL")
+    cur.execute(
+        "ALTER TABLE mmg ALTER COLUMN end_booking TYPE TIMESTAMP "
+        "USING end_booking::timestamp"
+    )
+    # 既有資料可能已經有顛倒的區間（上一版沒有這個約束），所以先清乾淨
+    # 再上約束，否則 ADD CONSTRAINT 會失敗、整個 ensure_schema 起不來。
+    cur.execute(
+        "UPDATE mmg SET end_booking = NULL "
+        "WHERE end_booking IS NOT NULL AND end_booking <= start_booking"
+    )
+    cur.execute("ALTER TABLE mmg DROP CONSTRAINT IF EXISTS mmg_listing_order")
+    cur.execute(
+        "ALTER TABLE mmg ADD CONSTRAINT mmg_listing_order CHECK ("
+        "end_booking IS NULL OR end_booking > start_booking)"
+    )
     if "room_id" not in existing:
         # 既有資料一律歸到第一間包廂：導入這個欄位之前只有一間，
         # 所有劇本本來就都在那裡演。

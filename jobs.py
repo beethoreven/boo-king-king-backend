@@ -26,6 +26,13 @@
 from __future__ import annotations
 
 from db import bookings as bookings_db
+from db import listing
+
+
+def _count_listing(cur) -> int:
+    """把到點的上下架落地，回傳一共改了幾齣。"""
+    changed = listing.sync_status(cur)
+    return len(changed["listed"]) + len(changed["delisted"])
 
 
 def run_batch(pool, *, lookback_days) -> dict:
@@ -47,6 +54,10 @@ def run_batch(pool, *, lookback_days) -> dict:
         ("ended", lambda cur: bookings_db.mark_ended_batch(cur, lookback_days=lookback_days)),
         ("cancelled", bookings_db.cancel_expired_batch),
         ("waitlist_expired", bookings_db.expire_stale_waitlist_batch),
+        # 上下架到點落地。判定本身是即時算出來的（玩家看到的切換是準時的），
+        # 這一步只是讓資料庫裡的狀態欄跟事實一致，晚幾小時沒有差別——
+        # 那正是不需要每分鐘排程的原因，見 db/listing.py。
+        ("listing", lambda cur: _count_listing(cur)),
     )
     for key, fn in steps:
         try:

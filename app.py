@@ -27,6 +27,7 @@ import jobs  # noqa: E402
 from db import bookings as bookings_db  # noqa: E402
 from db import idle_gap  # noqa: E402
 from db import mmg as mmg_db  # noqa: E402
+from db import listing  # noqa: E402
 from db import schedule  # noqa: E402
 from db.bookings import BookingError  # noqa: E402
 from db.connection import pool  # noqa: E402
@@ -1081,6 +1082,12 @@ def admin_list_mmg():
     「新增主持人」下拉選單不用另外打一支 API。"""
     with pool.connection() as conn:
         with conn.cursor() as cur:
+            # 順帶把到點的上下架落地。管理員的劇本清單是低頻查詢，而且
+            # 正是「狀態」這一欄被看到的地方——在這裡補，管理員看到的
+            # 就一定是對的，而不必為此養一個每分鐘醒來的排程
+            #（那會讓 Neon 的 compute 永遠睡不著，見 db/listing.py）。
+            listing.sync_status(cur)
+            conn.commit()
             items = mmg_admin.list_all(cur)
             # 排期設定兩個查詢一次撈完再貼回去，不是每齣戲各查一次。
             rules = schedule.list_all_rules(cur)

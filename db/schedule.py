@@ -4,6 +4,8 @@
 
     0. 上下架區間（mmg.start_booking / end_booking）
        絕對外框。區間外一律不開，下面三層都翻不過來。
+       start_booking 是「時刻」不是「日期」：上架當天只有上架時間
+       之後的場次算數，同一天更早的時段仍然不開。
 
     1. 特定日期例外（mmg_schedule_exception）
        區間內最高。「這一週跟平常不同」——臨時公休、臨時加場、
@@ -54,9 +56,9 @@ def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None:
     if row is None:
         return None
     start, end = row
-    if session_date < start:
+    if session_date < start.date():
         return None
-    if end is not None and session_date > end:
+    if end is not None and session_date > end.date():
         return None
 
     # 第 1 層：這一天有沒有例外。有就以它為準，完全不看常態。
@@ -78,7 +80,30 @@ def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None:
         (mmg_id, session_date.isoweekday() % 7),
     )
     row = cur.fetchone()
-    return list(row[0]) if row is not None else None
+    times = list(row[0]) if row is not None else None
+    return _within_listing(times, session_date, start, end)
+
+
+def _within_listing(times, session_date: date, start, end) -> list[time] | None:
+    """上下架當天，把區間外的時段濾掉。
+
+    ★ 這一步不能省。前面只比到「日期」，所以 14:00 上架的戲在當天會連
+      10:00 的場次一起放行——那正是只存日期表達不出來、而案主要求要能
+      表達的那件事。上架日與下架日之間的每一天都不受影響。
+
+    邊界方向刻意不同：上架時刻「當下」就開賣（>=），下架時刻「當下」
+    就停賣（<）。兩邊都用 >= 的話，剛好等於下架時刻的那一場會落在
+    已經下架的區間裡還能訂。
+    """
+    if times is None:
+        return times
+    if session_date == start.date():
+        times = [t for t in times if t >= start.time()]
+    if end is not None and session_date == end.date():
+        times = [t for t in times if t < end.time()]
+    # 全部被濾掉時回 None 而不是 []：呼叫端用 `is None` 判斷「這天不開」，
+    # 留一個空清單會讓「開了但沒有時段」混進來，那不是一個真實的狀態。
+    return times or None
 
 
 def is_open(cur, mmg_id: int, session_date: date, session_time: time) -> bool:
@@ -131,10 +156,14 @@ def calendar(cur, mmg_id: int, start: date, end: date) -> tuple[dict, bool]:
     configured = bool(weekly or cur.fetchone()[0])
 
     # 第 0 層直接把查詢範圍夾掉，後面兩層就不必再各自判斷一次。
-    if lo > start:
-        start = lo
-    if hi is not None and hi < end:
-        end = hi
+    # 只夾到「日」——上架當天要保留下來，讓 _within_listing 去濾掉那天
+    # 上架時刻之前的時段；整天砍掉的話上架當天就完全訂不到了。
+    if lo.date() > start:
+        start = lo.date()
+    # 同樣只夾到「日」，下架當天要留下來讓 _within_listing 濾掉
+    # 下架時刻之後的時段。
+    if hi is not None and hi.date() < end:
+        end = hi.date()
     if start > end:
         return {}, configured
 
@@ -153,6 +182,7 @@ def calendar(cur, mmg_id: int, start: date, end: date) -> tuple[dict, bool]:
             times = times if is_open_day else None
         else:
             times = weekly.get(day.isoweekday() % 7)
+        times = _within_listing(times, day, lo, hi)
         if times:
             out[day.isoformat()] = [t.strftime("%H:%M") for t in sorted(times)]
         day = day.fromordinal(day.toordinal() + 1)

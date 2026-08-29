@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from db import listing
+
 
 def _row_to_dict(cur, row) -> dict:
     """把一列 mmg 展開成 dict，並把 gm{n}_user 的 id 換成人名。
@@ -48,12 +50,37 @@ _COLUMNS = (
 
 
 def list_active(cur) -> list[dict]:
-    """可預約的劇本。停用的不回傳——玩家不該看到已下架的劇本。"""
-    cur.execute(f"SELECT {_COLUMNS} FROM mmg WHERE status = 'active' ORDER BY id")
+    """玩家看得到的劇本。
+
+    ★ 用 listing.VISIBLE_SQL 而不是 `status = 'active'`：上架時刻已經到了、
+      但欄位值還沒被落地的劇本也算數。判定用算的，不等排程，所以切換是
+      準時到秒的——理由見 db/listing.py。
+      「尚未上架」與「已下架」都不會出現在這裡，連選單裡都沒有。
+    """
+    now = listing.now_taipei(cur)
+    cur.execute(
+        f"SELECT {_COLUMNS} FROM mmg WHERE {listing.VISIBLE_SQL} ORDER BY id",
+        {"now": now},
+    )
     return [_row_to_dict(cur, r) for r in cur.fetchall()]
 
 
 def get(cur, mmg_id: int) -> dict | None:
+    """單一劇本。不篩狀態——管理員與主持人也走這支。
+
+    玩家路徑要擋的是「看不到的劇本也訂不到」，那由 is_visible 負責，
+    在需要的端點各自呼叫，而不是讓這支自己吞掉不該顯示的資料。
+    """
     cur.execute(f"SELECT {_COLUMNS} FROM mmg WHERE id = %s", (mmg_id,))
     row = cur.fetchone()
     return _row_to_dict(cur, row) if row else None
+
+
+def is_visible(cur, mmg_id: int) -> bool:
+    """這齣戲此刻是不是玩家看得到、訂得到的。"""
+    now = listing.now_taipei(cur)
+    cur.execute(
+        f"SELECT EXISTS (SELECT 1 FROM mmg WHERE id = %(id)s AND {listing.VISIBLE_SQL})",
+        {"id": mmg_id, "now": now},
+    )
+    return bool(cur.fetchone()[0])
