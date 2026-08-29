@@ -263,12 +263,20 @@ def _ensure_mmg(cur) -> None:
             -- 不賣了，若要再開一場就是把區間拉長，而不是從例外戳一個洞——
             -- 否則「這齣戲什麼時候有場」要同時看兩個地方才答得出來）。
             --
-            -- NULL 代表沒有那一側的限制。判斷式一律寫成
-            --     start_booking IS NULL OR session_date >= start_booking
-            -- 所以填一個很遠的真實日期（2999-12-31）跟填 NULL 會得到
-            -- 完全相同的結果——★ 不要把遙遠日期當成 magic value 特別處理，
-            -- 案主明確要求保留「寫真實數字也 OK」的空間。
-            start_booking DATE,
+            -- ★ start_booking 不可為空，預設是建立當天。
+            --
+            --   一齣連上架日期都掛不出來的劇本，代表它還沒有真的要賣，
+            --   那它就不該是可以被預定的。允許留空的話，「先把資料建進去，
+            --   哪天再說」的劇本會一直躺在玩家選得到的清單裡。
+            --   DATE 的語意本來就是從那天 00:00 起算——判斷式是
+            --   session_date >= start_booking，整個當天都包含在內。
+            start_booking DATE NOT NULL DEFAULT (NOW() AT TIME ZONE 'Asia/Taipei')::date,
+
+            -- 下架日期則可以留空＝沒有上限，因為「不打算下架」是常態。
+            -- 判斷式寫成 end_booking IS NULL OR session_date <= end_booking，
+            -- 所以填一個很遠的真實日期（2999-12-31）跟填 NULL 結果完全相同
+            -- ——★ 不要把遙遠日期當成 magic value 特別處理，案主明確要求
+            -- 保留「寫真實數字也 OK」的空間。
             end_booking DATE,
 
             -- 每個主持人角色是「名稱 + 會這個角色的人」一組，刻意讓
@@ -304,10 +312,22 @@ def _ensure_mmg(cur) -> None:
             )
     for col in ("start_booking", "end_booking"):
         if col not in existing:
-            # 既有劇本一律留 NULL＝沒有上下架限制。導入這個欄位之前
-            # 本來就沒有任何日期限制，填 NULL 才是保持原本的行為；
-            # 給一個預設日期會讓既有劇本突然有一批日子訂不了。
             cur.execute(f"ALTER TABLE mmg ADD COLUMN {col} DATE")
+    # start_booking 補成 NOT NULL。分三步而不是一步 ALTER：既有的列可能
+    # 已經是 NULL（這個欄位剛加進來的那一版允許留空），直接 SET NOT NULL
+    # 會失敗。先補值再上約束。
+    #
+    # 既有劇本補「今天」而不是某個很早的日期：它們本來就沒有上架日的概念，
+    # 挑今天代表「從現在起可以賣」，而不是假裝它從 2020 年就上架了。
+    cur.execute(
+        "UPDATE mmg SET start_booking = (NOW() AT TIME ZONE 'Asia/Taipei')::date "
+        "WHERE start_booking IS NULL"
+    )
+    cur.execute(
+        "ALTER TABLE mmg ALTER COLUMN start_booking SET DEFAULT "
+        "(NOW() AT TIME ZONE 'Asia/Taipei')::date"
+    )
+    cur.execute("ALTER TABLE mmg ALTER COLUMN start_booking SET NOT NULL")
     if "room_id" not in existing:
         # 既有資料一律歸到第一間包廂：導入這個欄位之前只有一間，
         # 所有劇本本來就都在那裡演。

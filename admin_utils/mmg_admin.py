@@ -9,7 +9,17 @@ admin_utils/users.py。
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from db.bookings import BookingError
+
+# 台北是固定的 UTC+8，沒有日光節約，所以不需要 zoneinfo（那在某些精簡的
+# 部署環境沒有時區資料庫可讀）。全系統一律以台北時間解讀日期。
+_TAIPEI = timezone(timedelta(hours=8))
+
+
+def _today_taipei() -> str:
+    return datetime.now(_TAIPEI).date().isoformat()
 
 # 可編輯的欄位。id 不在裡面——主鍵不給改，改了等於換一齣劇本，
 # 而所有 booking_record 都還指著舊的 id。
@@ -126,6 +136,37 @@ def _validate_slots(gm_slots: list[dict]) -> None:
             raise BookingError(f"角色 {i} 的主持人名單有重複")
 
 
+def _start_for_create(data: dict) -> str:
+    """新增時的上架日期。
+
+    ★ 「沒有這個欄位」與「這個欄位是空的」要分開處理，兩者是不同的意圖：
+        沒帶  → 呼叫端根本沒管這件事，套用預設值＝今天（台北）。
+                案主要的「新劇本預設為建置當天」就是這一條。
+        空字串 → 使用者把它清掉了，那是明確的「我不填」，要拒絕。
+
+      合成同一件事的話，前端表單清空後按下新增會靜靜地得到今天，
+      而使用者以為自己成功地把它留白了。
+    """
+    if "start_booking" not in data:
+        return _today_taipei()
+    return _require_start(data)
+
+
+def _require_start(data: dict) -> str:
+    """取出上架日期，空的就拒絕。
+
+    ★ 一齣連上架日期都掛不出來的劇本，代表它還沒有真的要賣，那它就不該
+      出現在玩家可以預定的清單裡。允許留空的話，「先把資料建進去，哪天
+      再說」的劇本會一直躺在那裡可以被訂走。
+      資料庫那一層也是 NOT NULL，這裡先擋是為了回一句看得懂的話，而不是
+      讓使用者收到一個 psycopg 的約束錯誤。
+    """
+    value = (data.get("start_booking") or "").strip()
+    if not value:
+        raise BookingError("上架日期不能空白")
+    return value
+
+
 def update(cur, mmg_id: int, data: dict) -> bool:
     """更新一齣劇本。回傳這次呼叫是否真的改到任何欄位。
 
@@ -161,10 +202,10 @@ def update(cur, mmg_id: int, data: dict) -> bool:
         "waitlist_limit": data.get("waitlist_limit"),
         "status": data["status"],
         "room_id": data.get("room_id") or 1,
-        # 空字串 → NULL。日期輸入框清空時送過來的是 ""，直接塞進
-        # DATE 欄位會噴型別錯誤；而「清空」的語意本來就是「這一側
-        # 沒有限制」，也就是 NULL。
-        "start_booking": (data.get("start_booking") or "").strip() or None,
+        # ★ 上架日期不可為空，見下方 _require_start 的說明。
+        "start_booking": _require_start(data),
+        # 下架日期可以留空 → NULL ＝ 沒有上限。日期輸入框清空時送過來的
+        # 是 ""，直接塞進 DATE 欄位會噴型別錯誤，所以要轉成 None。
         "end_booking": (data.get("end_booking") or "").strip() or None,
     }
 
@@ -243,7 +284,7 @@ def create(cur, data: dict) -> int:
             data.get("booking_cost"), data.get("players"),
             data.get("waitlist_limit", 3), data.get("status", "active"),
             data.get("room_id") or 1,
-            (data.get("start_booking") or "").strip() or None,
+            _start_for_create(data),
             (data.get("end_booking") or "").strip() or None,
             names[0], user_ids[0],
             names[1], user_ids[1],

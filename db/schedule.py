@@ -33,55 +33,28 @@ from __future__ import annotations
 from datetime import date, time
 
 
-# 一個劇本完全沒有設過任何排期規則時，要當成「不限制」還是「全部關閉」。
-#
-# ★ 目前是「不限制」，這是刻意的，理由是它不會在功能上線的當下把既有的
-#   劇本全部變成訂不了——這個功能之前沒有任何日期限制，既有資料自然也
-#   沒有規則，判成全關等於一次無聲的大規模下架。新建的劇本同理：還沒設定
-#   就先當成沒有限制，比「建好卻莫名其妙訂不了」好解釋。
-#
-#   代價是：店家沒設定就沒有保護。要改成「沒設定＝全關」的話，把這個常數
-#   翻成 False 就好，三個判斷點會一起改變（那正是它們共用這支的原因）。
-UNCONFIGURED_IS_OPEN = True
+def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None:
+    """這一天開放的時段清單。不開放（任何一層擋下）時回傳 None。
 
-# 「沒有設定過」用這個回傳值表示，跟「有設定但這天不開」（None）分開。
-# 兩者對玩家的結果可能一樣，但對管理員是待辦與決定的差別。
-UNCONFIGURED = "unconfigured"
-
-
-def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None | str:
-    """這一天開放的時段清單。
-
-    回傳三種值，呼叫端要分開處理：
-        list  → 開放，這些時段可選
-        None  → 有設定，但這一天不開
-        UNCONFIGURED → 這個劇本完全沒設過規則（見上面的常數）
+    ★ 沒有「還沒設定所以不限制」這種例外。start_booking 是 NOT NULL，
+      每一齣劇本一定有上架日；沒有排定任何星期或特例的劇本就是全部關閉。
+      一齣連開放時段都沒設的戲，本來就不該被預定——這是刻意的，不是漏網。
 
     ★ None 與 [] 不同：[] 不會發生（兩張表都有 CHECK 擋掉空時段）。
       呼叫端用 `is None` 判斷，不要用真假值——空清單跟 None 在 if 裡
       是一樣的，那會讓兩種不同的狀態悄悄合併。
     """
-    # 第 0 層與「有沒有設定過」一起問，一次往返就拿到。
-    # 這支在開賣尖峰是最熱的讀取路徑之一，多一次往返就是多一次讓
-    # Neon compute 保持清醒的理由（見 db/idle_gap.py）。
+    # 第 0 層。這支在開賣尖峰是最熱的讀取路徑之一，能少一次往返就少一次
+    # 讓 Neon compute 保持清醒的理由（見 db/idle_gap.py）。
     cur.execute(
-        """
-        SELECT m.start_booking, m.end_booking,
-               EXISTS (SELECT 1 FROM mmg_weekly_slot w WHERE w.mmg_id = m.id)
-            OR EXISTS (SELECT 1 FROM mmg_schedule_exception e WHERE e.mmg_id = m.id)
-            OR m.start_booking IS NOT NULL
-            OR m.end_booking IS NOT NULL
-          FROM mmg m WHERE m.id = %s
-        """,
+        "SELECT start_booking, end_booking FROM mmg WHERE id = %s",
         (mmg_id,),
     )
     row = cur.fetchone()
     if row is None:
         return None
-    start, end, configured = row
-    if not configured:
-        return UNCONFIGURED
-    if start is not None and session_date < start:
+    start, end = row
+    if session_date < start:
         return None
     if end is not None and session_date > end:
         return None
@@ -111,30 +84,12 @@ def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None | str:
 def is_open(cur, mmg_id: int, session_date: date, session_time: time) -> bool:
     """這個 (日期, 時間) 能不能預約。"""
     times = open_times(cur, mmg_id, session_date)
-    if times == UNCONFIGURED:
-        return UNCONFIGURED_IS_OPEN
     if times is None:
         return False
     # 只比時與分。資料庫存的是 TIME，前端送的是 HH:MM，兩邊都不帶秒；
     # 但若哪天有人手動塞了帶秒的資料，直接比物件會無聲地永遠不相等。
     return any(t.hour == session_time.hour and t.minute == session_time.minute
                for t in times)
-
-
-def has_any_rule(cur, mmg_id: int) -> bool:
-    """這個劇本有沒有設過任何排期規則。
-
-    用來區分「還沒設定」與「設定成全關」。兩者的 open_times 都會回
-    None，但對管理員來說是完全不同的兩件事：前者是待辦，後者是決定。
-    """
-    cur.execute(
-        "SELECT EXISTS (SELECT 1 FROM mmg_weekly_slot WHERE mmg_id = %s) "
-        "OR EXISTS (SELECT 1 FROM mmg_schedule_exception WHERE mmg_id = %s) "
-        "OR EXISTS (SELECT 1 FROM mmg WHERE id = %s "
-        "           AND (start_booking IS NOT NULL OR end_booking IS NOT NULL))",
-        (mmg_id, mmg_id, mmg_id),
-    )
-    return bool(cur.fetchone()[0])
 
 
 def calendar(cur, mmg_id: int, start: date, end: date) -> tuple[dict, bool]:
@@ -171,22 +126,17 @@ def calendar(cur, mmg_id: int, start: date, end: date) -> tuple[dict, bool]:
         "SELECT EXISTS (SELECT 1 FROM mmg_schedule_exception WHERE mmg_id = %s)",
         (mmg_id,),
     )
-    configured = bool(
-        weekly or cur.fetchone()[0] or lo is not None or hi is not None
-    )
-    if not configured:
-        # 沒設定過就不回任何日期，由呼叫端依 UNCONFIGURED_IS_OPEN 決定
-        # 要放行還是擋。這裡不擅自填一整個月的假資料——那會讓「沒設定」
-        # 看起來像「店家真的把每天都開好了」。
-        return {}, False
+    # 「排得出場」＝有星期常態或特例日。上架日期不算，因為那是必填的，
+    # 每一齣都有；拿它當判準的話這個旗標永遠是真，就沒有意義了。
+    configured = bool(weekly or cur.fetchone()[0])
 
     # 第 0 層直接把查詢範圍夾掉，後面兩層就不必再各自判斷一次。
-    if lo is not None and lo > start:
+    if lo > start:
         start = lo
     if hi is not None and hi < end:
         end = hi
     if start > end:
-        return {}, True
+        return {}, configured
 
     cur.execute(
         "SELECT exception_date, is_open, times FROM mmg_schedule_exception "
@@ -206,7 +156,7 @@ def calendar(cur, mmg_id: int, start: date, end: date) -> tuple[dict, bool]:
         if times:
             out[day.isoformat()] = [t.strftime("%H:%M") for t in sorted(times)]
         day = day.fromordinal(day.toordinal() + 1)
-    return out, True
+    return out, configured
 
 
 # ── 管理員的寫入 ────────────────────────────────────────────
