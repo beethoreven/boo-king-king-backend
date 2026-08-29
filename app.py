@@ -25,6 +25,7 @@ from auth_utils.google_auth import extract_bearer_token, verify_google_id_token 
 from admin_utils import bookings_admin, mmg_admin, users_admin  # noqa: E402
 import jobs  # noqa: E402
 from db import bookings as bookings_db  # noqa: E402
+from db import idle_gap  # noqa: E402
 from db import mmg as mmg_db  # noqa: E402
 from db.bookings import BookingError  # noqa: E402
 from db.connection import pool  # noqa: E402
@@ -149,6 +150,25 @@ def run_daily_jobs():
 
     result = jobs.run_daily(pool)
     return jsonify(result), (500 if result.get("errors") else 200)
+
+
+@app.get("/internal/idle-gap-stats")
+def idle_gap_stats():
+    """資料庫存取間隔統計，用來估 Neon 的 CU-hours。
+
+    ★ 這支刻意不碰資料庫，也刻意不掛 require_auth：任何要查資料庫的守衛
+      都會讓「查看統計」這個動作自己算成一次存取——把間隔壓短，還順便把
+      compute 叫醒。量測工具污染被量測的對象，數字就沒有意義了。
+      所以改用跟每日排程同一組的 X-Job-Token，那只是比對一個環境變數。
+
+    沒設 JOB_TOKEN 就整支關閉，跟 /api/jobs/daily 一樣預設關著。
+    """
+    expected = os.environ.get("JOB_TOKEN")
+    if not expected:
+        return jsonify({"error": "未設定 JOB_TOKEN，此端點停用"}), 503
+    if request.headers.get("X-Job-Token") != expected:
+        return jsonify({"error": "未授權"}), 401
+    return jsonify(idle_gap.stats())
 
 
 @app.get("/api/ready")

@@ -20,8 +20,11 @@ TCP 1 + TLS 1-2 + SCRAM 約 3 個往返）。跨區時光是 pool 的健檢
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 
 from psycopg_pool import ConnectionPool
+
+from db import idle_gap
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
@@ -45,7 +48,25 @@ def _configure(conn):
     conn.commit()
 
 
-pool = ConnectionPool(
+class _MeasuredPool(ConnectionPool):
+    """在每次取用連線時記一筆時間戳，其餘行為與 ConnectionPool 完全相同。
+
+    掛在這一層而不是 HTTP 層，是因為要量的是「Neon 的 compute 被碰到的
+    頻率」。被快取擋掉的請求不會碰到資料庫，算進去會低估間隔。
+    詳見 db/idle_gap.py。
+
+    mark() 只碰記憶體裡的幾個數字，且刻意放在取用連線「之前」——放在
+    後面的話，等連線等了 20 秒（尖峰排隊）會被算成那 20 秒沒有存取。
+    """
+
+    @contextmanager
+    def connection(self, timeout=None):
+        idle_gap.mark()
+        with super().connection(timeout) as conn:
+            yield conn
+
+
+pool = _MeasuredPool(
     conninfo=DATABASE_URL,
 
     # 尖峰是 30+ 併發搶同一批座位，這是反壓上限，不是效能旋鈕。
