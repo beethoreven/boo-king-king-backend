@@ -12,7 +12,7 @@ from functools import wraps
 
 from flask import g, jsonify, request
 
-from auth_utils import whitelist
+from auth_utils import guard, whitelist
 from auth_utils.google_auth import extract_bearer_token
 from auth_utils.sessions import resolve_session
 from db.connection import pool
@@ -59,7 +59,37 @@ def _authenticate() -> tuple[dict | None, tuple | None]:
         return None, (jsonify({"error": "此帳號已刪除", "code": "deleted"}), 403)
     if user["status"] != "active":
         return None, (jsonify({"error": "此帳號未獲授權", "code": "deactivated"}), 403)
+
+    # ★ 速率限制放在這裡，而不是更前面：它是「按帳號」算的，得先知道是誰。
+    #   代價是多花了一次 session 查詢才擋下來，但那換到的是「一個人打爆
+    #   自己的額度不會影響別人」——全站限制在開賣尖峰會把真客人一起擋掉。
+    #
+    #   管理員豁免。如果唯一的管理員被系統自己鎖住，就沒有人能解鎖了。
+    if user["role"] > 1:
+        retry_after = guard.check_rate(user["id"])
+        if retry_after is not None:
+            _log_incident(user["id"], guard.KIND_RATE_LIMIT,
+                          f"每分鐘超過 {guard.RATE_LIMIT_PER_MINUTE} 次")
+            resp = jsonify({"error": "請求過於頻繁，請稍候再試", "code": "rate_limited"})
+            resp.headers["Retry-After"] = str(retry_after)
+            return None, (resp, 429)
+
     return user, None
+
+
+def _log_incident(user_id: int, kind: str, detail: str) -> None:
+    """把異常寫進 abuse_log。
+
+    紀錄失敗不能讓請求跟著失敗——這是觀測用的旁支，把它變成主要流程的
+    單點故障，等於為了記錄問題而製造問題。
+    """
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                guard.record(cur, user_id, kind, request.path, detail)
+                conn.commit()
+    except Exception:  # noqa: BLE001 - 觀測失敗不該影響主要流程
+        pass
 
 
 def require_auth(fn):

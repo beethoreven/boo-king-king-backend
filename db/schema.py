@@ -49,6 +49,7 @@ def ensure_schema(cur) -> None:
         _ensure_mmg(cur)
         _ensure_booking_record(cur)
         _ensure_sessions(cur)
+        _ensure_abuse_log(cur)
 
         _schema_ready = True
 
@@ -85,6 +86,48 @@ def _ensure_sessions(cur) -> None:
     )
     # 「把某個使用者的所有 session 一次撤銷」會用到（停用帳號時）
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_email ON sessions (email)")
+
+
+def _ensure_abuse_log(cur) -> None:
+    """異常請求的紀錄。
+
+    存兩種事件：
+      bad_request —— 格式層的參數錯誤（start=abc、未知頁籤、日期格式壞掉）。
+                     前端送不出這種東西，所以這是「有人在手動戳 API」的
+                     強訊號。
+      rate_limit  —— 單一帳號請求量超過門檻。訊號很弱：重整、網路重試、
+                     開賣尖峰都會觸發，所以只記錄、不作為停權依據。
+
+    ★ 為什麼不是在 users 上加一個計數欄位：計數只會告訴你「有幾次」，
+      而事後真正要判斷的是「什麼時候、打哪一支、送了什麼」。少了那些，
+      看到一個數字 47 也不知道該不該停權。
+
+    ★ 同一位使用者、同一種事件在短時間內連續發生時，累加 hits 而不是
+      一直插新列——被打爆的時候，寫入紀錄本身不該變成第二個壓力來源。
+      合併的窗口見 auth_utils/guard.py 的 MERGE_WINDOW_SECONDS。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS abuse_log (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            kind TEXT NOT NULL,
+            path TEXT,
+            detail TEXT,
+            hits INTEGER NOT NULL DEFAULT 1,
+            first_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    # 查詢一律是「某人最近發生什麼」或「最近全站發生什麼」，兩者都靠這個索引。
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_abuse_log_user_time "
+        "ON abuse_log (user_id, last_at DESC)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_abuse_log_time ON abuse_log (last_at DESC)"
+    )
 
 
 def _ensure_users(cur) -> None:

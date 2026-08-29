@@ -1,0 +1,181 @@
+"""濫用防護：每個帳號的速率限制，與異常請求的紀錄。
+
+## 為什麼是「每個帳號」而不是全站
+
+全站限制會讓一個人的行為影響到所有人——開賣尖峰三十個人同時搶，正好是
+最不該有人被擋下的時刻。按帳號算的話，某個人打爆自己的額度不影響別人。
+
+## 為什麼目前不自動停權
+
+停權的代價是不對稱的：被停權的人當場被登出、訂不了場、只能打電話找店家。
+而「請求量大」這個訊號很弱——重整、網路重試、開賣尖峰都會觸發。在開賣的
+那三分鐘把真客人踢掉，比放過一個亂打 API 的人糟得多。
+
+所以先只記錄。累積一段時間的真實資料、確認會被記到的都是該記的人之後，
+再把 AUTO_DEACTIVATE 打開。那時只要改這一個常數。
+
+## 為什麼管理員永遠豁免
+
+如果唯一的管理員被系統自己鎖掉，就沒有人能解鎖了。
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections import deque
+
+# ── 可調參數 ────────────────────────────────────────────────
+
+# 每個帳號每分鐘的請求上限。正常使用大約是這個的二十分之一——量過的
+# 數字：完整走一次預約流程 4 次、管理員存一筆劇本 1 次、切換頁籤 1 次。
+# 訂在 120 是為了讓「連續重整」這種真人行為離門檻還很遠。
+RATE_LIMIT_PER_MINUTE = 120
+RATE_WINDOW_SECONDS = 60
+
+# 同一位使用者、同一種事件在這個窗口內重複發生時，累加既有那一列的
+# hits，不插新列。被打爆的時候，寫紀錄本身不該變成第二個壓力來源。
+MERGE_WINDOW_SECONDS = 300
+
+# ★ 打開之後，壞請求累積到門檻就會自動停權。先跑一段時間確認記到的
+#   都是該記的人，再打開。
+AUTO_DEACTIVATE = False
+BAD_REQUEST_STRIKE_LIMIT = 20
+STRIKE_WINDOW_SECONDS = 600
+
+KIND_BAD_REQUEST = "bad_request"
+KIND_RATE_LIMIT = "rate_limit"
+
+# ── 速率限制（記憶體）────────────────────────────────────────
+#
+# 刻意不進資料庫：這一層每個請求都會經過，為了省資源而每次寫一筆，
+# 是花更多資源。Render 休眠會讓計數歸零，但那對速率限制無所謂——
+# 重來一個窗口而已，不是安全漏洞。
+
+_hits: dict[int, deque] = {}
+_hits_lock = threading.Lock()
+
+
+def _prune(dq: deque, now: float) -> None:
+    while dq and now - dq[0] > RATE_WINDOW_SECONDS:
+        dq.popleft()
+
+
+def check_rate(user_id: int) -> int | None:
+    """記一次請求。超過上限時回傳建議的重試秒數，否則 None。"""
+    now = time.monotonic()
+    with _hits_lock:
+        dq = _hits.setdefault(user_id, deque())
+        _prune(dq, now)
+        if len(dq) >= RATE_LIMIT_PER_MINUTE:
+            # 最舊那一筆離開窗口就有額度了。
+            return max(1, int(RATE_WINDOW_SECONDS - (now - dq[0])) + 1)
+        dq.append(now)
+        return None
+
+
+def reset_rate(user_id: int | None = None) -> None:
+    """清掉速率計數。測試與人工排除用。"""
+    with _hits_lock:
+        if user_id is None:
+            _hits.clear()
+        else:
+            _hits.pop(user_id, None)
+
+
+# ── 事件紀錄（資料庫）────────────────────────────────────────
+
+
+def record(cur, user_id: int, kind: str, path: str | None, detail: str | None) -> None:
+    """寫一筆異常紀錄，短時間內的重複事件併進同一列。
+
+    合併的鍵是 (user_id, kind)，不含 path：一個人亂試的時候通常會換著
+    不同的端點打，每支各自開一列反而看不出「這個人在戳」這件事。path
+    留最後一次的，detail 也是——要看細節就看最新那次，要看規模就看 hits。
+
+    ★ 先下 advisory lock 再做「找不到就新增」。沒有這道鎖時，一波併發
+      湧進來會有好幾個執行緒同時查到「沒有既有的列」而各自 INSERT——
+      實測 48 次併發會開出 4 列。hits 總數仍然正確，但管理員看到的是
+      「45 次」旁邊掛著三個「1 次」，那一頁就是拿來一眼判斷規模的，
+      拆成四列等於把它最主要的用途弄壞。
+      鎖的鍵只到 (user_id, kind)，擋的是同一個人同一種事件，不會互相
+      影響——而這正是併發最兇的地方（被限速時每個執行緒都想記一筆）。
+    """
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (f"abuse|{user_id}|{kind}",),
+    )
+    cur.execute(
+        """
+        UPDATE abuse_log
+           SET hits = hits + 1, last_at = NOW(), path = %s, detail = %s
+         WHERE id = (
+             SELECT id FROM abuse_log
+              WHERE user_id = %s AND kind = %s
+                AND last_at > NOW() - (%s::int * interval '1 second')
+              ORDER BY last_at DESC LIMIT 1
+         )
+        """,
+        (path, detail, user_id, kind, MERGE_WINDOW_SECONDS),
+    )
+    if cur.rowcount == 0:
+        cur.execute(
+            "INSERT INTO abuse_log (user_id, kind, path, detail) VALUES (%s, %s, %s, %s)",
+            (user_id, kind, path, detail),
+        )
+
+
+def recent_bad_request_count(cur, user_id: int) -> int:
+    """這個帳號在觀察窗口內累積的壞請求次數。"""
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(hits), 0) FROM abuse_log
+         WHERE user_id = %s AND kind = %s
+           AND last_at > NOW() - (%s::int * interval '1 second')
+        """,
+        (user_id, KIND_BAD_REQUEST, STRIKE_WINDOW_SECONDS),
+    )
+    return int(cur.fetchone()[0])
+
+
+def list_log(cur, *, user_id: int | None = None, start: int = 1, limit: int = 50) -> dict:
+    """異常紀錄清單，新的在前。管理員介面用。"""
+    where = "WHERE a.user_id = %(user)s" if user_id else ""
+    cur.execute(
+        f"""
+        SELECT a.id, a.user_id, u.email, u.name, a.kind, a.path, a.detail,
+               a.hits, a.first_at, a.last_at
+          FROM abuse_log a JOIN users u ON u.id = a.user_id
+          {where}
+         ORDER BY a.last_at DESC
+         LIMIT %(limit)s OFFSET %(offset)s
+        """,
+        {"user": user_id, "limit": limit + 1, "offset": start - 1},
+    )
+    rows = cur.fetchall()
+    has_more = len(rows) > limit
+    return {
+        "items": [
+            {
+                "id": r[0], "user_id": r[1], "email": r[2], "name": r[3],
+                "kind": r[4], "path": r[5], "detail": r[6], "hits": r[7],
+                "first_at": r[8].isoformat(), "last_at": r[9].isoformat(),
+            }
+            for r in rows[:limit]
+        ],
+        "has_more": has_more,
+    }
+
+
+def clear_log(cur, *, user_id: int | None = None) -> int:
+    """清除紀錄。不指定使用者就是全部清掉。
+
+    可以刪是刻意的：這張表是給人看的線索，不是稽核軌跡。處理完一個誤判
+    之後留著只會讓下次查詢多一堆雜訊。真的需要不可刪除的稽核紀錄時，
+    那是另一件事，不該跟這張表混在一起。
+    """
+    if user_id is None:
+        cur.execute("DELETE FROM abuse_log")
+    else:
+        cur.execute("DELETE FROM abuse_log WHERE user_id = %s", (user_id,))
+    return cur.rowcount

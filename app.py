@@ -19,7 +19,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 from flask import Flask, g, jsonify, request  # noqa: E402
 from flask_cors import CORS  # noqa: E402
 
-from auth_utils import profile, sessions, whitelist  # noqa: E402
+from auth_utils import guard, profile, sessions, whitelist  # noqa: E402
 from auth_utils.decorators import require_auth, require_role  # noqa: E402
 from auth_utils.google_auth import extract_bearer_token, verify_google_id_token  # noqa: E402
 from admin_utils import bookings_admin, mmg_admin, users_admin  # noqa: E402
@@ -76,6 +76,44 @@ with pool.connection() as _conn:
     with _conn.cursor() as _cur:
         ensure_schema(_cur)
         _conn.commit()
+
+
+def bad_request(message: str):
+    """格式層的參數錯誤：回 400，並且記一筆。
+
+    ★ 只給「前端根本送不出來」的錯誤用——start=abc、未知頁籤、日期格式
+      壞掉。這些是有人在手動戳 API 的訊號。
+
+    ★ 業務層的拒絕不要走這裡：電話格式打錯、時段衝突、聯絡資料沒填，
+      那些都是真人在正常操作中會遇到的，一律用 jsonify(...), 400。
+      混在一起數的話，一個手機號碼打錯三次的客人會被當成攻擊者。
+    """
+    if getattr(g, "user", None):
+        _record_bad_request(g.user, message)
+    return jsonify({"error": message}), 400
+
+
+def _record_bad_request(user: dict, message: str) -> None:
+    # 管理員不記點，理由同速率限制（見 decorators.py）。
+    if user.get("role", 3) <= 1:
+        return
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                guard.record(cur, user["id"], guard.KIND_BAD_REQUEST,
+                             request.path, message)
+                if guard.AUTO_DEACTIVATE:
+                    count = guard.recent_bad_request_count(cur, user["id"])
+                    if count >= guard.BAD_REQUEST_STRIKE_LIMIT:
+                        cur.execute(
+                            "UPDATE users SET status = 'deactive' WHERE id = %s",
+                            (user["id"],),
+                        )
+                        sessions.delete_sessions_for_email(cur, user["email"])
+                        whitelist.invalidate(user["email"])
+                conn.commit()
+    except Exception:  # noqa: BLE001 - 觀測失敗不該影響主要流程
+        pass
 
 
 @app.get("/api/health")
@@ -481,7 +519,7 @@ def check_host_route():
         mmg_id = int(request.args.get("mmg_id", ""))
         user_id = int(request.args.get("user_id", ""))
     except ValueError:
-        return jsonify({"error": "需要 mmg_id 與 user_id"}), 400
+        return bad_request("需要 mmg_id 與 user_id")
 
     try:
         d, t = _parse_slot(request.args)
@@ -521,11 +559,11 @@ def create_booking_route():
 
     request_id = (body.get("request_id") or "").strip()
     if not request_id:
-        return jsonify({"error": "缺少 request_id（冪等鍵），請由前端產生一組 UUID"}), 400
+        return bad_request("缺少 request_id（冪等鍵），請由前端產生一組 UUID")
 
     mmg_id = body.get("mmg_id")
     if not isinstance(mmg_id, int):
-        return jsonify({"error": "需要 mmg_id"}), 400
+        return bad_request("需要 mmg_id")
 
     try:
         d, t = _parse_slot(body)
@@ -534,7 +572,7 @@ def create_booking_route():
 
     gm_user_ids = body.get("gm_user_ids")
     if not isinstance(gm_user_ids, list) or len(gm_user_ids) != 4:
-        return jsonify({"error": "gm_user_ids 需要是長度 4 的陣列，沒有的角色填 null"}), 400
+        return bad_request("gm_user_ids 需要是長度 4 的陣列，沒有的角色填 null")
 
     # 玩家一律是自己，沒有例外——這裡不存在「代訂」這個動作。任何角色
     # （包含主持人、管理員）建立預約時都是為自己訂。
@@ -610,9 +648,9 @@ def my_bookings_tab(tab: str):
     try:
         start = int(request.args.get("start", 1))
     except ValueError:
-        return jsonify({"error": "start 必須是數字"}), 400
+        return bad_request("start 必須是數字")
     if start < 1:
-        return jsonify({"error": "start 必須大於 0"}), 400
+        return bad_request("start 必須大於 0")
 
     try:
         filters = _parse_filters(request.args)
@@ -746,9 +784,9 @@ def host_tab_route(tab: str):
     try:
         start = int(request.args.get("start", 1))
     except ValueError:
-        return jsonify({"error": "start 必須是數字"}), 400
+        return bad_request("start 必須是數字")
     if start < 1:
-        return jsonify({"error": "start 必須大於 0"}), 400
+        return bad_request("start 必須大於 0")
 
     try:
         filters = _parse_filters(request.args)
@@ -919,6 +957,56 @@ def admin_tidy_bookings():
     return jsonify(result), (500 if result.get("errors") else 200)
 
 
+@app.get("/api/admin/abuse")
+@require_role(1)
+def admin_abuse_log():
+    """異常請求紀錄。不帶 user_id 就是全站最近的。
+
+    這張表回答的是「誰在什麼時候打了什麼、幾次」——只給一個累計數字的話，
+    看到 47 也不知道該不該停權。
+    """
+    raw = request.args.get("user_id")
+    try:
+        user_id = int(raw) if raw else None
+        start = int(request.args.get("start", 1))
+    except ValueError:
+        return bad_request("user_id 與 start 必須是數字")
+    if start < 1:
+        return bad_request("start 必須大於 0")
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            data = guard.list_log(cur, user_id=user_id, start=start)
+    return jsonify({
+        **data,
+        # 讓管理員知道現在是「只記錄」還是「會自動停權」，不必去翻程式碼。
+        "auto_deactivate": guard.AUTO_DEACTIVATE,
+        "rate_limit_per_minute": guard.RATE_LIMIT_PER_MINUTE,
+    })
+
+
+@app.delete("/api/admin/abuse")
+@require_role(1)
+def admin_clear_abuse_log():
+    """清除紀錄。帶 user_id 就只清那個人的。
+
+    可以刪是刻意的——見 auth_utils/guard.py 的 clear_log()。
+    """
+    raw = request.args.get("user_id")
+    try:
+        user_id = int(raw) if raw else None
+    except ValueError:
+        return bad_request("user_id 必須是數字")
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            removed = guard.clear_log(cur, user_id=user_id)
+            conn.commit()
+    if user_id:
+        guard.reset_rate(user_id)
+    return jsonify({"removed": removed})
+
+
 @app.get("/api/admin/mmg")
 @require_role(1)
 def admin_list_mmg():
@@ -991,9 +1079,9 @@ def admin_bookings_tab(tab: str):
     try:
         start = int(request.args.get("start", 1))
     except ValueError:
-        return jsonify({"error": "start 必須是數字"}), 400
+        return bad_request("start 必須是數字")
     if start < 1:
-        return jsonify({"error": "start 必須大於 0"}), 400
+        return bad_request("start 必須大於 0")
 
     try:
         # status 由子頁籤決定，篩選器沒有這一項（見 bookings_admin）
