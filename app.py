@@ -56,7 +56,25 @@ app = Flask(__name__)
 #
 # 瀏覽器對這個值有自己的上限（Chrome 2 小時、Safari 更短），設得再大也
 # 會被夾到上限，所以填 1 小時，不是愈大愈好。
-CORS(app, max_age=3600)
+#
+# 來源限制：ALLOWED_ORIGINS 是逗號分隔的完整來源（含 scheme，不要結尾斜線），
+# 例如 https://booking.example.com,https://www.example.com
+#
+# ★ 沒設定時放行全部，而且會在啟動時印一行警告。這是刻意的取捨：
+#   設成「沒設定就全擋」的話，本機開發與案主現在的手動測試會在毫無提示
+#   的情況下整個壞掉，而症狀是瀏覽器主控台的 CORS 錯誤——那是最難從
+#   畫面上看出原因的一種失敗。
+#   正式環境一定要設；上線 SOP 把它列為必填。
+_origins_raw = os.environ.get("ALLOWED_ORIGINS", "").strip()
+_origins = [o.strip().rstrip("/") for o in _origins_raw.split(",") if o.strip()]
+if _origins:
+    CORS(app, origins=_origins, max_age=3600)
+else:
+    print(
+        "[warn] ALLOWED_ORIGINS 未設定，目前放行任何來源。正式環境請務必設定。",
+        flush=True,
+    )
+    CORS(app, max_age=3600)
 
 # Flask 預設會把 JSON 物件的鍵照字母排序輸出。對大部分回應無所謂，但
 # 管理員場次管理的 tabs 是「照營運流程排的子頁籤順序」

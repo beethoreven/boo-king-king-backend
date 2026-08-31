@@ -43,6 +43,20 @@ def ensure_schema(cur) -> None:
         if _schema_ready:
             return
 
+        # ★ 上面那把是 threading.Lock，只鎖得住「同一個 process 裡的執行緒」。
+        #   正式環境用 gunicorn 跑多個 worker，那是多個**行程**——它們會同時
+        #   進到這裡，同時對同一張表下 ALTER TABLE，互相搶 AccessExclusiveLock
+        #   而死結，兩個 worker 一起啟動失敗，服務根本起不來。
+        #
+        #   實測過：`gunicorn --workers 2` 直接噴
+        #   `psycopg.errors.DeadlockDetected` 然後 "Worker failed to boot"。
+        #   單一 process 的 Flask 開發伺服器永遠測不出這件事。
+        #
+        #   所以要再加一把**跨行程**的鎖。advisory lock 是交易層級的，會在
+        #   呼叫端 commit 時自動釋放；第二個 worker 會擋在這一行，等第一個
+        #   建完才進去，然後發現該有的都有了（這裡的每一段本來就是冪等的）。
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext('booking-king:ensure_schema'))")
+
         _ensure_users(cur)
         # rooms 要在 mmg 之前——mmg.room_id 參照它。
         _ensure_rooms(cur)
