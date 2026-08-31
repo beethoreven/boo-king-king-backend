@@ -33,6 +33,32 @@ from db.bookings import BookingError  # noqa: E402
 from db.connection import pool  # noqa: E402
 from db.schema import ensure_schema  # noqa: E402
 
+# ★ 把 psycopg_pool 的日誌接出來。
+#
+#   連線池建立連線失敗時只會記在它自己的 logger（WARNING），預設不會出現
+#   在 gunicorn/Flask 的輸出裡——呼叫端看到的只有一句
+#   「couldn't get a connection after 20.00 sec」，那句話對「密碼錯」
+#   「主機不通」「SSL 交涉失敗」「資料庫冷啟動太久」是同一個樣子。
+#
+#   實際上線時就是這樣：Render 每一次資料庫存取都逾時，而 log 裡沒有
+#   任何線索，因為真正的錯誤被吞在這個 logger 裡。
+import logging  # noqa: E402
+import sys as _sys  # noqa: E402
+
+_pool_log = logging.getLogger("psycopg.pool")
+# WARNING 就夠了：連線建立失敗是記在 WARNING（"error connecting in ..."），
+# 那正是我們要的。INFO 會把每一次取用與歸還連線都印一行，線上會把 log
+# 塞爆，而且 Render 的免費方案有保存上限。
+#
+# 自己掛一個 handler 而不是用 basicConfig：basicConfig 在已經有 handler
+# 時是空操作，而 gunicorn 會先設定好自己的 logging——那會讓這一行看起來
+# 有生效、實際上什麼都沒做。
+_pool_log.setLevel(logging.WARNING)
+if not _pool_log.handlers:
+    _h = logging.StreamHandler(_sys.stderr)
+    _h.setFormatter(logging.Formatter("[pool] %(levelname)s %(message)s"))
+    _pool_log.addHandler(_h)
+
 app = Flask(__name__)
 
 # max_age 是預檢（OPTIONS）結果的快取秒數，不設的話每一次 API 呼叫都會
