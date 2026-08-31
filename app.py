@@ -195,14 +195,22 @@ def idle_gap_stats():
 def ready():
     """連資料庫一起檢查。部署後確認整條路徑通了用的，不要拿來當保活目標
     （那會讓每次保活都把 Neon 喚醒，把免費的 CU-hours 額度燒掉）。"""
+    # ★ 只回報「有沒有設定」，不回報值。設定錯誤最難查的地方在於它跟
+    #   「憑證真的無效」回同一句 401——部署後光看錯誤訊息分不出是哪一種。
+    #   這裡把「設定面」攤開，但不洩漏任何秘密。
+    config = {
+        "google_client_id": bool(os.environ.get("GOOGLE_CLIENT_ID")),
+        "allowed_origins": _origins or "（未設定，放行全部）",
+        "job_token": bool(os.environ.get("JOB_TOKEN")),
+    }
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
-        return jsonify({"status": "ok", "database": "ok"})
+        return jsonify({"status": "ok", "database": "ok", "config": config})
     except Exception as exc:  # noqa: BLE001 - 回報狀態，不讓例外變成 500
-        return jsonify({"status": "degraded", "database": str(exc)}), 503
+        return jsonify({"status": "degraded", "database": str(exc), "config": config}), 503
 
 
 @app.post("/auth/login")
