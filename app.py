@@ -210,7 +210,32 @@ def ready():
                 cur.fetchone()
         return jsonify({"status": "ok", "database": "ok", "config": config})
     except Exception as exc:  # noqa: BLE001 - 回報狀態，不讓例外變成 500
-        return jsonify({"status": "degraded", "database": str(exc), "config": config}), 503
+        # ★ 連線池只會說「等不到連線」，把真正的原因吞掉——那句話對排查
+        #   完全沒有幫助，因為「密碼錯」「主機名打錯」「SSL 沒開」「Neon
+        #   在冷啟動」全都長這樣。這裡直接繞過池子連一次，把底層的例外
+        #   attempt 出來。
+        #
+        #   不會洩漏密碼：Postgres 的錯誤訊息只講失敗原因與主機，連線字串
+        #   本身不會出現在裡面。為保險起見仍然只取例外的類別與訊息，
+        #   不回傳任何設定值。
+        detail = None
+        try:
+            import psycopg
+            with psycopg.connect(
+                os.environ.get("DATABASE_URL", ""), connect_timeout=10
+            ) as _c:
+                with _c.cursor() as _cur:
+                    _cur.execute("SELECT 1")
+                    _cur.fetchone()
+            detail = "直連成功——問題出在連線池，不是資料庫本身"
+        except Exception as inner:  # noqa: BLE001
+            detail = f"{type(inner).__name__}: {inner}"
+        return jsonify({
+            "status": "degraded",
+            "database": str(exc),
+            "database_detail": detail,
+            "config": config,
+        }), 503
 
 
 @app.post("/auth/login")
