@@ -247,10 +247,7 @@ def ready():
         # ★ 池子的內部統計。這是唯一能分辨「有在嘗試連線但失敗」與
         #   「根本沒在嘗試」的東西——後者代表背景 worker 沒在運作，
         #   那是完全不同的問題，而 PoolTimeout 對兩者是同一句話。
-        try:
-            stats = pool.get_stats()
-        except Exception:  # noqa: BLE001
-            stats = None
+        stats = pool.get_stats()
         detail = None
         try:
             import psycopg
