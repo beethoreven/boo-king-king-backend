@@ -985,16 +985,26 @@ def host_tab_route(tab: str):
 
 
 @app.get("/api/bookings/<int:booking_id>/detail")
-@require_role(2)
+@require_auth
 def booking_detail_route(booking_id: int):
-    """主持人介面點「預定者名稱」或「指定的角色名稱」時要的資料。
+    """某一筆預約的細節：預定者的聯絡方式，以及這場所有角色與主持人。
 
-    兩個對話框的內容合成一支：預定者的聯絡方式，以及這場所有角色與
-    對應的主持人。分開做會變成點兩個地方各打一次 API，但兩者都是
-    「這一筆預約的細節」，一次拿完比較合理。
+    兩個對話框的內容合成一支：分開做會變成點兩個地方各打一次 API，
+    但兩者都是「這一筆預約的細節」，一次拿完比較合理。
 
-    權限是 role<=2，但只有被指定為這場主持人的人（或管理員）能看——
-    預定者的 email 與電話是個資，不該讓任何一位主持人查到別人的場次。
+    誰讀得到（三種，缺一不可地各有理由）：
+      管理員　　　　　　全部。經營者要處理任何一筆。
+      被指定的主持人　　自己被指定的那幾場。
+      這筆預約的預定者　自己那一筆。
+
+    ★ 最後一條是 2026-08-31 加的，讓玩家在「我預定的場次」能看到自己
+      這場的主持人是誰、確認了沒。安全上成立的理由是：這支回傳的個資
+      就是**他自己的**姓名與聯絡方式，而主持人名單本來就是他預約時
+      自己選的。他讀不到任何別人的東西。
+
+    ★ 守衛從 require_role(2) 換成 require_auth，判斷改在函式內做——
+      因為現在的規則不是「某個等級以上」，而是「管理員、或跟這一筆有
+      關係的人」。用 require_role 表達不出後者。
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -1004,7 +1014,8 @@ def booking_detail_route(booking_id: int):
                        b.gm1_confirmed, b.gm2_confirmed, b.gm3_confirmed, b.gm4_confirmed,
                        m.gm1_name, m.gm2_name, m.gm3_name, m.gm4_name,
                        u.name, u.email, u.line_id, u.phone,
-                       m.name, b.session_date, b.session_time, b.status, b.note
+                       m.name, b.session_date, b.session_time, b.status, b.note,
+                       b.player_id
                   FROM booking_record b
                   JOIN mmg m   ON m.id = b.mmg_id
                   JOIN users u ON u.id = b.player_id
@@ -1017,8 +1028,13 @@ def booking_detail_route(booking_id: int):
                 return jsonify({"error": "找不到這筆預約"}), 404
 
             host_ids = list(row[0:4])
-            if g.user["role"] > 1 and g.user["id"] not in host_ids:
-                return jsonify({"error": "只能查看自己被指定的場次"}), 403
+            allowed = (
+                g.user["role"] <= 1                    # 管理員
+                or g.user["id"] in host_ids            # 被指定的主持人
+                or g.user["id"] == row[21]             # 這筆預約的預定者
+            )
+            if not allowed:
+                return jsonify({"error": "只能查看自己的場次"}), 403
 
             # 把有指派的主持人名字一次查出來，避免四次單筆查詢
             present = [h for h in host_ids if h is not None]
