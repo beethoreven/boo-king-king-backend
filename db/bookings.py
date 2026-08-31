@@ -591,18 +591,18 @@ def list_player_tab(
 
     def item(r):
         return {
-            "id": r[0], "mmg_name": r[1],
-            "session_date": r[2].isoformat(), "session_time": r[3].strftime("%H:%M"),
-            "status": r[4], "status_label": PLAYER_TABS.get(r[4], r[4]),
-            "deposit": r[5], "booking_cost": r[6], "note": r[7],
-            "position": r[8],
-            "gm_names": [n for n in r[9:13] if n],
+            "id": r[0], "mmg_name": r[1], "mmg_url": r[2],
+            "session_date": r[3].isoformat(), "session_time": r[4].strftime("%H:%M"),
+            "status": r[5], "status_label": PLAYER_TABS.get(r[5], r[5]),
+            "deposit": r[6], "booking_cost": r[7], "note": r[8],
+            "position": r[9],
+            "gm_names": [n for n in r[10:14] if n],
         }
 
     return paged(
         cur,
         f"""
-        SELECT b.id, m.name, b.session_date, b.session_time, b.status,
+        SELECT b.id, m.name, m.url, b.session_date, b.session_time, b.status,
                b.deposit, m.booking_cost, b.note,
                CASE WHEN b.status = 'cancelled' THEN NULL ELSE (
                    SELECT COUNT(*) + 1 FROM booking_record x
@@ -934,16 +934,16 @@ def host_tab(
 
     def item(r):
         return {
-            "id": r[0], "mmg_name": r[1], "player_name": r[2],
-            "session_date": r[3].isoformat(), "session_time": r[4].strftime("%H:%M"),
-            "status": r[5], "status_label": STATUS_LABEL[r[5]], "role_name": r[6],
+            "id": r[0], "mmg_name": r[1], "mmg_url": r[2], "player_name": r[3],
+            "session_date": r[4].isoformat(), "session_time": r[5].strftime("%H:%M"),
+            "status": r[6], "status_label": STATUS_LABEL[r[6]], "role_name": r[7],
         }
 
     spec = _TABS[tab]
     return paged(
         cur,
         f"""
-        SELECT b.id, m.name, u.name, b.session_date, b.session_time, b.status,
+        SELECT b.id, m.name, m.url, u.name, b.session_date, b.session_time, b.status,
                {_HOST_ROLE_NAME} AS role_name
           FROM booking_record b
           JOIN mmg m   ON m.id = b.mmg_id

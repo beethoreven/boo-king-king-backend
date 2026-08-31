@@ -51,19 +51,19 @@ def list_tab(cur, tab: str, *, start: int = 1, filters: dict | None = None) -> d
 
     def item(r):
         return {
-            "id": r[0], "mmg_id": r[1], "mmg_name": r[2],
-            "player_id": r[3], "player_name": r[4],
-            "session_date": r[5].isoformat(), "session_time": r[6].strftime("%H:%M"),
-            "deposit": r[7], "booking_cost": r[8], "note": r[9],
-            "gm_user_ids": list(r[10:14]),
-            "gm_confirmed": list(r[14:18]),
-            "gm_names": list(r[18:22]),
+            "id": r[0], "mmg_id": r[1], "mmg_name": r[2], "mmg_url": r[3],
+            "player_id": r[4], "player_name": r[5],
+            "session_date": r[6].isoformat(), "session_time": r[7].strftime("%H:%M"),
+            "deposit": r[8], "booking_cost": r[9], "note": r[10],
+            "gm_user_ids": list(r[11:15]),
+            "gm_confirmed": list(r[15:19]),
+            "gm_names": list(r[19:23]),
         }
 
     return paged(
         cur,
         f"""
-        SELECT b.id, b.mmg_id, m.name, b.player_id, u.name,
+        SELECT b.id, b.mmg_id, m.name, m.url, b.player_id, u.name,
                b.session_date, b.session_time, b.deposit, m.booking_cost, b.note,
                b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id,
                b.gm1_confirmed, b.gm2_confirmed, b.gm3_confirmed, b.gm4_confirmed,

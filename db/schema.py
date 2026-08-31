@@ -236,6 +236,14 @@ def _ensure_mmg(cur) -> None:
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
 
+            -- 劇本簡介的外部連結。有值時，畫面上的劇本名稱會變成可以點的
+            -- 連結（開新分頁）；沒有值就是純文字。
+            --
+            -- 簡介本身刻意不放在這個系統裡：那是會不斷變動、圖文並茂的
+            -- 行銷內容，塞進來會讓這個資料庫變成一個它不該扮演的角色，
+            -- 而且免費方案的容量要留給真正的營運資料。
+            url TEXT,
+
             -- 這齣戲在哪一間包廂演。場次衝突比對的是包廂的佔用，不是
             -- 劇本本身——見 _ensure_rooms 的說明。
             room_id INTEGER NOT NULL DEFAULT 1 REFERENCES rooms(id),
@@ -340,6 +348,8 @@ def _ensure_mmg(cur) -> None:
             cur.execute(
                 f"ALTER TABLE mmg ADD COLUMN {col} NUMERIC(3, 1) NOT NULL DEFAULT 0.5"
             )
+    if "url" not in existing:
+        cur.execute("ALTER TABLE mmg ADD COLUMN url TEXT")
     for col in ("start_booking", "end_booking"):
         if col not in existing:
             cur.execute(f"ALTER TABLE mmg ADD COLUMN {col} DATE")

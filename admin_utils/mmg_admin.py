@@ -31,7 +31,7 @@ def _now_taipei() -> str:
 #   判定成「無任何修改」而不寫入——使用者改了、按了儲存、看到提示，
 #   資料卻沒變。ready/reset/room_id 就是這樣漏過一次。
 EDITABLE = (
-    "name", "period", "ready_time_cost", "reset_time_cost",
+    "name", "url", "period", "ready_time_cost", "reset_time_cost",
     "price", "booking_cost", "players",
     "waitlist_limit", "status", "room_id",
     # 上下架日期。排期判斷的第 0 層，絕對外框——見 db/schedule.py。
@@ -45,12 +45,15 @@ SELECTABLE_STATUSES = ("preparing", "active", "inactive")
 
 
 def _row_to_dict(row) -> dict:
-    (mid, name, period, ready, reset, price, cost, players, wl, status, room_id,
+    (mid, name, url, period, ready, reset, price, cost, players, wl, status, room_id,
      start_booking, end_booking,
      n1, u1, n2, u2, n3, u3, n4, u4) = row
     return {
         "id": mid,
         "name": name,
+        # 劇本簡介的外部連結。空字串一律存成 NULL，讓「沒有連結」只有
+        # 一種表示法——否則前端要同時判斷 null 與 ""。
+        "url": url,
         # NUMERIC 在 psycopg 是 Decimal，JSON 序列化不了
         "period": float(period) if period is not None else None,
         # 佈置與還原時間。包廂的佔用區間是 [開始-ready, 開始+period+reset]，
@@ -85,7 +88,7 @@ def _row_to_dict(row) -> dict:
 
 
 _COLUMNS = (
-    "id, name, period, ready_time_cost, reset_time_cost, "
+    "id, name, url, period, ready_time_cost, reset_time_cost, "
     "price, booking_cost, players, waitlist_limit, status, room_id, "
     "start_booking, end_booking, "
     "gm1_name, gm1_user, gm2_name, gm2_user, gm3_name, gm3_user, gm4_name, gm4_user"
@@ -226,6 +229,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
 
     new = {
         "name": data["name"].strip(),
+        "url": (data.get("url") or "").strip() or None,
         "period": data.get("period"),
         "ready_time_cost": data.get("ready_time_cost"),
         "reset_time_cost": data.get("reset_time_cost"),
@@ -275,7 +279,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
     cur.execute(
         """
         UPDATE mmg SET
-            name = %s, period = %s, ready_time_cost = %s, reset_time_cost = %s,
+            name = %s, url = %s, period = %s, ready_time_cost = %s, reset_time_cost = %s,
             price = %s, booking_cost = %s,
             players = %s, waitlist_limit = %s, status = %s, room_id = %s,
             start_booking = %s, end_booking = %s,
@@ -286,7 +290,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
          WHERE id = %s
         """,
         (
-            new["name"], new["period"],
+            new["name"], new["url"], new["period"],
             new["ready_time_cost"], new["reset_time_cost"],
             new["price"], new["booking_cost"],
             new["players"], new["waitlist_limit"], new["status"], new["room_id"],
@@ -318,17 +322,18 @@ def create(cur, data: dict) -> int:
     cur.execute(
         """
         INSERT INTO mmg
-            (name, period, ready_time_cost, reset_time_cost,
+            (name, url, period, ready_time_cost, reset_time_cost,
              price, booking_cost, players, waitlist_limit, status, room_id,
              start_booking, end_booking,
              gm1_name, gm1_user, gm2_name, gm2_user,
              gm3_name, gm3_user, gm4_name, gm4_user)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s)
+                %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
-            data["name"].strip(), data.get("period"),
+            data["name"].strip(), (data.get("url") or "").strip() or None,
+            data.get("period"),
             data.get("ready_time_cost", 0.5), data.get("reset_time_cost", 0.5),
             data.get("price"),
             data.get("booking_cost"), data.get("players"),
