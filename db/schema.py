@@ -66,6 +66,7 @@ def ensure_schema(cur) -> None:
         _ensure_booking_record(cur)
         _ensure_sessions(cur)
         _ensure_abuse_log(cur)
+        _ensure_abuse_rule(cur)
 
         _schema_ready = True
 
@@ -177,6 +178,58 @@ def _ensure_users(cur) -> None:
             line_id TEXT,
             phone TEXT
         )
+        """
+    )
+
+    # ── 異常記點與累進停權（2026-09-01 加）────────────────────
+    #
+    # abuse_point   累計點數。每產生一列**新的** abuse_log 就加分
+    #               （bad_request 2 分、rate_limit 1 分），每週的排程統一減 1。
+    # banned_until  停權到什麼時候。只有 status = 'banned' 時有意義。
+    #
+    # ★ 為什麼要 banned_until，而不是只有一個 status：停權是有期限的
+    #   （5 分鐘／24 小時／30 天），光有狀態就得有人在到期那一刻去解除它。
+    #   存下到期時間之後，判定時當場算就好——跟劇本上架用的是同一招，
+    #   不需要一個每分鐘醒來的排程（理由見 db/listing.py）。
+    for ddl in (
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS abuse_point INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_until TIMESTAMPTZ",
+    ):
+        cur.execute(ddl)
+
+
+def _ensure_abuse_rule(cur) -> None:
+    """幾點停權多久。
+
+    做成資料表而不是程式裡的常數，因為這幾個數字要靠實際運作調整，而改常數
+    要重新部署。案主直接用 SQL 改，不做管理介面——三行資料，做一個介面的
+    成本遠大於它省下來的事。
+
+        UPDATE abuse_rule SET ban_seconds = 600 WHERE min_point = 3;
+        INSERT INTO abuse_rule (min_point, ban_seconds, label)
+             VALUES (9, 0, 'permanent');     -- 0 = 無限期，要管理員手動解
+
+    判定時取「min_point <= 目前點數」之中 min_point 最大的那一條，所以要加
+    中間級距不必動任何程式。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS abuse_rule (
+            min_point   INTEGER PRIMARY KEY,
+            ban_seconds INTEGER NOT NULL,
+            label       TEXT
+        )
+        """
+    )
+    # ON CONFLICT DO NOTHING：這是「沒有才給預設值」，不是「每次啟動都
+    # 覆蓋回預設值」——後者會把案主調過的數字默默蓋掉。
+    cur.execute(
+        """
+        INSERT INTO abuse_rule (min_point, ban_seconds, label) VALUES
+            (3, 300,     'lower_abuse'),
+            (5, 86400,   'middle_abuse'),
+            (7, 2592000, 'high_abuse')
+        ON CONFLICT (min_point) DO NOTHING
         """
     )
 

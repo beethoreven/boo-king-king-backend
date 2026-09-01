@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+from auth_utils import guard
 from db import bookings as bookings_db
 from db import listing
 
@@ -81,6 +82,33 @@ def run_batch(pool, *, lookback_days) -> dict:
 
     if errors:
         result["errors"] = errors
+    return result
+
+
+def run_weekly(pool) -> dict:
+    """每週一次：所有人的異常點數減 1，並把已到期的停權落地。
+
+    ★ 這一支是累進停權能用的前提。點數只增不減的話，偶爾誤觸的老客人
+      累積幾年必然踩到門檻被封——而那正是這個機制最不該傷到的人。
+      每週減一點讓「偶爾」自己歸零，只有累犯會往上爬。
+      做法參考早年 PTT 的水桶制。
+
+    ★ 跟每日排程分開，因為兩者的節奏與後果完全不同：每日那幾支漏跑會讓
+      場次狀態失準（看得出來），這一支漏跑只是讓點數多留一週（幾乎看不出
+      來，但補跑一次就好）。混在一起的話，調整其中一個的頻率會連帶影響
+      另一個。
+
+    重跑安全：多跑一次就是多減一點，不會壞掉，只是寬鬆一點。
+    """
+    result: dict = {}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                result["decayed_users"] = guard.decay_points(cur)
+                conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        result["decayed_users"] = None
+        result["errors"] = [f"decay: {exc}"]
     return result
 
 

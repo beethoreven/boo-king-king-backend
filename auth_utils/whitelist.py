@@ -40,15 +40,42 @@ _cache_lock = threading.Lock()
 
 
 def _fetch_user(cur, email: str) -> dict | None:
+    """讀一個帳號。★ status 回傳的是**當下生效的**狀態，不是資料庫裡存的字。
+
+    停權是有期限的，而到期那一刻不會有人跑來把狀態改回去（那需要一個每分鐘
+    醒來的排程，而那會讓 Neon 永遠不休眠——理由見 db/listing.py）。所以這裡
+    直接在 SQL 裡算：banned 但時間已過就等於 active。
+
+    資料庫裡那個字什麼時候才會被改回來？每週的排程順手做（guard.decay_points）。
+    那只是為了讓管理員在使用者清單上看到對的東西，不影響任何判定。
+    """
     cur.execute(
-        "SELECT id, email, name, role, status FROM users WHERE lower(email) = %s",
+        """
+        SELECT id, email, name, role,
+               CASE
+                   WHEN status = 'banned'
+                        AND banned_until IS NOT NULL
+                        AND banned_until <= NOW()
+                   THEN 'active'
+                   ELSE status
+               END AS effective_status,
+               banned_until,
+               abuse_point
+          FROM users WHERE lower(email) = %s
+        """,
         (email.lower().strip(),),
     )
     row = cur.fetchone()
     if row is None:
         return None
-    uid, mail, name, role, status = row
-    return {"id": uid, "email": mail, "name": name, "role": role, "status": status}
+    uid, mail, name, role, status, banned_until, points = row
+    return {
+        "id": uid, "email": mail, "name": name, "role": role, "status": status,
+        # 停權到期時間要帶出來——被擋下來的人要看到「停到什麼時候」，
+        # 只說「你被停權了」會讓他不知道該等還是該打電話。
+        "banned_until": banned_until,
+        "abuse_point": points,
+    }
 
 
 def get_user(cur, email: str, *, fresh: bool = False) -> dict | None:

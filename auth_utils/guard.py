@@ -5,14 +5,26 @@
 全站限制會讓一個人的行為影響到所有人——開賣尖峰三十個人同時搶，正好是
 最不該有人被擋下的時刻。按帳號算的話，某個人打爆自己的額度不影響別人。
 
-## 為什麼目前不自動停權
+## 累進停權（2026-09-01 加）
 
-停權的代價是不對稱的：被停權的人當場被登出、訂不了場、只能打電話找店家。
-而「請求量大」這個訊號很弱——重整、網路重試、開賣尖峰都會觸發。在開賣的
-那三分鐘把真客人踢掉，比放過一個亂打 API 的人糟得多。
+原本只記錄不處置。缺點是一個持續在洗 API 的帳號可以無限期洗下去，而
+記下來的東西沒有任何後果。
 
-所以先只記錄。累積一段時間的真實資料、確認會被記到的都是該記的人之後，
-再把 AUTO_DEACTIVATE 打開。那時只要改這一個常數。
+現在改成累進制：每產生一列新的 abuse_log 就給使用者加點（見
+POINTS_BY_KIND），累計點數對照 abuse_rule 表決定停權多久。
+
+停權的代價仍然是不對稱的——被停權的人當場被登出、訂不了場、只能打電話
+找店家。所以三件事一起做，來壓低誤判的傷害：
+
+  1. **限流門檻從 120 提高到 240。** 實測顯示 120 貼著真實使用（見下方
+     RATE_LIMIT_PER_MINUTE 的註解）。
+  2. **兩種訊號分開計分。** rate_limit 是弱訊號只給 1 點，要三次相隔五
+     分鐘以上的違規才會碰到最輕的停權。
+  3. **點數每週遞減。** 偶爾誤觸的人會自己降回 0，只有累犯才會往上爬。
+     沒有這一條的話，老客人一年下來必然被封（見 jobs.py 的每週遞減）。
+
+管理員在編輯畫面把狀態改回「啟用」就解除停權，同時點數歸零——不歸零的話
+下一次違規會立刻跳回門檻以上，管理員會覺得解了個寂寞。
 
 ## 為什麼管理員永遠豁免
 
@@ -30,7 +42,13 @@ from collections import deque
 # 每個帳號每分鐘的請求上限。正常使用大約是這個的二十分之一——量過的
 # 數字：完整走一次預約流程 4 次、管理員存一筆劇本 1 次、切換頁籤 1 次。
 # 訂在 120 是為了讓「連續重整」這種真人行為離門檻還很遠。
-RATE_LIMIT_PER_MINUTE = 120
+# 每個帳號每分鐘的請求上限。
+#
+# 2026-09-01 從 120 提高到 240。理由是實測：一個正常玩家在開賣時找位子，
+# 光是換劇本（2 次）、翻日曆月份（每個沒看過的月份 1 次）、查時段（1 次）
+# 就很容易在一分鐘內累積上百次呼叫——120 貼著真實使用，而現在超過門檻
+# 不再只是記一筆，是會累積點數並導致停權，誤判的代價變高了。
+RATE_LIMIT_PER_MINUTE = 240
 RATE_WINDOW_SECONDS = 60
 
 # 同一位使用者、同一種事件在這個窗口內重複發生時，累加既有那一列的
@@ -39,7 +57,21 @@ MERGE_WINDOW_SECONDS = 300
 
 # ★ 打開之後，壞請求累積到門檻就會自動停權。先跑一段時間確認記到的
 #   都是該記的人，再打開。
-AUTO_DEACTIVATE = False
+# 每產生一列新的 abuse_log 要加幾點。
+#
+# ★ 兩種訊號的強度差很多，所以不同分：
+#     bad_request  強。前端根本送不出格式錯誤的請求——那是有人手工在戳 API。
+#     rate_limit   弱。開賣尖峰、網路重試、瘋狂重整都會觸發，正常玩家也會中。
+#
+# ★ 記點的單位是「一列 abuse_log」，不是「一個被擋下的請求」。被限流代表
+#   已經送了門檻以上的請求，若每個被擋的請求都加分，同一秒就會直接跳到
+#   停權門檻。abuse_log 本來就把同一人同一種事件在 MERGE_WINDOW_SECONDS
+#   內併成一列，所以「一次違規」＝「一列」是現成而且合理的錨點：
+#   一次爆發算一點，持續洗的話每 5 分鐘再一點。
+POINTS_BY_KIND = {
+    "bad_request": 2,
+    "rate_limit": 1,
+}
 BAD_REQUEST_STRIKE_LIMIT = 20
 STRIKE_WINDOW_SECONDS = 600
 
@@ -123,6 +155,96 @@ def record(cur, user_id: int, kind: str, path: str | None, detail: str | None) -
             "INSERT INTO abuse_log (user_id, kind, path, detail) VALUES (%s, %s, %s, %s)",
             (user_id, kind, path, detail),
         )
+        # ★ 只有「開了新的一列」才加點——這正是「又犯了一次」的定義。
+        #   落在合併窗口內的重複事件只把 hits 加一，不加點。
+        add_point(cur, user_id, kind)
+
+
+def add_point(cur, user_id: int, kind: str) -> dict | None:
+    """給使用者加點，並依 abuse_rule 判斷要不要停權。
+
+    回傳這次觸發的停權（{'points', 'ban_seconds', 'label', 'until'}），
+    沒有觸發就回 None。
+
+    ★ 呼叫端要負責清 session 與權限快取——那兩件事需要 import
+      auth_utils.sessions 與 whitelist，而它們會 import 回這裡，直接在這
+      呼叫會變成循環相依。所以這支只負責「算」，善後交給 app.py。
+    """
+    points = POINTS_BY_KIND.get(kind, 1)
+    cur.execute(
+        "UPDATE users SET abuse_point = abuse_point + %s WHERE id = %s "
+        "RETURNING abuse_point, status",
+        (points, user_id),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    total, status = row
+
+    # 取「門檻 <= 目前點數」之中最高的那一條。找不到就是還沒到最輕的門檻。
+    cur.execute(
+        "SELECT min_point, ban_seconds, label FROM abuse_rule "
+        "WHERE min_point <= %s ORDER BY min_point DESC LIMIT 1",
+        (total,),
+    )
+    rule = cur.fetchone()
+    if rule is None:
+        return None
+    _min_point, ban_seconds, label = rule
+
+    # ban_seconds = 0 代表無限期，要管理員手動解。用 NULL 表示「沒有到期」，
+    # 判定那邊會把 NULL 當成永遠有效（見 whitelist 的 effective status）。
+    if ban_seconds > 0:
+        cur.execute(
+            "UPDATE users SET status = 'banned', "
+            "banned_until = NOW() + (%s::int * interval '1 second') "
+            "WHERE id = %s RETURNING banned_until",
+            (ban_seconds, user_id),
+        )
+    else:
+        cur.execute(
+            "UPDATE users SET status = 'banned', banned_until = NULL "
+            "WHERE id = %s RETURNING banned_until",
+            (user_id,),
+        )
+    until = cur.fetchone()[0]
+    return {"points": total, "ban_seconds": ban_seconds, "label": label, "until": until}
+
+
+def decay_points(cur, amount: int = 1) -> int:
+    """每週遞減：所有人的點數減 amount，不會低於 0。回傳有幾個人被減。
+
+    ★ 沒有這一條的話，每個人終將被封——點數只增不減，老客人偶爾誤觸幾次，
+      累積幾年必然踩到門檻。遞減讓「偶爾」自己歸零，只有累犯會往上爬。
+      做法參考早年 PTT 的水桶制。
+
+    ★ 順便把已經到期的停權落地。判定本身是即時算的（到期就等於沒被停權），
+      這裡只是讓資料庫裡的狀態跟事實一致，好讓管理員在使用者清單上看到
+      對的東西。同一招見 db/listing.py。
+    """
+    cur.execute(
+        "UPDATE users SET abuse_point = GREATEST(abuse_point - %s, 0) "
+        "WHERE abuse_point > 0",
+        (amount,),
+    )
+    decayed = cur.rowcount
+    cur.execute(
+        "UPDATE users SET status = 'active', banned_until = NULL "
+        "WHERE status = 'banned' AND banned_until IS NOT NULL AND banned_until <= NOW()"
+    )
+    return decayed
+
+
+def clear_points(cur, user_id: int) -> None:
+    """點數歸零並解除停權。管理員把狀態改回「啟用」時呼叫。
+
+    ★ 一定要跟解除停權綁在一起。只改狀態不清點數的話，對方下一次違規會
+      立刻跳回門檻以上被重新停權，管理員會覺得解了個寂寞。
+    """
+    cur.execute(
+        "UPDATE users SET abuse_point = 0, banned_until = NULL WHERE id = %s",
+        (user_id,),
+    )
 
 
 def recent_bad_request_count(cur, user_id: int) -> int:

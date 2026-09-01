@@ -6,10 +6,16 @@
 
 from __future__ import annotations
 
-from auth_utils import sessions, whitelist
+from auth_utils import guard, sessions, whitelist
 from db.bookings import BookingError
 
 EDITABLE = ("email", "name", "role", "status", "line_id", "phone")
+# 管理員在編輯畫面能選的狀態。
+#
+# ★ 刻意不含 "banned"：那是系統判定的結果，不是人可以直接指定的東西。
+#   管理員能做的是把它改回 "active"（＝解除停權，同時點數歸零），
+#   而不是手動把某個人標成「因異常行為停權」。
+#   要手動停用就用 "deactive"，那是店家的決定，語意本來就不同。
 SELECTABLE_STATUSES = ("active", "deactive")
 ROLE_LABEL = {1: "管理員", 2: "主持人", 3: "一般玩家"}
 
@@ -19,10 +25,14 @@ def _row_to_dict(row) -> dict:
         "id": row[0], "email": row[1], "name": row[2],
         "role": row[3], "role_label": ROLE_LABEL.get(row[3], str(row[3])),
         "status": row[4], "line_id": row[5], "phone": row[6],
+        # 停權相關。管理員的清單要在名字旁邊標「因異常行為停權至 X 月 X 日」，
+        # 沒有到期時間就顯示不出「還要多久」，管理員會不必要地手動解除。
+        "banned_until": row[7].isoformat() if row[7] else None,
+        "abuse_point": row[8],
     }
 
 
-_COLUMNS = "id, email, name, role, status, line_id, phone"
+_COLUMNS = "id, email, name, role, status, line_id, phone, banned_until, abuse_point"
 
 
 def list_all(cur) -> list[dict]:
@@ -91,6 +101,13 @@ def update(cur, user_id: int, data: dict) -> bool:
     # deactive 就做」——後者會讓管理員每次編輯一個早就停用的帳號
     # （改個名字之類）都重跑一次無意義的 DELETE。也不對所有 update
     # 做：改名字或調角色不該把人踢下線。
+    # 管理員把系統判定的停權改回「啟用」＝解除停權。
+    #
+    # ★ 點數一定要一起歸零。只改狀態的話，對方下一次違規會立刻跳回門檻
+    #   以上被重新停權——管理員會覺得解了個寂寞，而且找不到原因。
+    if current["status"] == "banned" and new["status"] == "active":
+        guard.clear_points(cur, user_id)
+
     if current["status"] == "active" and new["status"] == "deactive":
         sessions.delete_sessions_for_email(cur, new["email"])
         # 舊 email 跟新 email 都要清：快取是用 email 當鍵，這次呼叫

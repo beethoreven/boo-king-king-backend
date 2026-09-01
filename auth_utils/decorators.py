@@ -8,12 +8,14 @@
 
 from __future__ import annotations
 
+import time
 from functools import wraps
 
 from flask import g, jsonify, request
 
 from auth_utils import guard, whitelist
 from auth_utils.google_auth import extract_bearer_token
+from auth_utils import sessions as sessions_mod
 from auth_utils.sessions import resolve_cached, resolve_session
 from db.connection import pool
 
@@ -72,6 +74,18 @@ def _authenticate() -> tuple[dict | None, tuple | None]:
         # 自己刪掉的帳號。跟停權分開講：停權是店家的決定，刪除是他自己的，
         # 兩者要走的復原路徑不同（都得找店家，但說法不該一樣）。
         return None, (jsonify({"error": "此帳號已刪除", "code": "deleted"}), 403)
+    if user["status"] == "banned":
+        # 系統判定的停權，跟店家手動停用（deactivated）分開回報：前者會自己
+        # 到期、而且有明確的到期時間可以告訴當事人，後者只能找店家。
+        # 前端據此顯示不同的畫面，見 web 的 blocked 畫面。
+        return None, (jsonify({
+            "error": "因異常行為暫時停權",
+            "code": "banned",
+            # 到期時間給前端顯示。None 代表無限期（abuse_rule 的 ban_seconds
+            # 設 0），那種只能等管理員手動解。
+            "banned_until": user["banned_until"].isoformat() if user.get("banned_until") else None,
+            "admin_name": admin_display_name(),
+        }), 403)
     if user["status"] != "active":
         return None, (jsonify({"error": "此帳號未獲授權", "code": "deactivated"}), 403)
 
@@ -83,7 +97,7 @@ def _authenticate() -> tuple[dict | None, tuple | None]:
     if user["role"] > 1:
         retry_after = guard.check_rate(user["id"])
         if retry_after is not None:
-            _log_incident(user["id"], guard.KIND_RATE_LIMIT,
+            _log_incident(user["id"], user["email"], guard.KIND_RATE_LIMIT,
                           f"每分鐘超過 {guard.RATE_LIMIT_PER_MINUTE} 次")
             resp = jsonify({"error": "請求過於頻繁，請稍候再試", "code": "rate_limited"})
             resp.headers["Retry-After"] = str(retry_after)
@@ -92,16 +106,54 @@ def _authenticate() -> tuple[dict | None, tuple | None]:
     return user, None
 
 
-def _log_incident(user_id: int, kind: str, detail: str) -> None:
-    """把異常寫進 abuse_log。
+# 停權畫面要顯示「本店管理員是誰」。這個值幾乎不變，但被停權的人可能一直
+# 重打——不快取的話，每一次被擋下來都要多一次資料庫查詢，等於把停權畫面
+# 變成一個放大器。
+_ADMIN_NAME_TTL_SECONDS = 600
+_admin_name_cache: tuple[float, str | None] = (0.0, None)
+
+
+def admin_display_name() -> str | None:
+    """role 1 的管理員叫什麼。查不到就回 None，讓前端自己決定怎麼講。"""
+    global _admin_name_cache
+    now = time.monotonic()
+    if _admin_name_cache[0] > now:
+        return _admin_name_cache[1]
+    name = None
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT name FROM users WHERE role = 1 AND status = 'active' "
+                    "ORDER BY id LIMIT 1"
+                )
+                row = cur.fetchone()
+                name = row[0] if row else None
+    except Exception:  # noqa: BLE001 - 顯示用的資訊，查不到不該讓請求失敗
+        pass
+    _admin_name_cache = (now + _ADMIN_NAME_TTL_SECONDS, name)
+    return name
+
+
+def _log_incident(user_id: int, email: str, kind: str, detail: str) -> None:
+    """把異常寫進 abuse_log；如果這一筆讓點數到了門檻，順便把人踢下線。
 
     紀錄失敗不能讓請求跟著失敗——這是觀測用的旁支，把它變成主要流程的
     單點故障，等於為了記錄問題而製造問題。
+
+    ★ record() 內部會在「開了新的一列」時加點並改狀態（見 guard.py）。
+      這裡負責善後的兩件事，而且必須一起做：刪 session 把人踢下線，
+      清權限快取讓他不能立刻重新登入。
     """
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 guard.record(cur, user_id, kind, request.path, detail)
+                cur.execute("SELECT status FROM users WHERE id = %s", (user_id,))
+                row = cur.fetchone()
+                if row and row[0] == "banned":
+                    sessions_mod.delete_sessions_for_email(cur, email)
+                    whitelist.invalidate(email)
                 conn.commit()
     except Exception:  # noqa: BLE001 - 觀測失敗不該影響主要流程
         pass

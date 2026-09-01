@@ -20,7 +20,7 @@ from flask import Flask, g, jsonify, request  # noqa: E402
 from flask_cors import CORS  # noqa: E402
 
 from auth_utils import guard, profile, sessions, whitelist  # noqa: E402
-from auth_utils.decorators import require_auth, require_role  # noqa: E402
+from auth_utils.decorators import admin_display_name, require_auth, require_role  # noqa: E402
 from auth_utils.google_auth import extract_bearer_token, verify_google_id_token  # noqa: E402
 from admin_utils import bookings_admin, mmg_admin, users_admin  # noqa: E402
 import jobs  # noqa: E402
@@ -148,20 +148,34 @@ def _record_bad_request(user: dict, message: str) -> None:
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
+                # record() 內部會在「開了新的一列」時自動加點，點數到門檻
+                # 就把狀態改成 banned（見 auth_utils/guard.py）。這裡負責
+                # 善後：把人踢下線、清權限快取。
+                #
+                # 那兩件事不放進 guard 是因為循環相依——sessions 與
+                # whitelist 都會 import guard。
+                before = user.get("status")
                 guard.record(cur, user["id"], guard.KIND_BAD_REQUEST,
                              request.path, message)
-                if guard.AUTO_DEACTIVATE:
-                    count = guard.recent_bad_request_count(cur, user["id"])
-                    if count >= guard.BAD_REQUEST_STRIKE_LIMIT:
-                        cur.execute(
-                            "UPDATE users SET status = 'deactive' WHERE id = %s",
-                            (user["id"],),
-                        )
-                        sessions.delete_sessions_for_email(cur, user["email"])
-                        whitelist.invalidate(user["email"])
+                _revoke_if_banned(cur, user["id"], user["email"], before)
                 conn.commit()
     except Exception:  # noqa: BLE001 - 觀測失敗不該影響主要流程
         pass
+
+
+def _revoke_if_banned(cur, user_id: int, email: str, before_status: str | None) -> None:
+    """剛剛那次記點如果導致停權，把人踢下線並清掉權限快取。
+
+    ★ 兩件事一定要一起做（zh-cn-to-tw 的教訓）：只刪 session 的話，對方可以
+      立刻重新登入——/auth/login 走的是同一支帶快取的權限查詢，命中時仍然
+      回「active」，於是又拿到新 session、繞回原點。
+    """
+    cur.execute("SELECT status FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    if row is None or row[0] != "banned" or before_status == "banned":
+        return
+    sessions.delete_sessions_for_email(cur, email)
+    whitelist.invalidate(email)
 
 
 @app.get("/api/health")
@@ -196,6 +210,26 @@ def run_daily_jobs():
         return jsonify({"error": "未授權"}), 401
 
     result = jobs.run_daily(pool)
+    return jsonify(result), (500 if result.get("errors") else 200)
+
+
+@app.post("/api/jobs/weekly")
+def run_weekly_jobs():
+    """每週排程的觸發點：異常點數遞減。
+
+    跟每日排程分開一支端點而不是塞進 /api/jobs/daily：兩者的頻率不同，
+    而排程服務是用「一個工作 = 一個網址」在管的。合在一起就沒辦法一天跑
+    一次那幾支、一週跑一次這一支。
+
+    保護方式與重跑安全性都跟每日排程相同（見 jobs.py）。
+    """
+    expected = os.environ.get("JOB_TOKEN")
+    if not expected:
+        return jsonify({"error": "JOB_TOKEN 未設定，排程端點停用"}), 503
+    if request.headers.get("X-Job-Token") != expected:
+        return jsonify({"error": "未授權"}), 401
+
+    result = jobs.run_weekly(pool)
     return jsonify(result), (500 if result.get("errors") else 200)
 
 
@@ -409,6 +443,17 @@ def auth_status():
             # 前端要靠這個分辨「停權」與「已刪除」——兩者都是 authorized
             # false，但畫面與訊息不同。
             "status": user["status"] if user else None,
+            # status == "banned" 時，停權畫面要顯示的兩件事。
+            #
+            # ★ 到期時間一定要給。只說「你被停權了」，當事人不知道該等一下
+            #   還是該打電話——而 5 分鐘跟 30 天的處置完全不同。
+            #   None 代表無限期（abuse_rule 的 ban_seconds 設 0），只能找管理員。
+            "banned_until": (
+                user["banned_until"].isoformat()
+                if user and user.get("banned_until") and user["status"] == "banned"
+                else None
+            ),
+            "admin_name": admin_display_name() if user and user["status"] == "banned" else None,
             "email": user["email"] if user else email,
             "name": user["name"] if user else None,
             "role": user["role"] if user else None,
