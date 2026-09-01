@@ -28,6 +28,7 @@ from db import bookings as bookings_db  # noqa: E402
 from db import idle_gap  # noqa: E402
 from db import mmg as mmg_db  # noqa: E402
 from db import listing  # noqa: E402
+from db import roles  # noqa: E402
 from db import schedule  # noqa: E402
 from db import slot_cache  # noqa: E402
 from db.bookings import BookingError  # noqa: E402
@@ -1358,9 +1359,22 @@ def _mmg_with_schedule(cur, mmg_id: int) -> dict:
 @app.get("/api/admin/users")
 @require_role(1)
 def admin_list_users():
+    """使用者清單，順便把角色清單一起回。
+
+    ★ 角色跟著這一支回，而不是另開一支端點：前端的編輯畫面需要「有哪些
+      角色可以選」，而它本來就會呼叫這一支。分成兩支的話多一次往返，而且
+      清單顯示的名稱與下拉選項的名稱有機會來自不同時間點的資料——同一個
+      畫面上同一個角色顯示兩種字，那比不做還糟。
+    """
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            return jsonify({"items": users_admin.list_all(cur)})
+            return jsonify({
+                "items": users_admin.list_all(cur),
+                "roles": [
+                    {"value": r["id"], "label": r["name"]}
+                    for r in roles.all_roles(cur).values()
+                ],
+            })
 
 
 @app.put("/api/admin/users/<int:user_id>")

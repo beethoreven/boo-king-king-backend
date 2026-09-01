@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from auth_utils import guard, sessions, whitelist
+from db import roles
 from db.bookings import BookingError
 
 EDITABLE = ("email", "name", "role", "status", "line_id", "phone")
@@ -24,13 +25,16 @@ EDITABLE = ("email", "name", "role", "status", "line_id", "phone")
 #     deactive  店家的決定。沒有到期這回事。
 #     banned    異常行為。系統判的有到期時間，人工判的沒有（見 update）。
 SELECTABLE_STATUSES = ("active", "deactive", "banned")
-ROLE_LABEL = {1: "管理員", 2: "主持人", 3: "一般玩家"}
+# ★ 角色名稱不再寫在這裡，改由 db/roles.py 從 roles 表讀（帶快取）。
+#   原本這裡、schema 的 CHECK、seed_demo、前端下拉各有一份，改一個地方要
+#   記得改另外三個，而漏掉的那個不會報錯，只會讓同一個角色在不同畫面上
+#   顯示不一樣的字。
 
 
-def _row_to_dict(row) -> dict:
+def _row_to_dict(cur, row) -> dict:
     return {
         "id": row[0], "email": row[1], "name": row[2],
-        "role": row[3], "role_label": ROLE_LABEL.get(row[3], str(row[3])),
+        "role": row[3], "role_label": roles.label(cur, row[3]),
         "status": row[4], "line_id": row[5], "phone": row[6],
         # 停權相關。管理員的清單要在名字旁邊標「因異常行為停權至 X 月 X 日」，
         # 沒有到期時間就顯示不出「還要多久」，管理員會不必要地手動解除。
@@ -44,13 +48,13 @@ _COLUMNS = "id, email, name, role, status, line_id, phone, banned_until, abuse_p
 
 def list_all(cur) -> list[dict]:
     cur.execute(f"SELECT {_COLUMNS} FROM users ORDER BY id")
-    return [_row_to_dict(r) for r in cur.fetchall()]
+    return [_row_to_dict(cur, r) for r in cur.fetchall()]
 
 
 def get(cur, user_id: int) -> dict | None:
     cur.execute(f"SELECT {_COLUMNS} FROM users WHERE id = %s", (user_id,))
     row = cur.fetchone()
-    return _row_to_dict(row) if row else None
+    return _row_to_dict(cur, row) if row else None
 
 
 def update(cur, user_id: int, data: dict) -> bool:
@@ -68,7 +72,9 @@ def update(cur, user_id: int, data: dict) -> bool:
     email = (data.get("email") or "").strip().lower()
     if not email:
         raise BookingError("email 不能空白")
-    if data.get("role") not in (1, 2, 3):
+    # 合法的角色由 roles 表決定，不寫死。往 roles 加一列新角色就會自動被
+    # 接受——不用回來改這裡（漏改的症狀是「資料庫說可以、程式說不行」）。
+    if data.get("role") not in roles.all_roles(cur):
         raise BookingError(f"未知的角色「{data.get('role')}」")
     if data.get("status") not in SELECTABLE_STATUSES:
         raise BookingError(f"未知的狀態「{data.get('status')}」")
@@ -154,7 +160,9 @@ def create(cur, data: dict) -> int:
     email = (data.get("email") or "").strip().lower()
     if not email:
         raise BookingError("email 不能空白")
-    if data.get("role") not in (1, 2, 3):
+    # 合法的角色由 roles 表決定，不寫死。往 roles 加一列新角色就會自動被
+    # 接受——不用回來改這裡（漏改的症狀是「資料庫說可以、程式說不行」）。
+    if data.get("role") not in roles.all_roles(cur):
         raise BookingError(f"未知的角色「{data.get('role')}」")
 
     cur.execute("SELECT 1 FROM users WHERE lower(email) = %s", (email,))

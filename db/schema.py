@@ -57,6 +57,8 @@ def ensure_schema(cur) -> None:
         #   建完才進去，然後發現該有的都有了（這裡的每一段本來就是冪等的）。
         cur.execute("SELECT pg_advisory_xact_lock(hashtext('booking-king:ensure_schema'))")
 
+        # roles 要在 users 之前——users.role 有外鍵指過來。
+        _ensure_roles(cur)
         _ensure_users(cur)
         # rooms 要在 mmg 之前——mmg.room_id 參照它。
         _ensure_rooms(cur)
@@ -147,6 +149,62 @@ def _ensure_abuse_log(cur) -> None:
     )
 
 
+def _ensure_roles(cur) -> None:
+    """角色，以及每個角色要不要收通知。
+
+    ## 為什麼是一張表而不是三個常數
+
+    role 的名稱原本散在四個地方各有一份（後端的 ROLE_LABEL、schema 的
+    CHECK、seed_demo、前端的下拉選項）。改一個地方就要記得改另外三個，
+    而漏掉的那一個不會報錯，只會在某個畫面上顯示不一樣的字。
+
+    現在這裡是唯一的來源：名稱從這裡讀，users.role 用外鍵指過來。
+
+    ## 通知開關
+
+    line_notification / email_notification 決定「這個角色的人要不要收
+    通知」，各自對應一種情境：
+
+        管理員    所有指定的主持人都確認完了 → 通知管理員去發付訂金通知
+        主持人    玩家指定了他 → 通知他去點確認
+        一般玩家  狀態切到 booked → 通知他預約成立
+
+    ★ 沒有介面，用 SQL 改就好（跟 abuse_rule 同一個理由——兩三行資料，
+      做介面的成本遠大於它省下的事）：
+
+        UPDATE roles SET email_notification = true WHERE id = 2;
+        UPDATE roles SET line_notification = false;   -- 全部關掉
+
+    ★ 兩個都 false 就是這個角色完全不收通知，那是合法的設定，不是壞掉。
+
+    ★ line_notification 目前**只有欄位，還沒有實作**。LINE 官方帳號的免費
+      額度是每月 200 則，而這套流程每筆預約約 5-6 則（發給幾個人算幾則，
+      同一個人下次再發還是算），一個月三十幾筆就用完，所以先走 email
+      （Brevo 免費 300 封／天）。欄位先建著，等真的要接 LINE 時不用再動
+      schema。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS roles (
+            id                 INTEGER PRIMARY KEY,
+            name               TEXT NOT NULL,
+            line_notification  BOOLEAN NOT NULL DEFAULT false,
+            email_notification BOOLEAN NOT NULL DEFAULT false
+        )
+        """
+    )
+    # ON CONFLICT DO NOTHING：只在沒有時給預設值，不覆蓋案主調過的設定。
+    cur.execute(
+        """
+        INSERT INTO roles (id, name, line_notification, email_notification) VALUES
+            (1, '管理員',   false, true),
+            (2, '主持人',   false, true),
+            (3, '一般玩家', false, true)
+        ON CONFLICT (id) DO NOTHING
+        """
+    )
+
+
 def _ensure_users(cur) -> None:
     """帳號。
 
@@ -167,7 +225,7 @@ def _ensure_users(cur) -> None:
             id SERIAL PRIMARY KEY,
             email TEXT NOT NULL UNIQUE,
             name TEXT,
-            role INTEGER NOT NULL CHECK (role IN (1, 2, 3)),
+            role INTEGER NOT NULL REFERENCES roles(id),
             status TEXT NOT NULL DEFAULT 'active',
 
             -- 聯絡方式。兩者都可為空——玩家可能只留其中一種，
@@ -196,6 +254,29 @@ def _ensure_users(cur) -> None:
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_until TIMESTAMPTZ",
     ):
         cur.execute(ddl)
+
+    # ── role 從 CHECK 換成外鍵（2026-09-01）────────────────────
+    #
+    # 舊的 CHECK (role IN (1,2,3)) 把合法的角色寫死在 schema 裡，而角色現在
+    # 是一張表。留著 CHECK 的話，往 roles 加一列新角色會被它擋下來——一個
+    # 「資料表說可以、schema 說不行」的矛盾。
+    #
+    # 外鍵給的保證更強也更誠實：role 一定指得到 roles 裡真實存在的一列。
+    cur.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check")
+    cur.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'users_role_fkey'
+            ) THEN
+                ALTER TABLE users
+                    ADD CONSTRAINT users_role_fkey
+                    FOREIGN KEY (role) REFERENCES roles(id);
+            END IF;
+        END $$
+        """
+    )
 
 
 def _ensure_abuse_rule(cur) -> None:

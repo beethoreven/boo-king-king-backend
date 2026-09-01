@@ -127,7 +127,10 @@ def _fix_sequences(cur) -> None:
 def show(cur) -> None:
     _print_header("users")
     cur.execute("SELECT id, email, name, role, status, line_id, phone FROM users ORDER BY id")
-    role_label = {1: "管理員", 2: "主持人", 3: "一般玩家"}
+    # 從 roles 表讀，不要在這裡再放一份——這支的用途正是「印出資料庫裡
+    # 有什麼」，用一份自己的對照表印，印出來的就不一定是資料庫裡的東西。
+    from db import roles as roles_db
+    role_label = {rid: r["name"] for rid, r in roles_db.all_roles(cur).items()}
     for uid, email, name, role, status, line_id, phone in cur.fetchall():
         print(f"    id={uid}  {name:<8} {role_label.get(role, role):<8} {status:<8} {email}")
         print(f"           line_id={line_id or '(空)'}  phone={phone or '(空)'}")
