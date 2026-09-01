@@ -32,12 +32,15 @@ curl -s localhost:5001/api/health
 ```
 
 前端在另一個 repo（booking-king-web），用 `python3 -m http.server 5173` 起，
-但**網址一定要帶 `?apiBase=http://localhost:5001`**，否則前端會把 API 打到
-5173 自己身上，症狀是登入畫面卡住或 404。
+直接開 <http://localhost:5173> 就好——前端偵測到跑在 localhost 上會自動打
+`http://localhost:5001`，不用帶參數。要對別的後端測就帶 `?apiBase=`，
+查詢參數永遠優先（見 `js/api.js` 的 `API_BASE`）。
 
 ## 已定案的架構決策
 
-- 連線層：`db/connection.py`，psycopg3 + `ConnectionPool`，參數與理由見檔案內註解
+- 連線層：`db/connection.py`，**每次請求各自開一條連線 + `BoundedSemaphore(5)` 當
+  反壓上限**。原本用 psycopg3 的 `ConnectionPool`，在 Render 免費方案上會永久卡死
+  （容器凍結後池子的背景執行緒不恢復），2026-08-31 實測後換掉，完整理由見檔案內註解
 - 防超賣：per-slot advisory lock（鍵是「劇本+日期+時間」）鎖住該場次後才數容量，
   容量 = `1 + mmg.waitlist_limit` 組；主持人撞期另有 per-host advisory lock，
   多把鎖依排序取得避免死鎖。實作見 `db/bookings.py` 的 `_lock_slot` / `_lock_hosts`
