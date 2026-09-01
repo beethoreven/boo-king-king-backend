@@ -29,6 +29,7 @@ from db import idle_gap  # noqa: E402
 from db import mmg as mmg_db  # noqa: E402
 from db import listing  # noqa: E402
 from db import schedule  # noqa: E402
+from db import slot_cache  # noqa: E402
 from db.bookings import BookingError  # noqa: E402
 from db.connection import pool  # noqa: E402
 from db.schema import ensure_schema  # noqa: E402
@@ -214,7 +215,7 @@ def idle_gap_stats():
         return jsonify({"error": "未設定 JOB_TOKEN，此端點停用"}), 503
     if request.headers.get("X-Job-Token") != expected:
         return jsonify({"error": "未授權"}), 401
-    return jsonify(idle_gap.stats())
+    return jsonify({**idle_gap.stats(), "slot_cache": slot_cache.stats()})
 
 
 @app.get("/api/ready")
@@ -602,13 +603,26 @@ def get_availability(mmg_id: int):
 def get_slot(mmg_id: int):
     """某個劇本某個時段目前的排隊狀況。
 
-    這是開賣尖峰時最熱的讀取路徑（大量玩家重複整理看還有沒有位子）。
-    之後要接 Redis 快取的話就是快取這一支，寫入路徑不動。
+    這是開賣尖峰時最熱的讀取路徑（大量玩家重複整理看還有沒有位子），
+    所以整個回應有快取——見 db/slot_cache.py。寫入路徑一步都不動，
+    精準性仍然由 Postgres 的唯一性約束保證。
+
+    ★ 快取的是「這個時段的狀況」，跟問的人是誰無關：下面回傳的欄位裡
+      沒有任何一個跟使用者有關，所以跨使用者共用是安全的。哪天要在這支
+      加上會因人而異的欄位（例如「你自己排在第幾位」），快取就必須跟著
+      改成 per-user，否則會把 A 的資訊回給 B。
     """
     try:
         d, t = _parse_slot(request.args)
     except BookingError as exc:
         return jsonify({"error": str(exc)}), 400
+
+    ck = slot_cache.key(mmg_id, d, t)
+    cached = slot_cache.get(ck)
+    if cached is not None:
+        # ★ 命中就直接回，連線都不開——這正是要省的東西：不是那幾毫秒，
+        #   是「不要把 Neon 從休眠叫醒」。
+        return jsonify(cached)
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -629,7 +643,7 @@ def get_slot(mmg_id: int):
     # 這個時段有沒有已經成立的那一組。玩家看到的說法差很多：已經有人
     # 成立了，後面排的就是候補；都還沒成立的話，大家只是先後順序不同。
     has_booked = any(st == "booked" for _p, _b, _n, st, _d, _t2, _r in queue)
-    return jsonify({
+    payload = {
         "mmg_id": mmg_id,
         "mmg_name": item["name"],
         "session_date": d.isoformat(),
@@ -652,7 +666,9 @@ def get_slot(mmg_id: int):
         #   訂不訂得成」——前面排的是誰、他們的預約在什麼狀態，那是別的
         #   客人的資料，跟他要做的決定無關。
         #   管理員與主持人的畫面各自有完整清單，那兩支都有權限把關。
-    })
+    }
+    slot_cache.put(ck, payload)
+    return jsonify(payload)
 
 
 @app.get("/api/bookings/check-host")

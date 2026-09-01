@@ -43,6 +43,27 @@ _TOUCH_MIN_INTERVAL_SECONDS = 60
 _touch_lock = threading.Lock()
 _last_touched: dict[str, float] = {}
 
+# ── token → email 的解析快取 ────────────────────────────────
+#
+# 為什麼要有：查驗身分是**每一支受保護的路由**都會做的事，而它固定要開一條
+# 資料庫連線。db/connection.py 的同時連線上限是 5，開賣尖峰時那 5 個名額
+# 就是瓶頸——一個被快取擋下的 /slot 查詢原本還是要為了「你是誰」開一條，
+# 等於快取只把 2 條減成 1 條。加上這一層，命中的請求才真的變成 0 條。
+#
+# ★ 這一層快取的是「這張 token 是誰的」，**不是任何業務資料**。劇本清單、
+#   場次狀態都不經過這裡，所以它不會讓任何人看到過期的畫面。
+#
+# ★ 它也讓速率限制變便宜。guard.check_rate 是純記憶體的，但它跑在身分查驗
+#   **之後**——沒有這層快取時，一個正在被限流的攻擊者每次請求仍然會開一條
+#   連線才被擋下來，防禦比服務還貴。有了它，第二次之後的請求在記憶體裡就
+#   被擋掉了。
+#
+# TTL 取短：撤銷（登出、停用）在這個窗口內仍然有效。3 秒比 whitelist 那層
+# 既有的 30 秒權限窗口小一個數量級，所以它不會是撤銷延遲的瓶頸。
+# 設 0 就是停用這層快取。
+_RESOLVE_TTL_SECONDS = float(os.environ.get("SESSION_CACHE_TTL_SECONDS", "3"))
+_resolved: dict[str, tuple[float, str]] = {}
+
 
 def create_session(cur, email: str) -> str:
     """簽發一張新的 session token。
@@ -58,9 +79,28 @@ def create_session(cur, email: str) -> str:
     return token
 
 
+def resolve_cached(token: str | None) -> str | None:
+    """只查快取，不碰資料庫。沒有或已過期就回 None。
+
+    給 require_auth 用：先問這裡，命中就完全不必開連線。★ 不要用這支
+    取代 resolve_session——它不會更新 last_seen_at，也不會刪掉過期的列。
+    """
+    if not token or _RESOLVE_TTL_SECONDS <= 0:
+        return None
+    now = time.monotonic()
+    with _touch_lock:
+        hit = _resolved.get(token)
+        return hit[1] if hit is not None and hit[0] > now else None
+
+
 def resolve_session(cur, token: str | None) -> str | None:
     """token 有效就回傳對應的 email，並視情況更新 last_seen_at；
-    無效（不存在或閒置過久）回傳 None，過期的話順便把那筆刪掉。"""
+    無效（不存在或閒置過久）回傳 None，過期的話順便把那筆刪掉。
+
+    成功的結果會進解析快取（見上方 _RESOLVE_TTL_SECONDS）。失敗的**不會**
+    ——無效 token 通常代表有人在亂試，快取那個結果只是幫他省事，而且會讓
+    「剛登入的新 token」在窗口內被誤判成無效。
+    """
     if not token:
         return None
 
@@ -84,6 +124,9 @@ def resolve_session(cur, token: str | None) -> str | None:
         return None
 
     _maybe_touch(cur, token)
+    if _RESOLVE_TTL_SECONDS > 0:
+        with _touch_lock:
+            _resolved[token] = (time.monotonic() + _RESOLVE_TTL_SECONDS, email)
     return email
 
 
@@ -97,8 +140,10 @@ def _maybe_touch(cur, token: str) -> None:
 
 
 def _forget(token: str) -> None:
+    """忘掉這張 token 的所有行程內狀態。登出與過期都會走到這裡。"""
     with _touch_lock:
         _last_touched.pop(token, None)
+        _resolved.pop(token, None)
 
 
 def delete_session(cur, token: str | None) -> None:
@@ -113,7 +158,15 @@ def delete_session(cur, token: str | None) -> None:
 def delete_sessions_for_email(cur, email: str) -> int:
     """撤銷某個帳號的所有 session。停用帳號時一併呼叫，讓對方立刻登出，
     而不是等權限快取 TTL 過期。回傳撤銷了幾張。"""
-    cur.execute("DELETE FROM sessions WHERE lower(email) = %s", (email.lower().strip(),))
+    target = email.lower().strip()
+    cur.execute("DELETE FROM sessions WHERE lower(email) = %s", (target,))
+    # 解析快取是 token → email，所以要掃過去找出屬於這個帳號的每一張。
+    # 快取很小（只有近幾秒活躍過的 token），掃描的成本可以忽略；漏掉的
+    # 代價則是被停用的人在 TTL 內還能通過查驗。
+    with _touch_lock:
+        for tok in [t for t, (_exp, mail) in _resolved.items() if mail == target]:
+            _resolved.pop(tok, None)
+            _last_touched.pop(tok, None)
     return cur.rowcount
 
 

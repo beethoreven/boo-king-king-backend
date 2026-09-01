@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from db import listing, schedule
+from db import listing, schedule, slot_cache
 
 
 class BookingError(Exception):
@@ -460,6 +460,14 @@ def create_booking(
         already_existed = False
 
     position = get_position(cur, booking_id)
+    # 任何預約寫入都清空 /slot 的快取。理由與粗粒度的取捨見 db/slot_cache.py：
+    # has_room_conflict 是跨劇本、跨時間區間的，算不出「該清哪些鍵」，
+    # 而讀取遠多於寫入，所以清空的代價自動被攤平。
+    #
+    # ★ 放在這裡（函式內、commit 之前）而不是呼叫端，是為了讓未來新增的
+    #   呼叫路徑自動被涵蓋。代價是清空到 commit 之間有一個很短的窗口，
+    #   由 slot_cache 的 TTL 收尾。
+    slot_cache.clear()
     return BookingResult(id=booking_id, position=position, already_existed=already_existed)
 
 
@@ -652,6 +660,7 @@ def cancel_booking(cur, booking_id: int, *, note: str | None = None) -> dict:
         if cur.fetchone() is None:
             raise BookingError(f"預約 id={booking_id} 不存在")
         raise BookingError("這筆預約已經取消過了")
+    slot_cache.clear()  # 見 create_booking 上方的說明
     return get_booking(cur, booking_id)
 
 
@@ -986,6 +995,7 @@ def mark_ended(cur, booking_id: int) -> dict:
         if row is None:
             raise BookingError(f"預約 id={booking_id} 不存在")
         raise BookingError(f"只有已成立（booked）的預約能標記結束，目前狀態是「{row[0]}」")
+    slot_cache.clear()  # 見 create_booking 上方的說明
     return get_booking(cur, booking_id)
 
 
@@ -1033,6 +1043,7 @@ def mark_ended_batch(cur, *, lookback_days = ENDED_LOOKBACK_DAYS) -> int:
         """,
         {"lookback": lookback_days},
     )
+    slot_cache.clear()  # 見 create_booking 上方的說明
     return cur.rowcount
 
 
@@ -1058,6 +1069,7 @@ def cancel_expired_batch(cur) -> int:
            AND session_date < (NOW() AT TIME ZONE 'Asia/Taipei')::date
         """
     )
+    slot_cache.clear()  # 見 create_booking 上方的說明
     return cur.rowcount
 
 
@@ -1098,6 +1110,7 @@ def expire_stale_waitlist_batch(cur, *, days: int = WAITLIST_EXPIRY_DAYS) -> int
         """,
         (days,),
     )
+    slot_cache.clear()  # 見 create_booking 上方的說明
     return cur.rowcount
 
 
@@ -1141,4 +1154,5 @@ def set_status(cur, booking_id: int, status: str, *, note: str | None = None) ->
         if row is None:
             raise BookingError(f"預約 id={booking_id} 不存在")
         raise BookingError("已取消的預約不能再改狀態")
+    slot_cache.clear()  # 見 create_booking 上方的說明
     return get_booking(cur, booking_id)

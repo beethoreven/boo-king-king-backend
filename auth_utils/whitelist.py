@@ -92,6 +92,30 @@ def get_user(cur, email: str, *, fresh: bool = False) -> dict | None:
     return user
 
 
+# peek 用的哨兵（公開，require_auth 要用）。快取裡「查過、確認這個 email 沒註冊」存的就是 None，
+# 跟「沒查過」是兩回事——用 None 當作「沒查過」會讓未註冊的人每次請求都
+# 重新查一次資料庫，而那正是最該被擋下來的那種流量。
+MISS = object()
+
+
+def peek(email: str):
+    """只查快取，不碰資料庫。沒查過就回 MISS，查過就回使用者資料或 None。
+
+    給 require_auth 用：跟 sessions.resolve_cached 搭配，兩層都命中的請求
+    完全不需要開連線。★ 不要拿這支做授權判斷以外的事——它不會續期，
+    也不會在快取過期時自己去補。
+    """
+    key = (email or "").lower().strip()
+    if not key:
+        return MISS
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+    return MISS
+
+
 def is_permitted_user(cur, email: str, *, fresh: bool = False) -> bool:
     """這個 email 現在可以使用系統嗎。
 

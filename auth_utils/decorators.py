@@ -14,7 +14,7 @@ from flask import g, jsonify, request
 
 from auth_utils import guard, whitelist
 from auth_utils.google_auth import extract_bearer_token
-from auth_utils.sessions import resolve_session
+from auth_utils.sessions import resolve_cached, resolve_session
 from db.connection import pool
 
 
@@ -31,17 +31,32 @@ def _authenticate() -> tuple[dict | None, tuple | None]:
     if not token:
         return None, (jsonify({"error": "未提供登入憑證"}), 401)
 
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            email = resolve_session(cur, token)
-            if email is None:
-                return None, (jsonify({"error": "登入憑證無效或已過期"}), 401)
+    # ★ 兩層快取都命中就完全不開連線。
+    #
+    #   這是整個查驗路徑上最重要的一件事：身分查驗跑在每一支受保護的路由上，
+    #   而它原本固定要一條連線。db/connection.py 的同時連線上限是 5，開賣
+    #   尖峰時那 5 個名額就是瓶頸——即使 /slot 的回應已經被快取，還是得為了
+    #   「你是誰」開一條，等於快取只把 2 條減成 1 條。
+    #
+    #   兩層是分開的、TTL 也不同（session 3 秒、權限 30 秒），所以必須各自
+    #   問一次；任一層沒命中就走下面的完整流程，跟以前一模一樣。
+    #
+    #   ★ 這裡快取的都是「你是誰、有沒有權限」，不是任何業務資料。劇本清單、
+    #     場次狀態都不經過這一層。
+    email = resolve_cached(token)
+    user = whitelist.peek(email) if email else whitelist.MISS
+    if email is None or user is whitelist.MISS:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                email = resolve_session(cur, token)
+                if email is None:
+                    return None, (jsonify({"error": "登入憑證無效或已過期"}), 401)
 
-            # 權限每次都查（帶 30 秒快取），不從 session 讀取。
-            # 這樣管理員停用帳號後，對方最慢 30 秒就會被擋下來，
-            # 不用等 session token 自然過期。
-            user = whitelist.get_user(cur, email)
-            conn.commit()  # resolve_session 可能更新了 last_seen_at
+                # 權限每次都查（帶 30 秒快取），不從 session 讀取。
+                # 這樣管理員停用帳號後，對方最慢 30 秒就會被擋下來，
+                # 不用等 session token 自然過期。
+                user = whitelist.get_user(cur, email)
+                conn.commit()  # resolve_session 可能更新了 last_seen_at
 
     # ★ 兩種 403 要分得開。
     #
