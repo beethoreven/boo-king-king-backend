@@ -197,8 +197,37 @@ def update(cur, booking_id: int, data: dict) -> bool:
         ),
     )
 
-    # 訂金的自動轉態只在「管理員沒有自己動狀態」時才跑。動了的話
-    # 以他選的為準（見 docstring）。
+    # ── 自動轉態。兩條規則同一個前提：管理員沒有自己動狀態。動了的話
+    #    以他選的為準（見 docstring）。順序不能顛倒，理由見第二條。
+
+    # 1) 主持人全數確認 → gm_reviewed。
+    #
+    # ★ 這條原本沒有，是個實測抓到的洞：主持人自己按確認會轉態
+    #   （db/bookings.py 的 confirm_host），但管理員在後台勾「已確認」不會。
+    #   結果是兩位主持人都確認了、狀態卻停在 gm_confirm，那筆預約卡在那裡
+    #   直到有人手動改狀態——而且管理員收不到「待收訂金」的通知信。
+    #
+    # 「全數確認」的定義跟 confirm_host 一致：沒指派人的角色不算數。
+    # 但多一個守衛——一位主持人都沒指派時不算全員確認，否則一筆還沒排
+    # 主持人的預約會自己跳到「待收訂金」。
+    assigned = [(u, c) for u, c in zip(new["gm_user_ids"], new["gm_confirmed"]) if u]
+    if (
+        new["status"] == current["status"] == "gm_confirm"
+        and assigned
+        and all(c for _, c in assigned)
+    ):
+        cur.execute(
+            "UPDATE booking_record SET status = 'gm_reviewed' "
+            "WHERE id = %s AND status = 'gm_confirm'",
+            (booking_id,),
+        )
+
+    # 2) 訂金收足 → booked。
+    #
+    # ★ 放在第一條之後，是為了讓「同一次存檔裡既勾完主持人、又填滿訂金」
+    #   能一路走到底：第一條把狀態推到 gm_reviewed，record_deposit 從資料庫
+    #   讀狀態（不是讀 current），所以看得到剛剛那一步的結果，再推到 booked。
+    #   順序顛倒的話這種存檔只會走一半。
     if new["status"] == current["status"] and new["deposit"] != current["deposit"]:
         record_deposit(cur, booking_id, new["deposit"])
 
