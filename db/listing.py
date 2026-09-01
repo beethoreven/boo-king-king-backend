@@ -2,9 +2,14 @@
 
 ## 三個狀態
 
-    preparing  尚未上架 —— 資料建好了，但還沒開賣
+    preparing  尚未上架 —— 資料建好了，但還沒開放預約
     active     上架     —— 玩家看得到、訂得到
-    inactive   下架     —— 玩家看不到
+    inactive   下架     —— 玩家看不到。**只有管理員手動設得了**
+
+★ end_booking（預約終止時間）到了**不會**把狀態改成 inactive。那個欄位
+  管的是「還能不能預約」，不是「這齣戲還在不在架上」——有的店家只是不再
+  接這齣的預約，並沒有要把它收起來。時間過了之後玩家訂不到（由
+  VISIBLE_SQL 負責），但狀態仍然是 active。
 
 ★ 玩家的劇本清單只列 active。preparing 與 inactive 都不會出現，
   連選單裡都沒有——見 db/mmg.py 的 list_active。
@@ -26,7 +31,7 @@ Neon 免費方案閒置 5 分鐘就讓 compute 休眠，每月額度 100 CU-hour
 所以做法是**惰性判定 + 順帶落地**：
 
   1. 判定用算的，不用等排程。玩家的清單查詢與 slot 查詢都直接把
-     「preparing 但時間已到」算成上架、「end_booking 已過」算成下架。
+     「preparing 但時間已到」算成上架、「end_booking 已過」算成不可預約。
      這一層是精準到秒的——時間一到，下一個請求看到的就是新狀態，
      不存在「排程還沒跑到」的空窗。
 
@@ -48,6 +53,8 @@ from __future__ import annotations
 VISIBLE_SQL = """
     (
         (status = 'active' OR (status = 'preparing' AND start_booking <= %(now)s))
+        -- 預約終止時間。過了就訂不到，但**不會**改變 status——
+        -- 見上方說明，那是刻意的。
         AND (end_booking IS NULL OR end_booking > %(now)s)
     )
 """
@@ -67,8 +74,7 @@ def now_taipei(cur):
 def sync_status(cur) -> dict:
     """把到點的劇本狀態落地。回傳這次改了哪些。
 
-    先上架再下架，順序不能反：一齣上下架時間都已經過去的戲，最終應該是
-    下架。先跑下架再跑上架的話，它會被下架、然後又被上架回來。
+    只做「上架」這一半。end_booking 到了不會改狀態，理由見下方。
     """
     cur.execute(
         """
@@ -80,15 +86,12 @@ def sync_status(cur) -> dict:
     )
     listed = [{"id": r[0], "name": r[1]} for r in cur.fetchall()]
 
-    cur.execute(
-        """
-        UPDATE mmg SET status = 'inactive'
-         WHERE status IN ('preparing', 'active')
-           AND end_booking IS NOT NULL
-           AND end_booking <= (NOW() AT TIME ZONE 'Asia/Taipei')
-        RETURNING id, name
-        """
-    )
-    delisted = [{"id": r[0], "name": r[1]} for r in cur.fetchall()]
-
-    return {"listed": listed, "delisted": delisted}
+    # ★ 沒有「自動下架」這回事，這是刻意的（2026-09-01 拿掉的）。
+    #
+    #   end_booking 是「預約終止時間」，不是「下架時間」——有的店家不打算
+    #   把戲收起來，只是不再接這齣的預約。系統把它標成「下架」是在替店家
+    #   做一個他沒做的決定，而那個標籤之後會出現在他自己的清單上。
+    #
+    #   時間一過的效果由 VISIBLE_SQL 那個條件負責（玩家端訂不到），status
+    #   維持原樣。要真的下架仍然做得到：管理員自己把狀態改成「下架」。
+    return {"listed": listed, "delisted": []}

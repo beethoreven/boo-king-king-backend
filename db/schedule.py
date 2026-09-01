@@ -4,7 +4,7 @@
 
     0. 上下架區間（mmg.start_booking / end_booking）
        絕對外框。區間外一律不開，下面三層都翻不過來。
-       start_booking 是「時刻」不是「日期」：上架當天只有上架時間
+       start_booking 是「時刻」不是「日期」：開放當天只有開放預約時間
        之後的場次算數，同一天更早的時段仍然不開。
 
     1. 特定日期例外（mmg_schedule_exception）
