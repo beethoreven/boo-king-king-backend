@@ -12,11 +12,18 @@ from db.bookings import BookingError
 EDITABLE = ("email", "name", "role", "status", "line_id", "phone")
 # 管理員在編輯畫面能選的狀態。
 #
-# ★ 刻意不含 "banned"：那是系統判定的結果，不是人可以直接指定的東西。
-#   管理員能做的是把它改回 "active"（＝解除停權，同時點數歸零），
-#   而不是手動把某個人標成「因異常行為停權」。
-#   要手動停用就用 "deactive"，那是店家的決定，語意本來就不同。
-SELECTABLE_STATUSES = ("active", "deactive")
+# ★ "banned" 一定要在裡面，即使它主要是系統判定的結果。
+#   不放的話，一個已經被停權的帳號在編輯畫面上無法存檔——下拉裡沒有
+#   對應的選項，畫面會顯示「啟用」（說謊），而送出去的仍是 banned，
+#   後端回一句「未知的狀態」。管理員連改個電話都做不到，而且看不出原因。
+#
+#   開放之後也多了一個實際用途：店家自己看到有人在亂搞，可以直接掛上
+#   「因異常行為停權」那個對外訊息，而不必等系統累積到門檻。
+#
+# ★ "deactive" 與 "banned" 是兩件事，標籤上也要分得開：
+#     deactive  店家的決定。沒有到期這回事。
+#     banned    異常行為。系統判的有到期時間，人工判的沒有（見 update）。
+SELECTABLE_STATUSES = ("active", "deactive", "banned")
 ROLE_LABEL = {1: "管理員", 2: "主持人", 3: "一般玩家"}
 
 
@@ -107,6 +114,21 @@ def update(cur, user_id: int, data: dict) -> bool:
     #   以上被重新停權——管理員會覺得解了個寂寞，而且找不到原因。
     if current["status"] == "banned" and new["status"] == "active":
         guard.clear_points(cur, user_id)
+
+    # 管理員手動掛上停權。
+    #
+    # ★ 一律是無限期（banned_until = NULL）。「幾分鐘後自動解除」是累進
+    #   機制的概念——人工判斷沒有那個東西，解除的時機就是管理員自己決定
+    #   要解的時候。判定端把 NULL 當成永不到期（見 whitelist._fetch_user）。
+    #
+    # ★ 只在「不是 banned → banned」這個轉換上做。已經是 banned 的帳號被
+    #   編輯（改個電話之類）不能走到這裡，否則會把系統原本排定的到期時間
+    #   洗成 NULL，把一個五分鐘的停權變成永久的。
+    if current["status"] != "banned" and new["status"] == "banned":
+        cur.execute("UPDATE users SET banned_until = NULL WHERE id = %s", (user_id,))
+        sessions.delete_sessions_for_email(cur, new["email"])
+        whitelist.invalidate(new["email"])
+        whitelist.invalidate(current["email"])
 
     if current["status"] == "active" and new["status"] == "deactive":
         sessions.delete_sessions_for_email(cur, new["email"])
