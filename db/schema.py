@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import threading
 
+from db import default_templates
+
 _schema_ready = False
 _schema_lock = threading.Lock()
 
@@ -57,6 +59,9 @@ def ensure_schema(cur) -> None:
         #   建完才進去，然後發現該有的都有了（這裡的每一段本來就是冪等的）。
         cur.execute("SELECT pg_advisory_xact_lock(hashtext('booking-king:ensure_schema'))")
 
+        _ensure_settings(cur)
+        _ensure_notification_template(cur)
+        default_templates.ensure(cur)
         # roles 要在 users 之前——users.role 有外鍵指過來。
         _ensure_roles(cur)
         _ensure_users(cur)
@@ -146,6 +151,79 @@ def _ensure_abuse_log(cur) -> None:
     )
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_abuse_log_time ON abuse_log (last_at DESC)"
+    )
+
+
+def _ensure_settings(cur) -> None:
+    """每家店會不一樣的那幾個值。
+
+    跨店家的架構是「一份程式碼、每店一套獨立的基礎設施」，而店與店的差異
+    只放兩個地方：Render 的環境變數，以及這張表。環境變數放的是連線資訊
+    （資料庫、金鑰），這裡放的是**會出現在使用者眼前的東西**——店名、網址、
+    寄件人。分界線是「改了要不要重新部署」：這張表不用。
+
+    ★ 沒有介面，用 SQL 改（同 abuse_rule、roles）：
+
+        UPDATE settings SET value = '南極圈' WHERE key = 'site_name';
+
+    ★ site_url 特別容易忘記改。它是通知信裡那顆按鈕的目標，換網域之後
+      如果沒跟著改，信寄得出去、按鈕卻連到一個不存在的地方——而寄信本身
+      不會失敗，所以不會有任何錯誤讓你發現。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO settings (key, value) VALUES
+            ('site_name',    '步經徑'),
+            ('site_url',     'https://booking-king.tutor-arthur.workers.dev'),
+            ('sender_name',  '步經徑'),
+            ('sender_email', 'beethoreven@gmail.com')
+        ON CONFLICT (key) DO NOTHING
+        """
+    )
+
+
+def _ensure_notification_template(cur) -> None:
+    """通知信的主旨與內容。
+
+    ## 為什麼放資料庫而不是程式碼或 Brevo
+
+    放**程式碼**：改一個字要重新部署，而且每家店不能不同。
+    放 **Brevo 的範本編輯器**：有視覺編輯器，但內容就住在 Brevo——沒有版本
+      控制、換供應商帶不走，而且每家店要各自建一套範本，那會抵銷掉
+      「email 不必每店開帳號」這個優勢。
+    放**這裡**：跟著那家店自己的資料庫走，符合既有的跨店家決定；換供應商
+      不影響；改字是一行 SQL。代價是沒有視覺編輯器——但這些是短通知，
+      不是行銷信，用不到拖拉排版。
+
+    ## 內容裡的變數
+
+    用 {{name}} 這種雙大括號。代入時**值會做 HTML 逃逸**（見
+    notifications.py 的 render），所以劇本名或玩家暱稱裡有 < 或 & 不會
+    弄壞版面，也不會變成可以注入的地方。
+
+    ## enabled
+
+    單封關掉用的。roles 那邊的開關是「這個**角色**要不要收信」，這裡是
+    「這**封**信要不要發」——兩個維度，例如「管理員要收信，但不要收記點
+    通知」就是把這一封關掉。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notification_template (
+            key       TEXT PRIMARY KEY,
+            subject   TEXT NOT NULL,
+            body_html TEXT NOT NULL,
+            enabled   BOOLEAN NOT NULL DEFAULT true
+        )
+        """
     )
 
 

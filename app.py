@@ -34,6 +34,8 @@ from db import slot_cache  # noqa: E402
 from db.bookings import BookingError  # noqa: E402
 from db.connection import pool  # noqa: E402
 from db.schema import ensure_schema  # noqa: E402
+import notifications  # noqa: E402
+import notify_events  # noqa: E402
 
 # ★ 把 psycopg_pool 的日誌接出來。
 #
@@ -103,6 +105,20 @@ else:
         flush=True,
     )
     CORS(app, max_age=3600)
+
+# 啟動時說一聲通知信是開還是關。
+#
+# ★ 這一行存在的理由是「沉默的失敗」：BREVO_API_KEY 沒設或打錯字時，整個
+#   通知功能會安靜地停用——不會有任何錯誤、任何請求都照常成功，只是信永遠
+#   不會寄出去，而寄不出去這件事沒有人會回報。沒有這一行的話，唯一能發現的
+#   方法是有人剛好去看 /internal/idle-gap-stats。
+if notifications.enabled():
+    print("[info] 通知信已啟用（Brevo）", flush=True)
+else:
+    print(
+        "[warn] BREVO_API_KEY 未設定，通知信停用——不會寄出任何信件。",
+        flush=True,
+    )
 
 # Flask 預設會把 JSON 物件的鍵照字母排序輸出。對大部分回應無所謂，但
 # 管理員場次管理的 tabs 是「照營運流程排的子頁籤順序」
@@ -250,7 +266,8 @@ def idle_gap_stats():
         return jsonify({"error": "未設定 JOB_TOKEN，此端點停用"}), 503
     if request.headers.get("X-Job-Token") != expected:
         return jsonify({"error": "未授權"}), 401
-    return jsonify({**idle_gap.stats(), "slot_cache": slot_cache.stats()})
+    return jsonify({**idle_gap.stats(), "slot_cache": slot_cache.stats(),
+        "notifications": notifications.stats()})
 
 
 @app.get("/api/ready")
@@ -829,7 +846,14 @@ def create_booking_route():
                 conn.rollback()
                 return jsonify({"error": str(exc)}), 409
             booking = bookings_db.get_booking(cur, result.id)
+            # ★ 組信在 commit 之前（要 cursor），送出在 commit 之後（見下）。
+            #   重試打到既有的那筆時 before 給 booking 自己，兩邊一樣就沒有
+            #   任何轉變，不會重寄——否則連點三次「預約」等於主持人收三封。
+            outbox = notify_events.on_transition(
+                cur, booking if result.already_existed else None, booking
+            )
             conn.commit()
+    notifications.dispatch(outbox)
 
     return jsonify({
         **booking,
@@ -1182,12 +1206,15 @@ def confirm_booking_route(booking_id: int):
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
+            before = bookings_db.get_booking(cur, booking_id)
             try:
                 updated = bookings_db.confirm_host(cur, booking_id, g.user["id"])
             except BookingError as exc:
                 conn.rollback()
                 return jsonify({"error": str(exc)}), 409
+            outbox = notify_events.on_transition(cur, before, updated)
             conn.commit()
+    notifications.dispatch(outbox)
     return jsonify(updated)
 
 
@@ -1198,10 +1225,11 @@ def confirm_booking_route(booking_id: int):
 
 def _admin_write(fn):
     """管理員寫入路由共用的殼：開連線、跑、成功就 commit、
-    BookingError 回 400 並 rollback。"""
+    BookingError 回 400 並 rollback，最後送出 g.outbox 裡的通知信。"""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         body = request.get_json(silent=True) or {}
+        g.outbox = []
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 try:
@@ -1210,6 +1238,9 @@ def _admin_write(fn):
                     conn.rollback()
                     return jsonify({"error": str(exc)}), 400
                 conn.commit()
+        # ★ commit 成功才送信。被包住的路由把要寄的信放進 g.outbox，
+        #   由這裡統一在交易外送出——寄信不該有機會影響交易。
+        notifications.dispatch(g.outbox)
         return result
     return wrapper
 
@@ -1437,7 +1468,9 @@ def admin_create_booking(cur, body):
     d, t = _parse_slot(body)
     body = {**body, "session_date": d, "session_time": t}
     new_id = bookings_admin.create(cur, body)
-    return jsonify(bookings_db.get_booking(cur, new_id)), 201
+    created = bookings_db.get_booking(cur, new_id)
+    g.outbox = notify_events.on_transition(cur, None, created)
+    return jsonify(created), 201
 
 
 @app.put("/api/admin/bookings/<int:booking_id>")
@@ -1452,8 +1485,13 @@ def admin_update_booking(cur, body, booking_id: int):
             data["session_date"], data["session_time"] = d, t
         except BookingError:
             raise
+    before = bookings_db.get_booking(cur, booking_id)
     changed = bookings_admin.update(cur, booking_id, data)
-    return jsonify({"changed": changed, "item": bookings_db.get_booking(cur, booking_id)})
+    after = bookings_db.get_booking(cur, booking_id)
+    # 後台可以直接把狀態改成 gm_reviewed 或 booked，也可以補指派主持人——
+    # 前後比對讓這三種都跟正常流程走同一條通知規則（見 notify_events）。
+    g.outbox = notify_events.on_transition(cur, before, after)
+    return jsonify({"changed": changed, "item": after})
 
 
 if __name__ == "__main__":

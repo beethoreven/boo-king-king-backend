@@ -19,6 +19,9 @@ from auth_utils import sessions as sessions_mod
 from auth_utils.sessions import resolve_cached, resolve_session
 from db.connection import pool
 
+import notifications
+import notify_events
+
 
 def _authenticate() -> tuple[dict | None, tuple | None]:
     """查驗憑證，回傳 (使用者資料, 錯誤回應)。兩者恰有一個是 None。
@@ -144,19 +147,26 @@ def _log_incident(user_id: int, email: str, kind: str, detail: str) -> None:
     ★ record() 內部會在「開了新的一列」時加點並改狀態（見 guard.py）。
       這裡負責善後的兩件事，而且必須一起做：刪 session 把人踢下線，
       清權限快取讓他不能立刻重新登入。
+
+    ★ 通知信在 commit **之後**才送出。順序反過來的話，一個最後被 rollback
+      掉的記點會留下一封「某某被停權了」的信，而管理員去看會找不到那個人
+      的紀錄——信收不回來，只能不要寄錯。
     """
+    outbox = None
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                guard.record(cur, user_id, kind, request.path, detail)
+                outcome = guard.record(cur, user_id, kind, request.path, detail)
                 cur.execute("SELECT status FROM users WHERE id = %s", (user_id,))
                 row = cur.fetchone()
                 if row and row[0] == "banned":
                     sessions_mod.delete_sessions_for_email(cur, email)
                     whitelist.invalidate(email)
+                outbox = notify_events.on_abuse(cur, user_id, kind, outcome)
                 conn.commit()
     except Exception:  # noqa: BLE001 - 觀測失敗不該影響主要流程
-        pass
+        return
+    notifications.dispatch(outbox)
 
 
 def require_auth(fn):

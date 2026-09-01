@@ -118,8 +118,11 @@ def reset_rate(user_id: int | None = None) -> None:
 # ── 事件紀錄（資料庫）────────────────────────────────────────
 
 
-def record(cur, user_id: int, kind: str, path: str | None, detail: str | None) -> None:
+def record(cur, user_id: int, kind: str, path: str | None, detail: str | None) -> dict | None:
     """寫一筆異常紀錄，短時間內的重複事件併進同一列。
+
+    回傳 add_point() 的結果（見那支），或 None——併進既有那一列時不加點，
+    沒有加點就沒有值得通知的事。呼叫端用這個回傳決定要不要寄通知信。
 
     合併的鍵是 (user_id, kind)，不含 path：一個人亂試的時候通常會換著
     不同的端點打，每支各自開一列反而看不出「這個人在戳」這件事。path
@@ -157,14 +160,20 @@ def record(cur, user_id: int, kind: str, path: str | None, detail: str | None) -
         )
         # ★ 只有「開了新的一列」才加點——這正是「又犯了一次」的定義。
         #   落在合併窗口內的重複事件只把 hits 加一，不加點。
-        add_point(cur, user_id, kind)
+        return add_point(cur, user_id, kind)
+    return None
 
 
 def add_point(cur, user_id: int, kind: str) -> dict | None:
     """給使用者加點，並依 abuse_rule 判斷要不要停權。
 
-    回傳這次觸發的停權（{'points', 'ban_seconds', 'label', 'until'}），
-    沒有觸發就回 None。
+    回傳 {'added', 'total', 'ban'}：這次加了幾點、累計幾點，以及這次是否
+    觸發停權（觸發時 ban 是 {'points', 'ban_seconds', 'label', 'until'}，
+    否則 None）。使用者不存在才回 None。
+
+    ★ 「有沒有加點」與「有沒有停權」是兩件不同的事，所以分成兩層而不是用
+      「回 None 代表沒事」——通知信要能分辨「他被記了一點」跟「他被停權了」，
+      這兩封信的收件人反應完全不同。
 
     ★ 呼叫端要負責清 session 與權限快取——那兩件事需要 import
       auth_utils.sessions 與 whitelist，而它們會 import 回這裡，直接在這
@@ -189,7 +198,7 @@ def add_point(cur, user_id: int, kind: str) -> dict | None:
     )
     rule = cur.fetchone()
     if rule is None:
-        return None
+        return {"added": points, "total": total, "ban": None}
     _min_point, ban_seconds, label = rule
 
     # ban_seconds = 0 代表無限期，要管理員手動解。用 NULL 表示「沒有到期」，
@@ -208,7 +217,14 @@ def add_point(cur, user_id: int, kind: str) -> dict | None:
             (user_id,),
         )
     until = cur.fetchone()[0]
-    return {"points": total, "ban_seconds": ban_seconds, "label": label, "until": until}
+    return {
+        "added": points,
+        "total": total,
+        "ban": {
+            "points": total, "ban_seconds": ban_seconds,
+            "label": label, "until": until,
+        },
+    }
 
 
 def decay_points(cur, amount: int = 1) -> int:
