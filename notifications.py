@@ -184,14 +184,33 @@ def build(cur, key: str, recipients: list[dict], values: dict) -> Message | None
 
 # ── 收件人 ──────────────────────────────────────────────────────
 
+# 「現在還算不算啟用」。跟 auth_utils/whitelist._fetch_user 用同一條算式，
+# 而且必須同一條——
+#
+# 停權到期時 users.status 不會馬上變回 'active'：判定是讀取時即時算的
+# （所以人一到期就能登入工作），寫回資料庫是每週排程才做的（guard.decay_points）。
+# 中間最多差七天。這裡如果只看欄位字面值，那個人就會「照常使用系統、卻收不到
+# 任何通知」，而且沒有任何錯誤——正是不會有人回報的那種壞法。
+_EFFECTIVE_ACTIVE = """
+    (CASE WHEN status = 'banned' AND banned_until IS NOT NULL AND banned_until <= NOW()
+          THEN 'active' ELSE status END) = 'active'
+"""
+
+
 def _wants_email(cur, role_id: int) -> bool:
     return roles.wants(cur, role_id, "email")
 
 
 def admins(cur) -> list[dict]:
-    """要收信的管理員。停用或停權的不寄——他們現在不該在處理事情。"""
+    """要收信的管理員。**全部都寄**——管理員是唯一可能有複數收件人的角色
+    （主持人各寄各的、玩家只有一位），所以這裡不挑人。
+
+    停用或**目前仍在停權中**的不寄——他們現在不該在處理事情。已經到期的
+    照寄，見 _EFFECTIVE_ACTIVE。
+    """
     cur.execute(
-        "SELECT id, email, name, role FROM users WHERE role = 1 AND status = 'active'"
+        "SELECT id, email, name, role FROM users "
+        f"WHERE role = 1 AND {_EFFECTIVE_ACTIVE}"
     )
     return [
         {"id": i, "email": e, "name": n}
@@ -210,7 +229,8 @@ def users_by_id(cur, user_ids: list[int]) -> list[dict]:
     if not ids:
         return []
     cur.execute(
-        "SELECT id, email, name, role FROM users WHERE id = ANY(%s) AND status = 'active'",
+        "SELECT id, email, name, role FROM users "
+        f"WHERE id = ANY(%s) AND {_EFFECTIVE_ACTIVE}",
         (ids,),
     )
     return [
