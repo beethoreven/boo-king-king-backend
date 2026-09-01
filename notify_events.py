@@ -93,11 +93,15 @@ def _as_date(value) -> date | None:
 
 
 def session_text(session_date, session_time) -> tuple[str, str]:
-    """回傳 (完整, 精簡)：('2026-09-05（六）19:00', '9/5 19:00')。
+    """回傳 (完整, 精簡)：('2026-09-05（六）19:00', '2026/9/5 19:00')。
 
     完整版給內文——收件人要能一眼確定是哪一天，星期幾是最容易對到自己
-    行事曆的資訊。精簡版給主旨——主旨會被信箱截斷，年份與星期在那裡
-    是浪費字元，而信是當下寄的，年份幾乎不會有歧義。
+    行事曆的資訊。精簡版給主旨,省掉星期。
+
+    ★ 年份**要留**。原本省掉了，理由是「信是當下寄的，年份不會有歧義」——
+      那是錯的：場次可以訂在很久以後，主旨只寫「12/31」時收件人分不出是
+      今年還是明年，而主旨正是他之後在信箱搜尋時看到的那一行。星期可以省
+      （內文有），年份不行。
     """
     d = _as_date(session_date)
     t = str(session_time or "")[:5]
@@ -105,7 +109,7 @@ def session_text(session_date, session_time) -> tuple[str, str]:
         return f"{session_date} {t}".strip(), f"{session_date} {t}".strip()
     return (
         f"{d.isoformat()}（{_WEEKDAY[d.weekday()]}）{t}",
-        f"{d.month}/{d.day} {t}",
+        f"{d.year}/{d.month}/{d.day} {t}",
     )
 
 
@@ -233,9 +237,11 @@ def _until_text(until) -> tuple[str, str]:
     """(完整, 主旨用的短版)。until 是 None 代表無限期。"""
     if until is None:
         return "無解除期限（需管理員手動解除）", "（無期限）"
+    # 主旨同樣帶年份，理由與 session_text 相同——同一套規則，不要一封有
+    # 一封沒有。
     return (
         f"{until.year}-{until.month:02d}-{until.day:02d} {until.strftime('%H:%M')}",
-        f"至 {until.month}/{until.day}",
+        f"至 {until.year}/{until.month}/{until.day}",
     )
 
 

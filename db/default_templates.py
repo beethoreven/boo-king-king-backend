@@ -58,18 +58,33 @@ _FOOT = (
 )
 _HINT = "margin:0 0 24px;color:#5a5248;font-size:14px;"
 
+# 按鈕底下那行紅字。用紅色是因為它警告的是一個**不可逆而且沉默**的後果：
+# 點了 Brevo 的「取消訂閱」之後，那個人會被加進封鎖名單，之後所有通知都
+# 不會再寄給他——沒有錯誤、沒有退信，寄件端只會看到「送出成功」。
+#
+# ★ 那顆取消訂閱是 Brevo 自己加的，不是這裡產生的，所以擋不掉，只能提醒。
+_WARN = "margin:14px 0 0;color:#c0392b;font-size:13.5px;font-weight:700;"
+_WARN_TEXT = "請勿取消訂閱此信，否則將會丟失未來所有通知。"
+
 
 def _row(key: str, value: str) -> str:
     return f'<div><span style="{_KEY}">{key}</span>{value}</div>'
 
 
 def _btn(text: str) -> str:
-    return f'<a href="{{{{site_url}}}}" style="{_BTN}">{text}</a>'
+    """按鈕，底下固定跟著那行紅色警語。
+
+    綁在一起而不是各封自己加，是為了讓「之後新增第六封信」不會漏掉——
+    漏掉的後果是那封信的收件人少一道提醒，而這種漏掉沒有人會發現。
+    """
+    return (
+        f'<a href="{{{{site_url}}}}" style="{_BTN}">{text}</a>'
+        f'<p style="{_WARN}">{_WARN_TEXT}</p>'
+    )
 
 
-def _foot(extra: str = "") -> str:
-    tail = f"<br>{extra}" if extra else ""
-    return f'<p style="{_FOOT}">{{{{site_name}}}}{tail}</p>'
+def _foot() -> str:
+    return f'<p style="{_FOOT}">{{{{site_name}}}}</p>'
 
 
 # key -> (subject, body_html)
@@ -109,7 +124,7 @@ TEMPLATES: dict[str, tuple[str, str]] = {
     ),
     # ── ③ 玩家：預約成立 ────────────────────────────────────
     "player_booked": (
-        "【預約成功】《{{mmg_name}}》{{session_short}}",
+        "【預約成功】《{{mmg_name}}》{{session_short}}（請勿回覆）",
         f'''<div style="{_WRAP}">
 <p style="margin:0 0 14px;">{{{{player_name}}}} 您好：</p>
 <p style="margin:0 0 20px;">您的預約<strong>已經成立</strong>，我們到時候見。</p>
@@ -119,7 +134,7 @@ TEMPLATES: dict[str, tuple[str, str]] = {
 {_row("主持", "{{gm_list}}")}
 </div>
 {_btn("查看我的預約")}
-{_foot("（請勿回覆）")}
+{_foot()}
 </div>''',
     ),
     # ── ④ 管理員：有人被記點 ────────────────────────────────
@@ -162,10 +177,49 @@ TEMPLATES: dict[str, tuple[str, str]] = {
 
 
 def ensure(cur) -> None:
-    """把還不存在的範本寫進去。已經存在的**不動**——那可能是案主改過的。"""
+    """把還不存在的範本寫進去。已經存在的**不動**——那可能是案主改過的。
+
+    ★ 所以改了這個檔案裡的預設內容之後，**已經上線的資料庫不會自動跟著變**。
+      要套用就跑 reset()（見下），或把那一列刪掉等下次啟動重塞。
+    """
     for key, (subject, body) in TEMPLATES.items():
         cur.execute(
             "INSERT INTO notification_template (key, subject, body_html) "
             "VALUES (%s, %s, %s) ON CONFLICT (key) DO NOTHING",
             (key, subject, body),
         )
+
+
+def reset(cur, *keys: str) -> list[str]:
+    """把指定的範本**覆蓋**成這個檔案裡的預設值，回傳實際改到的 key。
+    不給 keys 就是全部五封。
+
+    ★ 這支會蓋掉案主用 SQL 改過的內容，所以刻意**不在啟動時呼叫**——
+      ensure() 才是啟動時跑的那支。這支是給「改了程式碼的預設內容，要把
+      它推到既有資料庫」用的，執行前先確認那幾列沒有你不想弄丟的修改：
+
+          SELECT key, subject FROM notification_template;
+
+    用法（在 backend 目錄）：
+
+        ./venv/bin/python -c "
+        from dotenv import load_dotenv; load_dotenv('.env')
+        from db.connection import pool
+        from db import default_templates as dt
+        with pool.connection() as c, c.cursor() as cur:
+            print(dt.reset(cur)); c.commit()"
+    """
+    targets = keys or tuple(TEMPLATES)
+    changed = []
+    for key in targets:
+        if key not in TEMPLATES:
+            continue
+        subject, body = TEMPLATES[key]
+        cur.execute(
+            "UPDATE notification_template SET subject = %s, body_html = %s "
+            "WHERE key = %s AND (subject <> %s OR body_html <> %s)",
+            (subject, body, key, subject, body),
+        )
+        if cur.rowcount:
+            changed.append(key)
+    return changed
