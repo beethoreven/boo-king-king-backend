@@ -71,19 +71,15 @@ def list_active(cur) -> list[dict]:
 def get(cur, mmg_id: int) -> dict | None:
     """單一劇本。不篩狀態——管理員與主持人也走這支。
 
-    玩家路徑要擋的是「看不到的劇本也訂不到」，那由 is_visible 負責，
-    在需要的端點各自呼叫，而不是讓這支自己吞掉不該顯示的資料。
+    「看不到的劇本也訂不到」不是由這支負責，而是 create_booking 在建立
+    預約的同一個交易裡自己查一次 listing.VISIBLE_SQL（見 db/bookings.py）。
+    擋在那裡而不是這裡，是因為那個檢查必須跟搶位在同一個交易內才有意義——
+    在別處先問過、再開一個交易去寫入，中間就有空隙。
+
+    ★ 這裡曾經有一支 is_visible() 想當那個關卡，但從來沒有任何地方呼叫過
+      （2026-09-01 刪除）。留著一個「看起來是關卡、實際上沒接線」的函式，
+      比沒有更危險：下一個讀的人會以為呼叫它就安全了。
     """
     cur.execute(f"SELECT {_COLUMNS} FROM mmg WHERE id = %s", (mmg_id,))
     row = cur.fetchone()
     return _row_to_dict(cur, row) if row else None
-
-
-def is_visible(cur, mmg_id: int) -> bool:
-    """這齣戲此刻是不是玩家看得到、訂得到的。"""
-    now = listing.now_taipei(cur)
-    cur.execute(
-        f"SELECT EXISTS (SELECT 1 FROM mmg WHERE id = %(id)s AND {listing.VISIBLE_SQL})",
-        {"id": mmg_id, "now": now},
-    )
-    return bool(cur.fetchone()[0])
