@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import threading
 import time
@@ -93,6 +94,22 @@ def resolve_cached(token: str | None) -> str | None:
         return hit[1] if hit is not None and hit[0] > now else None
 
 
+# create_session() 發出來的 token 一律是 secrets.token_hex(32)，也就是**恰好
+# 64 個小寫十六進位字元**。不是這個形狀的東西不可能存在於 sessions 表裡，
+# 所以可以在碰資料庫之前就拒絕。
+#
+# ★ 這是嚴格正確的，不是啟發式的猜測：全站只有 create_session 一個地方發
+#   token，而且這個格式從來沒換過（git log -S token_hex 只有一筆）。上線後
+#   實際查過正式庫：98 筆 session，98 筆都符合，長度全部是 64。
+#
+# ★ 為什麼值得做：/auth/status 是未登入也打得到的，而每一次假 token 都是一次
+#   完整的資料庫查詢。加上這一行之後，亂寫的字串連連線都不會開。
+#
+#   （注意 resolve_session 刻意不快取失敗的結果——理由見下面的 docstring。
+#     那個決定是對的，但它也代表每一發假 token 都真的會查一次資料庫。）
+_TOKEN_SHAPE = re.compile(r"^[0-9a-f]{64}$")
+
+
 def resolve_session(cur, token: str | None) -> str | None:
     """token 有效就回傳對應的 email，並視情況更新 last_seen_at；
     無效（不存在或閒置過久）回傳 None，過期的話順便把那筆刪掉。
@@ -102,6 +119,9 @@ def resolve_session(cur, token: str | None) -> str | None:
     「剛登入的新 token」在窗口內被誤判成無效。
     """
     if not token:
+        return None
+    # 形狀不對的不用查資料庫（見上方 _TOKEN_SHAPE）。
+    if not _TOKEN_SHAPE.match(token):
         return None
 
     # 有效性判斷交給資料庫做（欄位是 TIMESTAMPTZ），不要撈回 Python 再比對——

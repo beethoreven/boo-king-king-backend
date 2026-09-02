@@ -65,6 +65,14 @@ if not _pool_log.handlers:
 
 app = Flask(__name__)
 
+# 請求本體的上限。原本沒設，而 Flask/Werkzeug 沒有預設值——也就是說
+# /auth/login（未登入就打得到）可以收到任意大的 body，而且會被完整讀進
+# 記憶體之後才輪到任何檢查。送一個超大的 body 比送假 token 還便宜。
+#
+# 64KB 遠大於這裡任何一個正常請求（最大的是場次編輯，數 KB），
+# 而 Google ID Token 本身大約 1KB。超過就回 413，不進到路由。
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
+
 # max_age 是預檢（OPTIONS）結果的快取秒數，不設的話每一次 API 呼叫都會
 # 變成兩個 HTTP 請求。
 #

@@ -3,5 +3,9 @@ python-dotenv==1.0.1
 Flask==3.0.3
 Flask-Cors==5.0.0
 google-auth==2.32.0
+# google-auth 每次驗證都會重抓 Google 的公開金鑰（套件原始碼就是這樣，
+# 最新版也一樣）。CacheControl 讓它遵守 Google 回的 Cache-Control 標頭。
+# 理由詳見 auth_utils/google_auth.py。
+cachecontrol==0.14.3
 requests==2.32.5
 gunicorn==23.0.0
