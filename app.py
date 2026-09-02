@@ -1281,10 +1281,20 @@ def admin_abuse_log():
     with pool.connection() as conn:
         with conn.cursor() as cur:
             data = guard.list_log(cur, user_id=user_id, start=start)
+            cur.execute("SELECT EXISTS (SELECT 1 FROM abuse_rule)")
+            auto_deactivate = bool(cur.fetchone()[0])
     return jsonify({
         **data,
         # 讓管理員知道現在是「只記錄」還是「會自動停權」，不必去翻程式碼。
-        "auto_deactivate": guard.AUTO_DEACTIVATE,
+        #
+        # ★ 這裡原本讀 guard.AUTO_DEACTIVATE——一個布林常數。8265a2c 把停權
+        #   改成「累計點數對照 abuse_rule 表」之後那個常數就沒了，但這一行
+        #   留著，於是這支從那次起**每一次都回 500**。沒有人發現是因為前端
+        #   把失敗畫成了「目前沒有異常紀錄」，看起來就只是還沒有人觸發過。
+        #
+        #   現在改成問資料：abuse_rule 一筆都沒有時 _apply_points() 找不到
+        #   規則、不會停權，那才是真正的「只記錄」。
+        "auto_deactivate": auto_deactivate,
         "rate_limit_per_minute": guard.RATE_LIMIT_PER_MINUTE,
     })
 

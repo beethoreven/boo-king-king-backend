@@ -42,8 +42,8 @@ curl -s localhost:5001/api/health
   反壓上限**。原本用 psycopg3 的 `ConnectionPool`，在 Render 免費方案上會永久卡死
   （容器凍結後池子的背景執行緒不恢復），2026-08-31 實測後換掉，完整理由見檔案內註解
 - 防超賣：per-slot advisory lock（鍵是「劇本+日期+時間」）鎖住該場次後才數容量，
-  容量 = `1 + mmg.waitlist_limit` 組；主持人撞期另有 per-host advisory lock，
-  多把鎖依排序取得避免死鎖。實作見 `db/bookings.py` 的 `_lock_slot` / `_lock_hosts`
+  容量 = `1 + mmg.waitlist_limit` 組；主持人撞期另有 per-GM advisory lock，
+  多把鎖依排序取得避免死鎖。實作見 `db/bookings.py` 的 `_lock_slot` / `_lock_gms`
 - 冪等鍵：`UNIQUE (request_id)` + `ON CONFLICT DO NOTHING`，由前端在「按下送出」
   那一刻產生一組 UUID；日期/時間/主持人任一改變就換新的，否則改了日期會被當成同一筆
 - 重試：只在應用層、以 `request_id` 為鍵；連線層/pool 層自動重試會製造超賣
@@ -55,7 +55,7 @@ curl -s localhost:5001/api/health
 
 | 代號 | 主旨前綴 | 什麼時候寄 | 寄給誰 |
 |---|---|---|---|
-| `host_assigned` | 【指定通知】 | 某人**這次新被指定**為主持人 | 那位主持人（一人一封） |
+| `gm_assigned` | 【指定通知】 | 某人**這次新被指定**為主持人 | 那位主持人（一人一封） |
 | `admin_reviewed` | 【場次確認通知】 | 狀態轉成 `gm_reviewed`（主持人全數確認） | 全部管理員 |
 | `player_booked` | 【預約成功】 | 狀態轉成 `booked` | 預定的玩家 |
 | `abuse_point` | 【異常行為通知】 | 有人被記點，但**還沒**到停權門檻 | 全部管理員 |
