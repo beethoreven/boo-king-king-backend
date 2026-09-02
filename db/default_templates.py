@@ -76,9 +76,14 @@ def _btn(text: str) -> str:
 
     綁在一起而不是各封自己加，是為了讓「之後新增第六封信」不會漏掉——
     漏掉的後果是那封信的收件人少一道提醒，而這種漏掉沒有人會發現。
+
+    ★ href 用 {{link}} 而不是 {{site_url}}：site_url 是站台根目錄，而根
+      目錄一律開在預約畫面——主持人收到「你被指定了」點進來會看到預約
+      畫面，還要自己再點一次「主持人介面」。link 由 notifications 依信別
+      算出，指向該去的畫面與頁籤；對不到時它就等於 site_url。
     """
     return (
-        f'<a href="{{{{site_url}}}}" style="{_BTN}">{text}</a>'
+        f'<a href="{{{{link}}}}" style="{_BTN}">{text}</a>'
         f'<p style="{_WARN}">{_WARN_TEXT}</p>'
     )
 
@@ -90,10 +95,10 @@ def _foot() -> str:
 # key -> (subject, body_html)
 TEMPLATES: dict[str, tuple[str, str]] = {
     # ── ① 主持人：玩家指定了他 ──────────────────────────────
-    "host_assigned": (
+    "gm_assigned": (
         "【指定通知】你被指定主持《{{mmg_name}}》{{session_short}}",
         f'''<div style="{_WRAP}">
-<p style="margin:0 0 14px;">{{{{host_name}}}} 您好：</p>
+<p style="margin:0 0 14px;">{{{{gm_name}}}} 您好：</p>
 <p style="margin:0 0 20px;">有一筆新的預約指定您擔任主持人，請前往確認。</p>
 <div style="{_BOX}">
 {_row("劇本", "<strong>{{mmg_name}}</strong>")}
@@ -176,12 +181,32 @@ TEMPLATES: dict[str, tuple[str, str]] = {
 }
 
 
+# 改過名字的範本 key：{舊: 新}。
+#
+# ★ **key 是資料庫的主鍵，改名一定要帶遷移。** 少了這一步的話：舊那列
+#   （host_assigned）沒有人再讀它，ensure() 會用預設內容插一列新的
+#   （gm_assigned）——信照寄，但**那一列的 enabled 開關會回到預設值**。
+#   如果案主曾經把這封信關掉，它會自己復活；而這種事沒有錯誤訊息。
+#
+# 這裡不用手動步驟，是因為手動步驟會被忘記，而忘記的後果是安靜的。
+_RENAMED = {"host_assigned": "gm_assigned"}
+
+
 def ensure(cur) -> None:
     """把還不存在的範本寫進去。已經存在的**不動**——那可能是案主改過的。
 
     ★ 所以改了這個檔案裡的預設內容之後，**已經上線的資料庫不會自動跟著變**。
       要套用就跑 reset()（見下），或把那一列刪掉等下次啟動重塞。
     """
+    # 先遷移改過名的 key，再補齊缺的。順序不能反——反過來會先插一列新的，
+    # 然後改名撞到主鍵。
+    for old, new in _RENAMED.items():
+        cur.execute(
+            "UPDATE notification_template SET key = %s "
+            "WHERE key = %s AND NOT EXISTS ("
+            "  SELECT 1 FROM notification_template WHERE key = %s)",
+            (new, old, new),
+        )
     for key, (subject, body) in TEMPLATES.items():
         cur.execute(
             "INSERT INTO notification_template (key, subject, body_html) "

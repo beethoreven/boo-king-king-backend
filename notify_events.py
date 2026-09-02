@@ -125,10 +125,10 @@ def _gm_names(cur, gm_user_ids: list[int | None]) -> str:
     return "、".join(by_id.get(i, f"#{i}") for i in ids)
 
 
-def _gm_role_name(cur, mmg_id: int, gm_user_ids: list, host_id: int) -> str:
+def _gm_role_name(cur, mmg_id: int, gm_user_ids: list, gm_id: int) -> str:
     """這位主持人在這個劇本裡擔任的角色名稱（gm1_name..gm4_name）。"""
     try:
-        slot = [i for i in gm_user_ids].index(host_id) + 1
+        slot = [i for i in gm_user_ids].index(gm_id) + 1
     except ValueError:
         return ""
     cur.execute(f"SELECT gm{slot}_name FROM mmg WHERE id = %s", (mmg_id,))
@@ -174,18 +174,18 @@ def on_transition(cur, before: dict | None, after: dict | None) -> list:
 
     out = []
     old_status = before["status"] if before else None
-    old_hosts = set(i for i in (before["gm_user_ids"] if before else []) if i)
-    new_hosts = [i for i in after["gm_user_ids"] if i and i not in old_hosts]
+    old_gms = set(i for i in (before["gm_user_ids"] if before else []) if i)
+    new_gms = [i for i in after["gm_user_ids"] if i and i not in old_gms]
     base = _booking_values(cur, after)
 
     # ① 這次新被指定到的主持人。已經被指定過的不重寄——管理員為了改備註
     #    存一次檔，不該讓所有主持人再收一封「你被指定了」。
-    for host in nf.users_by_id(cur, new_hosts):
-        msg = nf.build(cur, "host_assigned", [host], {
+    for gm in nf.users_by_id(cur, new_gms):
+        msg = nf.build(cur, "gm_assigned", [gm], {
             **base,
-            "host_name": host["name"] or "主持人",
+            "gm_name": gm["name"] or "主持人",
             "gm_role": _gm_role_name(
-                cur, after["mmg_id"], after["gm_user_ids"], host["id"]
+                cur, after["mmg_id"], after["gm_user_ids"], gm["id"]
             ),
         })
         if msg:

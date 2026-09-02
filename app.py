@@ -79,7 +79,7 @@ app = Flask(__name__)
 # ★ 快取是按「完整網址」分開存的，查詢字串算在裡面（實測：同一個網址連打
 #   五次只送一次 OPTIONS；同一支 API 換三個日期就送三次）。所以省下來的
 #   是「重複打同一個網址」那部分：
-#     有效——/api/mmg、/api/host/dashboard、POST /api/bookings 這些沒有
+#     有效——/api/mmg、/api/gm/dashboard、POST /api/bookings 這些沒有
 #            查詢字串的，以及開賣時大家不斷重整同一個場次
 #     無效——瀏覽不同日期的場次、換篩選條件翻頁，每組參數都要各自預檢
 #   別以為裝了這行就沒有預檢了。
@@ -734,12 +734,12 @@ def get_slot(mmg_id: int):
     return jsonify(payload)
 
 
-@app.get("/api/bookings/check-host")
+@app.get("/api/bookings/check-gm")
 @require_auth
-def check_host_route():
+def check_gm_route():
     """玩家在預約畫面選了某位主持人時，即時確認他這個時段有沒有空。
 
-    跟送出時的檢查是同一個函式（conflicting_host），只是提早跑一次，
+    跟送出時的檢查是同一個函式（conflicting_gm），只是提早跑一次，
     讓玩家在填表當下就知道，而不是全部填完按下送出才被退回。這裡不做
     任何寫入，也不取任何鎖——真正的把關仍然在 create_booking() 裡，
     那裡才有 advisory lock 保證「檢查到寫入」之間沒有人插隊。
@@ -761,7 +761,7 @@ def check_host_route():
             if cur.fetchone() is None:
                 return jsonify({"error": "找不到這個劇本"}), 404
 
-            conflicting = bookings_db.conflicting_host(
+            conflicting = bookings_db.conflicting_gm(
                 cur, [user_id], mmg_id, d, t
             )
             if conflicting is None:
@@ -769,9 +769,9 @@ def check_host_route():
 
             cur.execute("SELECT name FROM users WHERE id = %s", (conflicting,))
             name_row = cur.fetchone()
-            host_name = name_row[0] if name_row else f"id={conflicting}"
+            gm_name = name_row[0] if name_row else f"id={conflicting}"
 
-    return jsonify({"error": f"{host_name}在這個時間有場次無法預定"}), 409
+    return jsonify({"error": f"{gm_name}在這個時間有場次無法預定"}), 409
 
 
 @app.post("/api/bookings")
@@ -899,7 +899,7 @@ def my_bookings_tab(tab: str):
         return jsonify({"error": str(exc)}), 400
 
 
-def _is_assigned_host(booking: dict, user_id: int) -> bool:
+def _is_assigned_gm(booking: dict, user_id: int) -> bool:
     """這個人是不是這筆預約指定的主持人之一。"""
     return user_id in (booking.get("gm_user_ids") or [])
 
@@ -912,7 +912,7 @@ def _may_read_booking(booking: dict, user: dict) -> bool:
     玩家　：只有自己訂的。
 
     ★ 主持人不再是「role<=2 就看得到全部」。他在畫面上本來就只看得到
-      自己的場（host_tab 的 WHERE 已經限定），但按 id 的端點沒有跟著限，
+      自己的場（gm_tab 的 WHERE 已經限定），但按 id 的端點沒有跟著限，
       等於留了一條用開發者工具改個數字就能翻別人資料的路。畫面帶不到的
       地方，不代表到不了。
     """
@@ -920,7 +920,7 @@ def _may_read_booking(booking: dict, user: dict) -> bool:
         return True
     if booking["player_id"] == user["id"]:
         return True
-    return user["role"] <= 2 and _is_assigned_host(booking, user["id"])
+    return user["role"] <= 2 and _is_assigned_gm(booking, user["id"])
 
 
 @app.get("/api/bookings/<int:booking_id>")
@@ -1031,22 +1031,22 @@ def _parse_filters(args) -> dict:
     return f
 
 
-@app.get("/api/host/dashboard")
+@app.get("/api/gm/dashboard")
 @require_role(2)
-def host_dashboard_route():
+def gm_dashboard_route():
     """主持人介面初次載入：三個頁籤各第一頁，一次拿完。
 
-    翻頁與篩選都不走這支——那兩件事只影響當前頁籤，走 /api/host/tab/<tab>
+    翻頁與篩選都不走這支——那兩件事只影響當前頁籤，走 /api/gm/tab/<tab>
     單獨拿，另外兩個頁籤維持畫面上既有的內容、不重查。
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            return jsonify(bookings_db.host_dashboard(cur, g.user["id"]))
+            return jsonify(bookings_db.gm_dashboard(cur, g.user["id"]))
 
 
-@app.get("/api/host/tab/<tab>")
+@app.get("/api/gm/tab/<tab>")
 @require_role(2)
-def host_tab_route(tab: str):
+def gm_tab_route(tab: str):
     """單一頁籤的一頁資料。翻頁（start）與篩選都在這裡。
 
     start 是 1-based 起始筆數（1、51、101...）。換篩選條件時前端要把
@@ -1064,7 +1064,7 @@ def host_tab_route(tab: str):
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 return jsonify(
-                    bookings_db.host_tab(cur, g.user["id"], tab, start=start, filters=filters)
+                    bookings_db.gm_tab(cur, g.user["id"], tab, start=start, filters=filters)
                 )
     except BookingError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -1113,17 +1113,17 @@ def booking_detail_route(booking_id: int):
             if row is None:
                 return jsonify({"error": "找不到這筆預約"}), 404
 
-            host_ids = list(row[0:4])
+            gm_ids = list(row[0:4])
             allowed = (
                 g.user["role"] <= 1                    # 管理員
-                or g.user["id"] in host_ids            # 被指定的主持人
+                or g.user["id"] in gm_ids            # 被指定的主持人
                 or g.user["id"] == row[21]             # 這筆預約的預定者
             )
             if not allowed:
                 return jsonify({"error": "只能查看自己的場次"}), 403
 
             # 把有指派的主持人名字一次查出來，避免四次單筆查詢
-            present = [h for h in host_ids if h is not None]
+            present = [h for h in gm_ids if h is not None]
             names = {}
             if present:
                 cur.execute("SELECT id, name FROM users WHERE id = ANY(%s)", (present,))
@@ -1148,8 +1148,8 @@ def booking_detail_route(booking_id: int):
             {
                 "slot": i + 1,
                 "role_name": role_names[i],
-                "user_id": host_ids[i],
-                "user_name": names.get(host_ids[i]),
+                "user_id": gm_ids[i],
+                "user_name": names.get(gm_ids[i]),
                 "confirmed": confirmed[i],
             }
             for i in range(4)
@@ -1167,12 +1167,12 @@ def booking_conflicts_route(booking_id: int):
     一次，撞期就跳對話框讓人自己決定要不要繼續——這兩個畫面的用途就是
     人工判斷，系統該做的是把資訊攤開，不是替他決定。
 
-    回傳兩組（見 find_conflicts）：script 是這個劇本被排了兩場，hosts 是
+    回傳兩組（見 find_conflicts）：script 是這個劇本被排了兩場，gms 是
     某位主持人同時段已經有別的場。兩者的嚴重程度不同——劇本撞期是排班
     問題，人可以判斷後放行；主持人自己撞期是他分身乏術，不該放行——所以
     分開給，不合併成一份清單。
 
-    hosts 的每一筆帶 is_me，標出是不是呼叫者自己。主持人只在意自己撞到
+    gms 的每一筆帶 is_me，標出是不是呼叫者自己。主持人只在意自己撞到
     什麼。在這裡標而不是讓前端比對，是因為前端拿不到自己的 user id
     （登入回應只給 email/name/role），為了這件事改動登入回應的形狀不
     划算，而後端本來就知道自己是誰。
@@ -1187,11 +1187,11 @@ def booking_conflicts_route(booking_id: int):
             booking = bookings_db.get_booking(cur, booking_id)
             if booking is None:
                 return jsonify({"error": "找不到這筆預約"}), 404
-            if g.user["role"] > 1 and not _is_assigned_host(booking, g.user["id"]):
+            if g.user["role"] > 1 and not _is_assigned_gm(booking, g.user["id"]):
                 return jsonify({"error": "只能查看自己被指定的場次"}), 403
             result = bookings_db.find_conflicts(cur, booking_id)
-    for c in result["hosts"]:
-        c["is_me"] = c["host_id"] == g.user["id"]
+    for c in result["gms"]:
+        c["is_me"] = c["gm_id"] == g.user["id"]
     return jsonify(result)
 
 
@@ -1200,7 +1200,7 @@ def booking_conflicts_route(booking_id: int):
 def confirm_booking_route(booking_id: int):
     """主持人確認自己在這場的指定。
 
-    刻意不檢查「這個人是不是這場的主持人」——confirm_host() 的 WHERE
+    刻意不檢查「這個人是不是這場的主持人」——confirm_gm() 的 WHERE
     已經包含那個條件，不符合就拋 BookingError。在這裡多做一次檢查，
     等於同一條規則有兩個地方可以改，遲早會不一致。
     """
@@ -1208,7 +1208,7 @@ def confirm_booking_route(booking_id: int):
         with conn.cursor() as cur:
             before = bookings_db.get_booking(cur, booking_id)
             try:
-                updated = bookings_db.confirm_host(cur, booking_id, g.user["id"])
+                updated = bookings_db.confirm_gm(cur, booking_id, g.user["id"])
             except BookingError as exc:
                 conn.rollback()
                 return jsonify({"error": str(exc)}), 409
@@ -1333,7 +1333,7 @@ def admin_list_mmg():
                 )
             return jsonify({
                 "items": items,
-                "host_candidates": mmg_admin.list_host_candidates(cur),
+                "gm_candidates": mmg_admin.list_gm_candidates(cur),
                 "rooms": mmg_admin.list_rooms(cur),
             })
 

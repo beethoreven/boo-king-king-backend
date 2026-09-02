@@ -123,6 +123,64 @@ def invalidate() -> None:
 
 _HOLE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 
+# 不做 HTML 逃逸的變數。只有「要進 href 而且不含使用者輸入」的才進得來。
+_RAW_VALUES = ("site_url", "link")
+
+# 每封信的按鈕要落到哪裡（前端路由，見 booking-king-web/js/route.js）。
+#
+# ★ **這是唯一寫著路由形狀的地方。** 不要把 ?view=... 寫進範本——範本存在
+#   資料庫裡，寫死的話之後路由一改（查詢參數換成真路徑、或頁籤改名）就要
+#   改五列資料，而且改漏了不會有任何錯誤，只會有人點了信落在錯的地方。
+#
+# ★ 沒對到的 key 退回 site_url，也就是站台首頁——跟做路由之前一樣。新增
+#   第六封信而忘了加對應時，它會落在首頁（可以接受），而不是變成一個壞掉
+#   的連結（不能接受）。
+_BUTTON_TARGET = {
+    "gm_assigned": "view=gm&tab=pending",
+    "admin_reviewed": "view=admin&tab=bookings",
+    "player_booked": "view=mybookings&tab=booked",
+    "abuse_point": "view=admin&tab=abuse",
+    "abuse_banned": "view=admin&tab=users",
+}
+
+
+def _check_button_targets() -> None:
+    """_BUTTON_TARGET 必須**剛好**覆蓋所有範本，不多不少。
+
+    ★ 這裡刻意不做「對不到就退回首頁」。退回首頁的話，新增第六封信而忘了
+      給它目的地時，信照樣寄得出去、按鈕照樣點得動，只是每個收件人都落在
+      預約畫面——沒有錯誤、沒有人回報，而那正是這整件事一開始要修的毛病。
+      寧可讓程式在啟動時就起不來：那時候只有工程師在看，而且一定看得到。
+    """
+    from db.default_templates import TEMPLATES
+
+    missing = sorted(set(TEMPLATES) - set(_BUTTON_TARGET))
+    extra = sorted(set(_BUTTON_TARGET) - set(TEMPLATES))
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append(f"這幾封信沒有指定按鈕要去哪裡：{'、'.join(missing)}")
+        if extra:
+            parts.append(f"指定了目的地但沒有這封信：{'、'.join(extra)}")
+        raise RuntimeError("通知信的按鈕目的地表對不上——" + "；".join(parts))
+
+
+_check_button_targets()
+
+
+def _button_link(site_url: str, key: str) -> str:
+    """site_url 加上這封信該去的位置。
+
+    site_url 自己帶查詢字串的話用 & 接——目前不會發生（settings 裡就是
+    一個站台網址），但這一行比「之後有人加了參數才發現連結壞掉」便宜。
+
+    ★ 用 [] 不用 .get()：key 對不到是程式錯誤，上面的 _check_button_targets()
+      已經在啟動時擋掉了，能走到這裡還對不到的話要炸給人看。
+    """
+    if not site_url:
+        return site_url
+    return f"{site_url}{'&' if '?' in site_url else '?'}{_BUTTON_TARGET[key]}"
+
 
 def render(text: str, values: dict) -> str:
     """把 {{name}} 換成 values['name']，**值會做 HTML 逃逸**。
@@ -131,9 +189,10 @@ def render(text: str, values: dict) -> str:
     出現 & 或 < 的機率不低（「A&B」這種名字很常見）。不逃逸的話輕則版面
     壞掉，重則有人可以用暱稱往管理員的信箱塞任意 HTML。
 
-    ★ 例外是 site_url：它要進 href，逃逸後 & 會變成 &amp; 而壞掉連結。
-      但它來自 settings 表（只有案主用 SQL 改得到），不是使用者輸入，
-      所以照原樣代入是安全的。
+    ★ 例外是 site_url 與 link：它們要進 href。兩者都不是使用者輸入——
+      site_url 來自 settings 表（只有案主用 SQL 改得到），link 是下面
+      _button_link() 用 site_url 加一段寫死的查詢字串組出來的——所以
+      照原樣代入是安全的。
 
     找不到的變數留原樣不換——那是範本寫錯，讓它顯眼比悄悄變成空字串好，
     因為空字串會讓信看起來只是「少了一行」，沒有人會發現。
@@ -144,7 +203,7 @@ def render(text: str, values: dict) -> str:
             return m.group(0)
         raw = values[name]
         text_val = "" if raw is None else str(raw)
-        return text_val if name == "site_url" else html.escape(text_val)
+        return text_val if name in _RAW_VALUES else html.escape(text_val)
 
     return _HOLE.sub(sub, text)
 
@@ -171,6 +230,10 @@ def build(cur, key: str, recipients: list[dict], values: dict) -> Message | None
     if tpl is None or not tpl["enabled"]:
         return None
     values = {**settings(cur), **values}
+    # 算在這裡而不是讓五個觸發點各自傳：build() 是每一封信都會經過的地方，
+    # 所以 link 不可能漏掉。理由跟 default_templates._btn() 把警語綁在按鈕
+    # 上是同一個——會漏掉而且漏了不會有人發現的事，要放在共用的那一層。
+    values["link"] = _button_link(values.get("site_url") or "", key)
     return Message(
         to=[{"email": r["email"], "name": r.get("name") or r["email"]} for r in recipients],
         sender={

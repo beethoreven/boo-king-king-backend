@@ -63,7 +63,7 @@ def _lock_slot(cur, mmg_id: int, session_date, session_time) -> None:
     )
 
 
-def _lock_hosts(cur, host_ids: list[int]) -> None:
+def _lock_gms(cur, gm_ids: list[int]) -> None:
     """鎖住這幾位主持人的行事曆，直到交易結束。
 
     跟 _lock_slot 是同一個 TOCTOU 問題（查沒衝突→寫入，中間可能被插隊），
@@ -74,9 +74,14 @@ def _lock_hosts(cur, host_ids: list[int]) -> None:
     對不重複的 id 用排序過的順序逐一上鎖（sorted(set(...))）：多筆交易
     如果各自要鎖好幾位主持人，鎖的順序不一致就會有死鎖風險（A 先鎖 1 再等 2，
     B 先鎖 2 再等 1）；統一用同一個順序上鎖可以避免這個情況。
+
+    ★ 鎖的字串（"gm|<id>"）是**跨行程的協定值**，不是單純的命名。兩個行程
+      要用同一個字串才會拿到同一把鎖，所以改這個字串的那一次部署，新舊行程
+      交替的那幾秒鐘會各鎖各的，這段時間這把鎖等於不存在。這裡的量是一天
+      個位數，挑沒人在訂的時間部署就好；但下次要再改這個字串時要記得這件事。
     """
-    for host_id in sorted(set(host_ids)):
-        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"host|{host_id}",))
+    for gm_id in sorted(set(gm_ids)):
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"gm|{gm_id}",))
 
 
 # 一場戲實際佔用包廂的區間。
@@ -144,10 +149,10 @@ def has_room_conflict(cur, mmg_id: int, session_date, session_time) -> tuple | N
     return cur.fetchone()
 
 
-def conflicting_host(
-    cur, host_ids: list[int], mmg_id: int, session_date, session_time
+def conflicting_gm(
+    cur, gm_ids: list[int], mmg_id: int, session_date, session_time
 ) -> int | None:
-    """host_ids 裡任何一位在這段時間有沒有別的（不同場次的）已成立預約，
+    """gm_ids 裡任何一位在這段時間有沒有別的（不同場次的）已成立預約，
     回傳第一個撞期的 user id；都沒撞回傳 None。
 
     佔用區間的定義與包廂那支完全相同（見 _OCCUPY_*）：主持人一樣要在場地
@@ -157,7 +162,7 @@ def conflicting_host(
     不是「這位主持人」本身——同一場遊戲底下各序位掛的是同一位主持人，
     那是同一件事被記錄很多次，不是這位主持人被排了兩場不同的戲。
     """
-    if not host_ids:
+    if not gm_ids:
         return None
     cur.execute(
         f"""
@@ -170,7 +175,7 @@ def conflicting_host(
         SELECT u.id
           FROM booking_record b
           JOIN mmg m2 ON m2.id = b.mmg_id
-          JOIN users u ON u.id = ANY(%(hosts)s)
+          JOIN users u ON u.id = ANY(%(gms)s)
                       AND u.id IN (b.gm1_user_id, b.gm2_user_id,
                                    b.gm3_user_id, b.gm4_user_id)
           CROSS JOIN me
@@ -182,7 +187,7 @@ def conflicting_host(
            AND me.occupy_start < {_OCCUPY_END}
          LIMIT 1
         """,
-        {"hosts": host_ids, "mmg": mmg_id, "d": session_date, "t": session_time},
+        {"gms": gm_ids, "mmg": mmg_id, "d": session_date, "t": session_time},
     )
     row = cur.fetchone()
     return row[0] if row else None
@@ -195,13 +200,13 @@ def find_conflicts(cur, booking_id: int) -> dict:
         實體資源，一次只能開一場，跟是哪一齣戲、誰主持都無關。這條規則
         跟玩家預訂時擋人的 has_room_conflict() 是同一條。
 
-    hosts —— 這筆的某位「主持人」在這段時間已經被別的成立場次佔住。
+    gms —— 這筆的某位「主持人」在這段時間已經被別的成立場次佔住。
         不限同一個劇本：他可能被指定去帶另一齣戲，時間一樣會撞。
 
     兩者可以各自成立，也可以同時發生。分開回傳讓呼叫端決定各自要怎麼
     處置——目前是包廂衝突可以放行、主持人自己撞期不能放行。
 
-    佔用區間含佈置與還原時間，與 has_room_conflict／conflicting_host
+    佔用區間含佈置與還原時間，與 has_room_conflict／conflicting_gm
     用的是同一組定義（_OCCUPY_*）。三支必須一致：一支說可以、另一支說
     不行，畫面就會自相矛盾。
 
@@ -221,7 +226,7 @@ def find_conflicts(cur, booking_id: int) -> dict:
         raise BookingError(f"預約 id={booking_id} 不存在")
 
     mmg_id, session_date, session_time = row[0], row[1], row[2]
-    host_ids = [h for h in row[3:7] if h is not None]
+    gm_ids = [h for h in row[3:7] if h is not None]
 
     # 候選場次自己的佔用區間，跟另外兩支用同一個定義。
     me_cte = """
@@ -266,15 +271,15 @@ def find_conflicts(cur, booking_id: int) -> dict:
     ]
 
     # ── 某位主持人同時段已經有場 ──
-    hosts = []
-    if host_ids:
+    gms = []
+    if gm_ids:
         cur.execute(
             f"""
             {me_cte}
             SELECT DISTINCT u.id, u.name, m2.name, b2.session_date, b2.session_time
               FROM booking_record b2
               JOIN mmg m2  ON m2.id = b2.mmg_id
-              JOIN users u ON u.id = ANY(%(host_ids)s)
+              JOIN users u ON u.id = ANY(%(gm_ids)s)
                           AND u.id IN (b2.gm1_user_id, b2.gm2_user_id,
                                        b2.gm3_user_id, b2.gm4_user_id)
               CROSS JOIN me
@@ -283,18 +288,18 @@ def find_conflicts(cur, booking_id: int) -> dict:
                {overlap}
              ORDER BY b2.session_date, b2.session_time
             """,
-            {**params, "host_ids": host_ids},
+            {**params, "gm_ids": gm_ids},
         )
-        hosts = [
+        gms = [
             {
-                "host_id": r[0], "host_name": r[1], "mmg_name": r[2],
+                "gm_id": r[0], "gm_name": r[1], "mmg_name": r[2],
                 "session_date": r[3].isoformat(),
                 "session_time": r[4].strftime("%H:%M"),
             }
             for r in cur.fetchall()
         ]
 
-    return {"room": room, "hosts": hosts}
+    return {"room": room, "gms": gms}
 
 
 def _validate_gm_choice(cur, mmg_id: int, gm_user_ids: list[int | None]) -> None:
@@ -354,7 +359,7 @@ def create_booking(
     都是新的意圖，冪等保護會失效。
     """
     request_id = request_id or str(uuid.uuid4())
-    host_ids = [i for i in gm_user_ids if i is not None]
+    gm_ids = [i for i in gm_user_ids if i is not None]
 
     # ★ 排期檢查放在最前面，而且一定要在後端做。
     #
@@ -382,7 +387,7 @@ def create_booking(
         raise BookingError("此時間未開放")
 
     _lock_slot(cur, mmg_id, session_date, session_time)
-    _lock_hosts(cur, host_ids)
+    _lock_gms(cur, gm_ids)
     _validate_gm_choice(cur, mmg_id, gm_user_ids)
 
     # waitlist_limit 就是這個時段的總容量，不是「第 1 序位之外還能排幾組」。
@@ -413,11 +418,11 @@ def create_booking(
             f"，另需 {other_reset:g} 小時還原場地），時段衝突"
         )
 
-    conflicting = conflicting_host(cur, host_ids, mmg_id, session_date, session_time)
+    conflicting = conflicting_gm(cur, gm_ids, mmg_id, session_date, session_time)
     if conflicting is not None:
         cur.execute("SELECT name FROM users WHERE id = %s", (conflicting,))
-        host_name = cur.fetchone()[0]
-        raise BookingError(f"{host_name}在這個時間有場次無法預定")
+        gm_name = cur.fetchone()[0]
+        raise BookingError(f"{gm_name}在這個時間有場次無法預定")
 
     cur.execute(
         "SELECT COUNT(*) FROM booking_record "
@@ -563,13 +568,33 @@ def get_booking(cur, booking_id: int) -> dict | None:
 
 # 玩家自己的場次清單分頁。跟主持人／管理員一樣按狀態分，但用玩家看得懂
 # 的說法：他不需要知道「待收訂金」是店家的動作，他要知道的是「該去付了」。
-PLAYER_TABS = {
+# 五個狀態的中文，**玩家與管理員共用同一份**。
+#
+# 原本是兩份：玩家看「等待主持人確認／等待支付訂金／預約完成」，管理員看
+# 「待主持確認／待收訂金／已成立」。指的是同一個狀態，只是各寫各的，久了
+# 就會漂移——而這兩邊的人是會對話的（「我這場是不是已成立？」「系統上寫
+# 預約完成」），用詞不一樣會讓同一件事聽起來像兩件事。
+#
+# 選字以玩家那一版為基準：管理員讀得懂玩家的說法，反過來不一定
+# （「待收訂金」對玩家是站在店家立場講話）。booked 取兩邊的交集「預約成立」。
+#
+# ★ 這一份是「頁籤標題」。另有一份 STATUS_LABEL（本檔下方）是主持人視角
+#   的說法（「等待其他主持確認」——對主持人而言關鍵是還缺別人，不是缺自己），
+#   那是不同的資訊，刻意沒有併進來。
+#
+# ★ 共用同一個物件是刻意的——之後只要有人改這裡，兩個畫面一定同時變。
+#   哪天真的需要分開講（例如管理員要更精簡的字），就在這裡拆成兩份，
+#   而不是在畫面上各自蓋掉。
+TAB_LABEL = {
     "gm_confirm": "等待主持人確認",
     "gm_reviewed": "等待支付訂金",
-    "booked": "預約完成",
+    "booked": "預約成立",
     "ended": "已結束",
     "cancelled": "已取消",
 }
+
+# 玩家的頁籤就是這五個狀態。
+PLAYER_TABS = TAB_LABEL
 
 # 已結束與已取消看最近的，其餘看最早的——待處理的先做舊的，已完結的
 # 通常是查最近那幾筆。跟主持人與管理員的清單同一個原則。
@@ -706,7 +731,7 @@ def record_deposit(cur, booking_id: int, amount: int) -> dict:
     return get_booking(cur, booking_id)
 
 
-def confirm_host(cur, booking_id: int, host_id: int) -> dict:
+def confirm_gm(cur, booking_id: int, gm_id: int) -> dict:
     """某位主持人確認自己在這場的指定。
 
     只有 status 還是 gm_confirm 時才能確認——已經 gm_reviewed 以後代表
@@ -722,28 +747,28 @@ def confirm_host(cur, booking_id: int, host_id: int) -> dict:
     由資料庫自己算。
     """
     # COALESCE(...,false) 每一個都不能省：gm{n}_user_id 是 NULL 時
-    # (gm{n}_user_id = %(host)s) 在 SQL 三值邏輯下算出來是 NULL，
+    # (gm{n}_user_id = %(gm)s) 在 SQL 三值邏輯下算出來是 NULL，
     # 不是 false，而 `false OR NULL` 還是 NULL——寫進 NOT NULL 欄位
     # 直接違反約束（實測撞過：NotNullViolation on gm4_confirmed）。
     cur.execute(
         """
         UPDATE booking_record
-           SET gm1_confirmed = gm1_confirmed OR COALESCE(gm1_user_id = %(host)s, false),
-               gm2_confirmed = gm2_confirmed OR COALESCE(gm2_user_id = %(host)s, false),
-               gm3_confirmed = gm3_confirmed OR COALESCE(gm3_user_id = %(host)s, false),
-               gm4_confirmed = gm4_confirmed OR COALESCE(gm4_user_id = %(host)s, false)
+           SET gm1_confirmed = gm1_confirmed OR COALESCE(gm1_user_id = %(gm)s, false),
+               gm2_confirmed = gm2_confirmed OR COALESCE(gm2_user_id = %(gm)s, false),
+               gm3_confirmed = gm3_confirmed OR COALESCE(gm3_user_id = %(gm)s, false),
+               gm4_confirmed = gm4_confirmed OR COALESCE(gm4_user_id = %(gm)s, false)
          WHERE id = %(id)s
            AND status = 'gm_confirm'
-           AND %(host)s IN (gm1_user_id, gm2_user_id, gm3_user_id, gm4_user_id)
+           AND %(gm)s IN (gm1_user_id, gm2_user_id, gm3_user_id, gm4_user_id)
            -- 這個人還沒確認過。少了這行，重複確認會靜靜地成功
            -- （OR 是冪等的，true OR true 還是 true），呼叫端拿到 200
            -- 卻什麼都沒發生——UI 上那一列早就變暗了，回一個假的成功
            -- 比回錯誤更難查。
            AND NOT (
-                 COALESCE(gm1_user_id = %(host)s AND gm1_confirmed, false)
-              OR COALESCE(gm2_user_id = %(host)s AND gm2_confirmed, false)
-              OR COALESCE(gm3_user_id = %(host)s AND gm3_confirmed, false)
-              OR COALESCE(gm4_user_id = %(host)s AND gm4_confirmed, false)
+                 COALESCE(gm1_user_id = %(gm)s AND gm1_confirmed, false)
+              OR COALESCE(gm2_user_id = %(gm)s AND gm2_confirmed, false)
+              OR COALESCE(gm3_user_id = %(gm)s AND gm3_confirmed, false)
+              OR COALESCE(gm4_user_id = %(gm)s AND gm4_confirmed, false)
            )
         RETURNING
             (gm1_user_id IS NULL OR gm1_confirmed)
@@ -751,7 +776,7 @@ def confirm_host(cur, booking_id: int, host_id: int) -> dict:
         AND (gm3_user_id IS NULL OR gm3_confirmed)
         AND (gm4_user_id IS NULL OR gm4_confirmed)
         """,
-        {"host": host_id, "id": booking_id},
+        {"gm": gm_id, "id": booking_id},
     )
     row = cur.fetchone()
     if row is None:
@@ -761,21 +786,21 @@ def confirm_host(cur, booking_id: int, host_id: int) -> dict:
         cur.execute(
             """
             SELECT status,
-                   COALESCE(%(host)s IN (gm1_user_id, gm2_user_id,
+                   COALESCE(%(gm)s IN (gm1_user_id, gm2_user_id,
                                          gm3_user_id, gm4_user_id), false),
-                   COALESCE(gm1_user_id = %(host)s AND gm1_confirmed, false)
-                OR COALESCE(gm2_user_id = %(host)s AND gm2_confirmed, false)
-                OR COALESCE(gm3_user_id = %(host)s AND gm3_confirmed, false)
-                OR COALESCE(gm4_user_id = %(host)s AND gm4_confirmed, false)
+                   COALESCE(gm1_user_id = %(gm)s AND gm1_confirmed, false)
+                OR COALESCE(gm2_user_id = %(gm)s AND gm2_confirmed, false)
+                OR COALESCE(gm3_user_id = %(gm)s AND gm3_confirmed, false)
+                OR COALESCE(gm4_user_id = %(gm)s AND gm4_confirmed, false)
               FROM booking_record WHERE id = %(id)s
             """,
-            {"host": host_id, "id": booking_id},
+            {"gm": gm_id, "id": booking_id},
         )
         existing = cur.fetchone()
         if existing is None:
             raise BookingError(f"預約 id={booking_id} 不存在")
-        status, is_host, already = existing
-        if not is_host:
+        status, is_gm, already = existing
+        if not is_gm:
             raise BookingError("你不是這場預約指定的主持人")
         if already:
             raise BookingError("你已經確認過這場預約了")
@@ -790,28 +815,38 @@ def confirm_host(cur, booking_id: int, host_id: int) -> dict:
     return get_booking(cur, booking_id)
 
 
+# 主持人視角的說法：**就是 TAB_LABEL，只改真的有主持人專屬資訊的那一個。**
+#
+# 原本這裡是獨立的第三份，五個狀態各寫各的，結果 gm_reviewed 寫成「等待訂金
+# 支付」、booked 寫成「場次已預約完成」——跟 TAB_LABEL 講的是同一件事，只是
+# 換了順序跟長度。那不是兩種說法，是兩份沒對齊的同一句話。
+#
+# 改成從 TAB_LABEL 展開之後，**沒有列在下面的狀態不可能再漂移**：改 TAB_LABEL
+# 就兩邊一起變。要讓某個狀態對主持人講不一樣的話，就在下面多寫一行，而那一行
+# 本身就是「這裡刻意不同」的宣告。
+#
+# 目前只有一個：gm_confirm 對主持人而言關鍵是還缺**別人**，不是缺自己——他自己
+# 已經確認過了，所以他看到的是「等待其他主持確認」。這是他這個角色才需要知道
+# 的事。
 STATUS_LABEL = {
+    **TAB_LABEL,
     "gm_confirm": "等待其他主持確認",
-    "gm_reviewed": "等待訂金支付",
-    "booked": "場次已預約完成",
-    "ended": "已結束",
-    "cancelled": "已取消",
 }
 
 
-_HOST_ROLE_NAME = """
-    CASE WHEN b.gm1_user_id = %(host)s THEN m.gm1_name
-         WHEN b.gm2_user_id = %(host)s THEN m.gm2_name
-         WHEN b.gm3_user_id = %(host)s THEN m.gm3_name
-         WHEN b.gm4_user_id = %(host)s THEN m.gm4_name
+_GM_ROLE_NAME = """
+    CASE WHEN b.gm1_user_id = %(gm)s THEN m.gm1_name
+         WHEN b.gm2_user_id = %(gm)s THEN m.gm2_name
+         WHEN b.gm3_user_id = %(gm)s THEN m.gm3_name
+         WHEN b.gm4_user_id = %(gm)s THEN m.gm4_name
     END
 """
 
-_HOST_CONFIRMED = """
-    CASE WHEN b.gm1_user_id = %(host)s THEN b.gm1_confirmed
-         WHEN b.gm2_user_id = %(host)s THEN b.gm2_confirmed
-         WHEN b.gm3_user_id = %(host)s THEN b.gm3_confirmed
-         WHEN b.gm4_user_id = %(host)s THEN b.gm4_confirmed
+_GM_CONFIRMED = """
+    CASE WHEN b.gm1_user_id = %(gm)s THEN b.gm1_confirmed
+         WHEN b.gm2_user_id = %(gm)s THEN b.gm2_confirmed
+         WHEN b.gm3_user_id = %(gm)s THEN b.gm3_confirmed
+         WHEN b.gm4_user_id = %(gm)s THEN b.gm4_confirmed
     END
 """
 
@@ -853,7 +888,7 @@ def filter_clauses(f: dict | None) -> tuple[str, dict]:
     if f.get("role_name"):
         # 只比對「我擔任的那個角色」的名稱，不是這場所有角色——
         # 這一欄在畫面上顯示的就是我自己的角色，篩選要跟顯示一致。
-        sql.append(f"AND {_HOST_ROLE_NAME} ILIKE %(f_role)s")
+        sql.append(f"AND {_GM_ROLE_NAME} ILIKE %(f_role)s")
         params["f_role"] = like(f["role_name"])
     if f.get("session_date"):
         sql.append("AND b.session_date = %(f_date)s")
@@ -888,13 +923,13 @@ def paged(cur, sql: str, params: dict, row_to_item) -> dict:
 # （顯示「等待其他主持確認」），不是待確認（那裡不該再讓我按一次）。
 _TABS = {
     "pending": {
-        "where": f"AND b.status = 'gm_confirm' AND NOT COALESCE({_HOST_CONFIRMED}, false)",
+        "where": f"AND b.status = 'gm_confirm' AND NOT COALESCE({_GM_CONFIRMED}, false)",
         "order": "b.session_date, b.session_time",
     },
     "confirmed": {
         "where": f"""AND (
                  b.status IN ('gm_reviewed', 'booked')
-                 OR (b.status = 'gm_confirm' AND {_HOST_CONFIRMED})
+                 OR (b.status = 'gm_confirm' AND {_GM_CONFIRMED})
                )""",
         "order": "b.session_date, b.session_time",
     },
@@ -905,9 +940,9 @@ _TABS = {
 }
 
 
-def host_tab(
+def gm_tab(
     cur,
-    host_id: int,
+    gm_id: int,
     tab: str,
     *,
     start: int = 1,
@@ -916,7 +951,7 @@ def host_tab(
     """撈主持人介面「某一個頁籤」的一頁資料。
 
     分頁與篩選都是當前頁籤的事，不影響另外兩個頁籤——所以它們是這支
-    函式的參數，而不是 host_dashboard() 的。使用者翻頁或按下篩選時，
+    函式的參數，而不是 gm_dashboard() 的。使用者翻頁或按下篩選時，
     前端只針對當前頁籤呼叫這支，另外兩包維持畫面上既有的內容。
 
     start 是 1-based 的起始筆數（1、51、101...）。換篩選條件時前端要把
@@ -953,29 +988,52 @@ def host_tab(
         cur,
         f"""
         SELECT b.id, m.name, m.url, u.name, b.session_date, b.session_time, b.status,
-               {_HOST_ROLE_NAME} AS role_name
+               {_GM_ROLE_NAME} AS role_name
           FROM booking_record b
           JOIN mmg m   ON m.id = b.mmg_id
           JOIN users u ON u.id = b.player_id
-         WHERE %(host)s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
+         WHERE %(gm)s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
            {spec["where"]}
            {where}
          ORDER BY {spec["order"]}
          LIMIT %(limit)s OFFSET %(offset)s
         """,
-        {"host": host_id, "offset": start - 1, **fp},
+        {"gm": gm_id, "offset": start - 1, **fp},
         item,
     )
 
 
-def host_dashboard(cur, host_id: int) -> dict:
+# 主持人「已確認場次」頁籤的狀態篩選選項，順序即畫面上的順序（跟著流程走）。
+#
+# ★ 由後端定義而不是前端寫死，因為**能篩出什麼是上面那條 WHERE 決定的**：
+#   已確認頁籤收的就是 gm_reviewed、booked，以及自己已確認但整筆還是
+#   gm_confirm 的那些。前端另外寫一份，就變成同一件事有兩個定義，而它們
+#   會走鐘——實際上已經走鐘過：同一個狀態在篩選器下拉裡是「等待訂金支付」，
+#   在清單列裡卻是「等待支付訂金」，兩邊各改各的沒人發現。
+#
+# 只有已確認頁籤篩狀態才有意義：待確認永遠是 gm_confirm、已結束永遠是
+# ended，對它們篩狀態等於沒篩。
+#
+# 「全部」那一項不放這裡——它不是一個狀態，是「不要篩」，屬於前端的操作。
+GM_FILTER_STATUSES = ("gm_confirm", "gm_reviewed", "booked")
+
+
+def gm_dashboard(cur, gm_id: int) -> dict:
     """主持人介面初次載入：三個頁籤各拿第一頁，一支 API 打完。
 
     只給「剛打開頁面」用，刻意不收分頁與篩選參數——那兩件事都只作用於
-    當前頁籤，走 host_tab() 單獨拿即可，不需要為了改動一個頁籤而把
+    當前頁籤，走 gm_tab() 單獨拿即可，不需要為了改動一個頁籤而把
     另外兩個也重查一次。
+
+    ★ 除了三個頁籤，還帶回 status_options。跟著這一支回而不是另開一支，
+      理由與 /api/admin/users 把角色選項跟使用者清單一起回一樣：省一次
+      請求，而且不會有「清單」與「下拉」來自不同時間點的問題。
     """
-    return {tab: host_tab(cur, host_id, tab) for tab in _TABS}
+    out = {tab: gm_tab(cur, gm_id, tab) for tab in _TABS}
+    out["status_options"] = [
+        {"value": s, "label": STATUS_LABEL[s]} for s in GM_FILTER_STATUSES
+    ]
+    return out
 
 
 def mark_ended(cur, booking_id: int) -> dict:

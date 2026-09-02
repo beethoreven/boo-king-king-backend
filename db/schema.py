@@ -829,11 +829,11 @@ def _ensure_booking_record(cur) -> None:
             -- 對照著找。NULL 的 user_id 代表該劇本沒有這個角色或尚未
             -- 指定，此時對應的 confirmed 恆為 false，沒有意義但無害。
             --
-            -- 全部被指定的角色都確認過（confirm_host() 判斷），才會把
+            -- 全部被指定的角色都確認過（confirm_gm() 判斷），才會把
             -- status 從 gm_confirm 轉成 gm_reviewed。「確認」是針對
             -- 「這個人」而不是「這一列資料」——同一位主持人若同時佔了
             -- 這場的兩個角色，一次確認會把他佔的每一格都標記，見
-            -- confirm_host() 的說明。
+            -- confirm_gm() 的說明。
             gm1_user_id INTEGER REFERENCES users(id),
             gm1_confirmed BOOLEAN NOT NULL DEFAULT false,
             gm2_user_id INTEGER REFERENCES users(id),

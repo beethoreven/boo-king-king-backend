@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from db.bookings import (
     PAGE_SIZE,
+    TAB_LABEL,
     VALID_STATUSES,
     BookingError,
     create_booking,
@@ -21,14 +22,12 @@ from db.bookings import (
     record_deposit,
 )
 
-# 子頁籤 = status，順序即畫面上的順序（跟著流程走）
-TABS = {
-    "gm_confirm": "待主持確認",
-    "gm_reviewed": "待收訂金",
-    "booked": "已成立",
-    "ended": "已結束",
-    "cancelled": "已取消",
-}
+# 子頁籤 = status，順序即畫面上的順序（跟著流程走）。
+#
+# ★ 中文跟玩家那邊共用同一份（db.bookings.TAB_LABEL），理由見那裡。
+#   這裡原本自己寫了一份比較精簡的說法，結果同一個狀態在兩個畫面上叫
+#   不同的名字。
+TABS = TAB_LABEL
 
 # 已結束與已取消看最近的，其餘看最早的——待處理的事情要先做舊的，
 # 已經完結的則是最近的比較常查。
@@ -162,7 +161,7 @@ def update(cur, booking_id: int, data: dict) -> bool:
     if len(gm_user_ids) != 4 or len(gm_confirmed) != 4:
         raise BookingError("gm_user_ids 與 gm_confirmed 都需要剛好 4 個元素")
     # 沒有指派主持人的角色不可能「已確認」——放著會讓
-    # confirm_host() 的「全員確認了嗎」判斷得到錯誤結果。
+    # confirm_gm() 的「全員確認了嗎」判斷得到錯誤結果。
     gm_confirmed = [bool(c) and u is not None for c, u in zip(gm_confirmed, gm_user_ids)]
 
     new = {
@@ -203,11 +202,11 @@ def update(cur, booking_id: int, data: dict) -> bool:
     # 1) 主持人全數確認 → gm_reviewed。
     #
     # ★ 這條原本沒有，是個實測抓到的洞：主持人自己按確認會轉態
-    #   （db/bookings.py 的 confirm_host），但管理員在後台勾「已確認」不會。
+    #   （db/bookings.py 的 confirm_gm），但管理員在後台勾「已確認」不會。
     #   結果是兩位主持人都確認了、狀態卻停在 gm_confirm，那筆預約卡在那裡
     #   直到有人手動改狀態——而且管理員收不到「待收訂金」的通知信。
     #
-    # 「全數確認」的定義跟 confirm_host 一致：沒指派人的角色不算數。
+    # 「全數確認」的定義跟 confirm_gm 一致：沒指派人的角色不算數。
     # 但多一個守衛——一位主持人都沒指派時不算全員確認，否則一筆還沒排
     # 主持人的預約會自己跳到「待收訂金」。
     assigned = [(u, c) for u, c in zip(new["gm_user_ids"], new["gm_confirmed"]) if u]

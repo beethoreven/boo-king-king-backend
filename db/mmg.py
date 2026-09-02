@@ -18,15 +18,15 @@ def _row_to_dict(cur, row) -> dict:
     for idx, (gname, guids) in enumerate(((n1, u1), (n2, u2), (n3, u3), (n4, u4)), start=1):
         if gname is None:
             continue
-        hosts = []
+        gms = []
         if guids:
             cur.execute(
                 "SELECT id, name FROM users "
                 " WHERE id = ANY(%s) AND status = 'active' ORDER BY id",
                 (guids,),
             )
-            hosts = [{"id": i, "name": n} for i, n in cur.fetchall()]
-        slots.append({"slot": idx, "name": gname, "hosts": hosts})
+            gms = [{"id": i, "name": n} for i, n in cur.fetchall()]
+        slots.append({"slot": idx, "name": gname, "gms": gms})
 
     return {
         "id": mid,

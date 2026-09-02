@@ -113,7 +113,7 @@ def list_rooms(cur) -> list[dict]:
     return [{"id": r[0], "name": r[1]} for r in cur.fetchall()]
 
 
-def list_host_candidates(cur) -> list[dict]:
+def list_gm_candidates(cur) -> list[dict]:
     """能被指派為主持人的使用者：role <= 2（主持人與管理員）且啟用中。
 
     停用的不列出來——不該讓管理員把一個已經停用的帳號指派成新場次的
