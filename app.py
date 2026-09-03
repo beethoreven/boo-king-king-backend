@@ -114,6 +114,84 @@ else:
     )
     CORS(app, max_age=3600)
 
+# ── 每店部署的識別（variant）─────────────────────────────────
+#
+# 網址形狀是 /v/<variant>/api/...，前綴放在**所有路徑最前面**。理由是這個
+# 後端有 /api/... 與 /auth/... 兩種前綴，而前端的 API_BASE 只是主機位址——
+# 前綴放最前面，前端只要改 index.html 一行，四十幾個呼叫點零改動；放中間
+# （/api/<variant>/...）則要改每一個呼叫點，而且 /auth/... 那幾支塞不進去。
+#
+# ★ 這一段**不是**用來決定連哪個資料庫。variant 從環境變數來，每個部署
+#   啟動時就知道自己是誰，手上只有一組 DATABASE_URL——它根本連不到別家店
+#   的資料庫。隔離來自「這個 process 沒有那把鑰匙」，不是來自路由寫對。
+#   網址裡那一段只做一件事：對不上就拒絕，防的是「前端網址填錯」這種設定
+#   錯誤。把它當斷言看，不要讓它承擔隔離責任。
+#
+# ★ 沒設 VARIANT 就直接起不來，不給預設值。給了預設值的話，eli 的服務忘記
+#   設定就會安靜地變成「接受 /v/tutor-arthur、拒絕 /v/eli」——那正是那種
+#   只有某些情境才壞、上線前測不出來的失敗。起不來則是所有人一起壞，一眼
+#   就看得到；而且 Render 部署失敗會保留舊版本，現有服務不會中斷。
+VARIANT = os.environ.get("VARIANT", "").strip()
+if not VARIANT:
+    raise RuntimeError(
+        "VARIANT 未設定。這是每店部署的識別（例如 tutor-arthur、eli），"
+        "決定這個服務接受哪一個 /v/<variant> 前綴。設好環境變數再啟動。"
+    )
+
+
+class _StripVariant:
+    """把 /v/<variant> 從路徑上剝掉，讓後面四十幾支路由完全不用改。
+
+    只負責剝除與記錄，**不做判斷**——判斷放在下面的 before_request。
+    在 WSGI 這一層直接回 404 的話，那個回應不會經過 Flask-CORS，瀏覽器
+    只會看到一個沒有 CORS 標頭的失敗，主控台顯示成跨來源錯誤——把「打錯
+    服務」偽裝成「CORS 設定壞了」，是最難從畫面判斷原因的一種。
+    """
+
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        if path.startswith("/v/"):
+            # ['', 'v', '<variant>', '剩下的路徑']
+            parts = path.split("/", 3)
+            variant = parts[2] if len(parts) > 2 else ""
+            environ["boo_king_king.variant"] = variant
+            environ["PATH_INFO"] = "/" + (parts[3] if len(parts) > 3 else "")
+            # SCRIPT_NAME 要一起補上，否則 url_for 產生的網址會少掉前綴。
+            environ["SCRIPT_NAME"] = environ.get("SCRIPT_NAME", "") + f"/v/{variant}"
+        return self.wsgi_app(environ, start_response)
+
+
+app.wsgi_app = _StripVariant(app.wsgi_app)
+
+
+@app.before_request
+def _assert_variant():
+    """帶了前綴就必須對得上；沒帶前綴的舊路徑暫時放行。
+
+    ★ 過渡期設定，做完就要收掉。cron-job.org 上那三支排程目前打的是舊路徑
+      （/api/health、/api/jobs/daily、/api/jobs/weekly），在前綴上線與排程
+      改設定之間有一段空窗。這時候若拒絕舊路徑，每日排程會**安靜地停掉**
+      ——排程失敗沒有人會通知你，要等到發現過期場次沒被整理才察覺。
+
+      排程改好、確認跑過一輪之後，把下面 `got is None` 那個分支改成一律
+      拒絕，斷言才算真的生效。
+    """
+    got = request.environ.get("boo_king_king.variant")
+    if got is None:
+        return None  # 過渡期：不帶前綴的舊路徑仍然放行
+    if got != VARIANT:
+        return jsonify({
+            "error": "打錯服務了",
+            "detail": f"這個服務是 {VARIANT}，收到的前綴是 {got or '(空的)'}",
+        }), 404
+    return None
+
+
+print(f"[info] variant = {VARIANT}（接受 /v/{VARIANT}/... 前綴）", flush=True)
+
 # 啟動時說一聲通知信是開還是關。
 #
 # ★ 這一行存在的理由是「沉默的失敗」：BREVO_API_KEY 沒設或打錯字時，整個
