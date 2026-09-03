@@ -57,7 +57,7 @@ def ensure_schema(cur) -> None:
         #   所以要再加一把**跨行程**的鎖。advisory lock 是交易層級的，會在
         #   呼叫端 commit 時自動釋放；第二個 worker 會擋在這一行，等第一個
         #   建完才進去，然後發現該有的都有了（這裡的每一段本來就是冪等的）。
-        cur.execute("SELECT pg_advisory_xact_lock(hashtext('booking-king:ensure_schema'))")
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext('boo-king-king:ensure_schema'))")
 
         _ensure_settings(cur)
         _ensure_notification_template(cur)
@@ -182,7 +182,7 @@ def _ensure_settings(cur) -> None:
         """
         INSERT INTO settings (key, value) VALUES
             ('site_name',    '步經徑'),
-            ('site_url',     'https://tutor-arthur.booking-king.workers.dev'),
+            ('site_url',     'https://tutor-arthur.boo-king-king.workers.dev'),
             ('sender_name',  '步經徑'),
             ('sender_email', 'beethoreven@gmail.com')
         ON CONFLICT (key) DO NOTHING

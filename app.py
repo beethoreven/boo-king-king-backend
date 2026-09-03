@@ -1,5 +1,5 @@
 """
-booking-king 後端。
+boo-king-king 後端。
 
 健康檢查、保活端點、Google 登入與 session 層，以及劇本查詢與預約路由。
 """

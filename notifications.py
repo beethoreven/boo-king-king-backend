@@ -126,7 +126,7 @@ _HOLE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 # 不做 HTML 逃逸的變數。只有「要進 href 而且不含使用者輸入」的才進得來。
 _RAW_VALUES = ("site_url", "link")
 
-# 每封信的按鈕要落到哪裡（前端路由，見 booking-king-web/js/route.js）。
+# 每封信的按鈕要落到哪裡（前端路由，見 boo-king-king-web/js/route.js）。
 #
 # ★ **這是唯一寫著路由形狀的地方。** 不要把 ?view=... 寫進範本——範本存在
 #   資料庫裡，寫死的話之後路由一改（查詢參數換成真路徑、或頁籤改名）就要

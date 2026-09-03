@@ -106,7 +106,7 @@ def update(cur, user_id: int, data: dict) -> bool:
     #   1. 刪 session —— 把人踢下線
     #   2. 清授權快取 —— 否則他立刻就能重新登入
     #
-    # （booking-king 的 /auth/login 另外用 fresh=True 跳過快取，本身
+    # （boo-king-king 的 /auth/login 另外用 fresh=True 跳過快取，本身
     # 已經擋得住這條路；這裡清快取是第二層保險，也讓其他讀快取的
     # 路徑立即反映停用。）
     #

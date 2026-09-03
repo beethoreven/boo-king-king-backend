@@ -1,4 +1,4 @@
-# booking-king-backend
+# boo-king-king-backend
 
 劇本殺預約系統後端。機房 Singapore (ap-southeast-1)，須與 Neon 資料庫同區。
 
@@ -31,7 +31,7 @@ Google OAuth 的 authorized origins 是連 port 一起比對的。
 curl -s localhost:5001/api/health
 ```
 
-前端在另一個 repo（booking-king-web），用 `python3 -m http.server 5173` 起，
+前端在另一個 repo（boo-king-king-web），用 `python3 -m http.server 5173` 起，
 直接開 <http://localhost:5173> 就好——前端偵測到跑在 localhost 上會自動打
 `http://localhost:5001`，不用帶參數。要對別的後端測就帶 `?apiBase=`，
 查詢參數永遠優先（見 `js/api.js` 的 `API_BASE`）。

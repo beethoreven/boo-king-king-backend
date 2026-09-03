@@ -12,7 +12,7 @@
 
     python3 -m db.verify_schema --seed
 
---seed 塞的資料都用 booking-king-verify 開頭的 email 標記，可以用
+--seed 塞的資料都用 boo-king-king-verify 開頭的 email 標記，可以用
 --clean 全部清掉，不會誤刪真實資料：
 
     python3 -m db.verify_schema --clean
@@ -34,7 +34,7 @@ from db.connection import pool  # noqa: E402
 from db.schema import ensure_schema  # noqa: E402
 
 # 範例資料一律用這個前綴，--clean 靠它辨識該刪哪些，不會碰到真實帳號。
-SEED_PREFIX = "booking-king-verify"
+SEED_PREFIX = "boo-king-king-verify"
 
 EXPECTED_TABLES = ["users", "mmg", "booking_record"]
 
@@ -272,7 +272,7 @@ def check_sequences(cur) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="驗證 booking-king 的資料庫 schema")
+    parser = argparse.ArgumentParser(description="驗證 boo-king-king 的資料庫 schema")
     parser.add_argument("--seed", action="store_true", help="寫入範例資料")
     parser.add_argument("--clean", action="store_true", help="清除範例資料後結束")
     args = parser.parse_args()

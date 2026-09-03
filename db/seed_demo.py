@@ -5,7 +5,7 @@
     python3 -m db.seed_demo --show   # 只顯示，不寫入
 
 這支跟 verify_schema.py 的 --seed 不同：那邊塞的是拋棄式測試資料（前綴
-booking-king-verify，--clean 會清掉），這裡放的是要留著看的示範內容。
+boo-king-king-verify，--clean 會清掉），這裡放的是要留著看的示範內容。
 兩者互不干擾。
 
 可重複執行：所有寫入都是 ON CONFLICT DO UPDATE，跑第二次只會把欄位更新
@@ -171,7 +171,7 @@ def show(cur) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="寫入 booking-king 示範資料")
+    parser = argparse.ArgumentParser(description="寫入 boo-king-king 示範資料")
     parser.add_argument("--show", action="store_true", help="只顯示現況，不寫入")
     args = parser.parse_args()
 
