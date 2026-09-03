@@ -1036,27 +1036,6 @@ def gm_dashboard(cur, gm_id: int) -> dict:
     return out
 
 
-def mark_ended(cur, booking_id: int) -> dict:
-    """人工把一筆已成立的預約標記為結束。
-
-    只能從 booked 轉過來——沒收訂金、沒經過主持人審核的場次談不上
-    「結束」，那種情況要嘛還卡在審核流程，要嘛該走 cancel_booking。
-    """
-    cur.execute(
-        "UPDATE booking_record SET status = 'ended' "
-        "WHERE id = %s AND status = 'booked' RETURNING id",
-        (booking_id,),
-    )
-    if cur.fetchone() is None:
-        cur.execute("SELECT status FROM booking_record WHERE id = %s", (booking_id,))
-        row = cur.fetchone()
-        if row is None:
-            raise BookingError(f"預約 id={booking_id} 不存在")
-        raise BookingError(f"只有已成立（booked）的預約能標記結束，目前狀態是「{row[0]}」")
-    slot_cache.clear()  # 見 create_booking 上方的說明
-    return get_booking(cur, booking_id)
-
-
 # 往回看幾天。遊戲可能跨一個夜（晚上開場、隔天早上結束），但不會跨兩個，
 # 所以兩天足以涵蓋任何一場「昨天開、今天才結束」的場次。
 ENDED_LOOKBACK_DAYS = 2

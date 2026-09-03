@@ -233,16 +233,3 @@ def update(cur, booking_id: int, data: dict) -> bool:
     return True
 
 
-def deposit_warning(deposit: int, booking_cost: int | None) -> str | None:
-    """訂金金額相對於劇本定價的警示文字，給管理員介面顯示用。
-
-    純顯示，不影響任何寫入判斷——record_deposit() 用 >= 判斷是否轉態，
-    超收一樣算足額。
-    """
-    if booking_cost is None or deposit == 0:
-        return None
-    if deposit > booking_cost:
-        return "超收訂金"
-    if deposit < booking_cost:
-        return "訂金不足額"
-    return None

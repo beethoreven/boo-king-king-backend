@@ -25,7 +25,7 @@
 
 from __future__ import annotations
 
-from auth_utils import guard
+from auth_utils import guard, sessions
 from db import bookings as bookings_db
 from db import listing
 
@@ -86,7 +86,7 @@ def run_batch(pool, *, lookback_days) -> dict:
 
 
 def run_weekly(pool) -> dict:
-    """每週一次：所有人的異常點數減 1，並把已到期的停權落地。
+    """每週一次：異常點數減 1、把已到期的停權落地、清掉過期的 session。
 
     ★ 這一支是累進停權能用的前提。點數只增不減的話，偶爾誤觸的老客人
       累積幾年必然踩到門檻被封——而那正是這個機制最不該傷到的人。
@@ -101,6 +101,8 @@ def run_weekly(pool) -> dict:
     重跑安全：多跑一次就是多減一點，不會壞掉，只是寬鬆一點。
     """
     result: dict = {}
+    errors: list[str] = []
+
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
@@ -108,7 +110,28 @@ def run_weekly(pool) -> dict:
                 conn.commit()
     except Exception as exc:  # noqa: BLE001
         result["decayed_users"] = None
-        result["errors"] = [f"decay: {exc}"]
+        errors.append(f"decay: {exc}")
+
+    # 清掉過期的 session。
+    #
+    # ★ sessions.purge_expired() 早就寫好了，但**在這之前沒有任何地方呼叫
+    #   它**（2026-09-03 全樹掃描發現）。它的 docstring 寫著「不要讓這張表
+    #   無限長大」——而那正是上線以來一直在發生的事：只增不減。
+    #   這不是清掉沒人用的程式碼，是把一個寫好卻沒接上的防護接回去。
+    #
+    # ★ 用自己的 try，不跟上面共用：兩件事互不相干，其中一支失敗不該讓
+    #   另一支也不跑。這也是 result[...] = None + errors 這個寫法的用意。
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                result["purged_sessions"] = sessions.purge_expired(cur)
+                conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        result["purged_sessions"] = None
+        errors.append(f"purge_sessions: {exc}")
+
+    if errors:
+        result["errors"] = errors
     return result
 
 

@@ -912,38 +912,6 @@ def _is_assigned_gm(booking: dict, user_id: int) -> bool:
     return user_id in (booking.get("gm_user_ids") or [])
 
 
-def _may_read_booking(booking: dict, user: dict) -> bool:
-    """誰讀得到某一筆預約。
-
-    管理員：全部。經營者要處理任何一筆，這是職務範圍。
-    主持人：自己被指定的那幾場，加上自己以玩家身分訂的。
-    玩家　：只有自己訂的。
-
-    ★ 主持人不再是「role<=2 就看得到全部」。他在畫面上本來就只看得到
-      自己的場（gm_tab 的 WHERE 已經限定），但按 id 的端點沒有跟著限，
-      等於留了一條用開發者工具改個數字就能翻別人資料的路。畫面帶不到的
-      地方，不代表到不了。
-    """
-    if user["role"] <= 1:
-        return True
-    if booking["player_id"] == user["id"]:
-        return True
-    return user["role"] <= 2 and _is_assigned_gm(booking, user["id"])
-
-
-@app.get("/api/bookings/<int:booking_id>")
-@require_auth
-def get_booking_route(booking_id: int):
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            booking = bookings_db.get_booking(cur, booking_id)
-    if booking is None:
-        return jsonify({"error": "找不到這筆預約"}), 404
-    if not _may_read_booking(booking, g.user):
-        return jsonify({"error": "只能查看自己的預約"}), 403
-    return jsonify(booking)
-
-
 @app.post("/api/bookings/<int:booking_id>/cancel")
 @require_auth
 def cancel_booking_route(booking_id: int):

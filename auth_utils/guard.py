@@ -72,9 +72,6 @@ POINTS_BY_KIND = {
     "bad_request": 2,
     "rate_limit": 1,
 }
-BAD_REQUEST_STRIKE_LIMIT = 20
-STRIKE_WINDOW_SECONDS = 600
-
 KIND_BAD_REQUEST = "bad_request"
 KIND_RATE_LIMIT = "rate_limit"
 
@@ -261,19 +258,6 @@ def clear_points(cur, user_id: int) -> None:
         "UPDATE users SET abuse_point = 0, banned_until = NULL WHERE id = %s",
         (user_id,),
     )
-
-
-def recent_bad_request_count(cur, user_id: int) -> int:
-    """這個帳號在觀察窗口內累積的壞請求次數。"""
-    cur.execute(
-        """
-        SELECT COALESCE(SUM(hits), 0) FROM abuse_log
-         WHERE user_id = %s AND kind = %s
-           AND last_at > NOW() - (%s::int * interval '1 second')
-        """,
-        (user_id, KIND_BAD_REQUEST, STRIKE_WINDOW_SECONDS),
-    )
-    return int(cur.fetchone()[0])
 
 
 def list_log(cur, *, user_id: int | None = None, start: int = 1, limit: int = 50) -> dict:

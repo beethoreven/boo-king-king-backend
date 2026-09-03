@@ -152,22 +152,6 @@ def is_permitted_user(cur, email: str, *, fresh: bool = False) -> bool:
     return bool(user and user["status"] == "active")
 
 
-def is_admin_user(cur, email: str) -> bool:
-    """role 1 是管理員。"""
-    user = get_user(cur, email)
-    return bool(user and user["status"] == "active" and user["role"] == 1)
-
-
-def has_role(cur, email: str, required: int) -> bool:
-    """權限是階層：數字越小權限越高，1 管理員 ⊃ 2 主持人 ⊃ 3 一般玩家。
-
-    所以判斷一律寫成 `role <= required`，不要寫 `role == required`——
-    後者會把管理員擋在主持人專用的功能外面。
-    """
-    user = get_user(cur, email)
-    return bool(user and user["status"] == "active" and user["role"] <= required)
-
-
 def invalidate(email: str | None = None) -> None:
     """清掉快取。改動使用者權限後呼叫，讓變更立即生效而不用等 TTL。"""
     with _cache_lock:
