@@ -167,26 +167,46 @@ class _StripVariant:
 app.wsgi_app = _StripVariant(app.wsgi_app)
 
 
+# 唯一不需要前綴的路徑，而且是**永久**的例外，不是過渡措施。
+#
+# /api/health 刻意不碰資料庫、不回任何店家資料——沒有一個欄位是 variant
+# 能區分的，所以「打錯服務」這件事在這支上不存在，斷言沒有東西可以保護。
+#
+# ★ 真正的理由是它的呼叫者不歸我們管：Render 自己的健康檢查、外部的監控
+#   服務都可能打這一支，而那些地方不會帶前綴。把它一起擋掉的話，故障會是
+#   「服務被判定為不健康而反覆重啟」——跟店家隔離完全無關，卻很難聯想到
+#   是這個斷言造成的。
+_NO_PREFIX_OK = {"/api/health"}
+
+
 @app.before_request
 def _assert_variant():
-    """帶了前綴就必須對得上；沒帶前綴的舊路徑暫時放行。
+    """每個請求都要帶對的部署識別前綴。
 
-    ★ 過渡期設定，做完就要收掉。cron-job.org 上那三支排程目前打的是舊路徑
-      （/api/health、/api/jobs/daily、/api/jobs/weekly），在前綴上線與排程
-      改設定之間有一段空窗。這時候若拒絕舊路徑，每日排程會**安靜地停掉**
-      ——排程失敗沒有人會通知你，要等到發現過期場次沒被整理才察覺。
+    兩種拒絕：**沒帶前綴**（多半是設定漏改）與**帶錯前綴**（打到別家店的
+    服務）。兩者都回 404 並說清楚正確的網址長什麼樣——這支斷言存在的意義
+    就是把設定錯誤變成看得見的失敗，訊息含糊就等於沒做。
 
-      排程改好、確認跑過一輪之後，把下面 `got is None` 那個分支改成一律
-      拒絕，斷言才算真的生效。
+    ★ 這裡**不是**用來決定連哪個資料庫。variant 從環境變數來，這個 process
+      手上只有一組 DATABASE_URL，連不到別家店的資料庫。這裡擋的是「前端網址
+      填錯」，不是隔離。
     """
     got = request.environ.get("boo_king_king.variant")
+
     if got is None:
-        return None  # 過渡期：不帶前綴的舊路徑仍然放行
+        if request.path in _NO_PREFIX_OK:
+            return None
+        return jsonify({
+            "error": "缺少部署識別前綴",
+            "detail": f"正確的網址是 /v/{VARIANT}{request.path}",
+        }), 404
+
     if got != VARIANT:
         return jsonify({
             "error": "打錯服務了",
             "detail": f"這個服務是 {VARIANT}，收到的前綴是 {got or '(空的)'}",
         }), 404
+
     return None
 
 
