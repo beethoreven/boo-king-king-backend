@@ -32,11 +32,34 @@ def _now_taipei() -> str:
 #   資料卻沒變。ready/reset/room_id 就是這樣漏過一次。
 EDITABLE = (
     "name", "url", "period", "ready_time_cost", "reset_time_cost",
-    "price", "booking_cost", "players",
+    "price", "price_holiday", "booking_cost", "booking_cost_holiday", "players",
     "waitlist_limit", "status", "room_id",
     # 上下架日期。排期判斷的第 0 層，絕對外框——見 db/schedule.py。
     "start_booking", "end_booking",
 )
+
+# 售價與訂金，平日／假日各一。畫面上的欄位名，錯誤訊息用。
+MONEY_LABEL = {
+    "price": "售價（平日）", "price_holiday": "售價（假日）",
+    "booking_cost": "訂金（平日）", "booking_cost_holiday": "訂金（假日）",
+}
+
+
+def _money(data: dict, key: str) -> int | None:
+    """取出一個金額：空（沒設定）或 0 以上的整數。
+
+    ★ 空與 0 是兩件事：0 是「免訂金」，空是「沒設定」——訂金空著的日子
+      類型不能開放（見 db/bookings.py 的 check_deposit_coverage）。所以
+      這裡不能把空字串之類的東西順手轉成 0。
+    """
+    value = data.get(key)
+    if value is None:
+        return None
+    # bool 是 int 的子類別，JSON 的 true 會混進來變成 1。
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise BookingError(f"{MONEY_LABEL[key]}必須是 0 以上的整數，或留空")
+    return value
+
 
 # preparing＝尚未上架。玩家的清單只列上架中的，preparing 與 inactive
 # 都看不到（見 db/listing.py）。上架時刻到了會自動轉成 active，
@@ -47,7 +70,8 @@ SELECTABLE_STATUSES = ("preparing", "active", "inactive")
 def _row_to_dict(row) -> dict:
     (mid, name, url, period, ready, reset, price, cost, players, wl, status, room_id,
      start_booking, end_booking,
-     n1, u1, n2, u2, n3, u3, n4, u4) = row
+     n1, u1, n2, u2, n3, u3, n4, u4,
+     price_holiday, cost_holiday) = row
     return {
         "id": mid,
         "name": name,
@@ -60,8 +84,11 @@ def _row_to_dict(row) -> dict:
         # 衝突判定比的是這個，不是 period 本身。
         "ready_time_cost": float(ready) if ready is not None else 0.0,
         "reset_time_cost": float(reset) if reset is not None else 0.0,
+        # 沒有後綴的是平日。兩個一樣時畫面只顯示一個。
         "price": price,
+        "price_holiday": price_holiday,
         "booking_cost": cost,
+        "booking_cost_holiday": cost_holiday,
         "players": players,
         "waitlist_limit": wl,
         "status": status,
@@ -91,7 +118,9 @@ _COLUMNS = (
     "id, name, url, period, ready_time_cost, reset_time_cost, "
     "price, booking_cost, players, waitlist_limit, status, room_id, "
     "start_booking, end_booking, "
-    "gm1_name, gm1_user, gm2_name, gm2_user, gm3_name, gm3_user, gm4_name, gm4_user"
+    "gm1_name, gm1_user, gm2_name, gm2_user, gm3_name, gm3_user, gm4_name, gm4_user, "
+    # 假日的兩個接在最後，不動既有欄位的位置。
+    "price_holiday, booking_cost_holiday"
 )
 
 
@@ -233,8 +262,19 @@ def update(cur, mmg_id: int, data: dict) -> bool:
         "period": data.get("period"),
         "ready_time_cost": data.get("ready_time_cost"),
         "reset_time_cost": data.get("reset_time_cost"),
-        "price": data.get("price"),
-        "booking_cost": data.get("booking_cost"),
+        "price": _money(data, "price"),
+        "booking_cost": _money(data, "booking_cost"),
+        # ★ 假日的兩個「沒送」就保留現值，不是清空。還沒更新的舊前端不知道
+        #   有這兩欄，照 data.get() 寫的話它每存一次檔就把假日金額清掉——
+        #   而清掉之後，有開週末的劇本會被 check_deposit_coverage 擋下，
+        #   舊前端卻沒有欄位可以補，等於那段期間劇本完全存不了。
+        #   跟 app.py 的 _save_schedule「沒有 schedule 這個鍵就不動排期」
+        #   是同一個理由。
+        "price_holiday": (_money(data, "price_holiday")
+                          if "price_holiday" in data else current["price_holiday"]),
+        "booking_cost_holiday": (_money(data, "booking_cost_holiday")
+                                 if "booking_cost_holiday" in data
+                                 else current["booking_cost_holiday"]),
         "players": data.get("players"),
         "waitlist_limit": data.get("waitlist_limit"),
         "status": data["status"],
@@ -280,7 +320,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
         """
         UPDATE mmg SET
             name = %s, url = %s, period = %s, ready_time_cost = %s, reset_time_cost = %s,
-            price = %s, booking_cost = %s,
+            price = %s, price_holiday = %s, booking_cost = %s, booking_cost_holiday = %s,
             players = %s, waitlist_limit = %s, status = %s, room_id = %s,
             start_booking = %s, end_booking = %s,
             gm1_name = %s, gm1_user = %s,
@@ -292,7 +332,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
         (
             new["name"], new["url"], new["period"],
             new["ready_time_cost"], new["reset_time_cost"],
-            new["price"], new["booking_cost"],
+            new["price"], new["price_holiday"], new["booking_cost"], new["booking_cost_holiday"],
             new["players"], new["waitlist_limit"], new["status"], new["room_id"],
             new["start_booking"], new["end_booking"],
             names[0], user_ids[0],
@@ -319,24 +359,33 @@ def create(cur, data: dict) -> int:
     end = (data.get("end_booking") or "").strip() or None
     _validate_listing(start, end)
 
+    price, cost = _money(data, "price"), _money(data, "booking_cost")
+    # 假日的兩個沒送（呼叫端不知道有這兩欄）就跟平日一樣——跟既有劇本遷移
+    # 時的回填同一個意思：只有一種價錢的店家，兩欄本來就該相同。
+    # 有送、而且是空的，就是真的空（「只填其中一個」是合法的）。
+    price_holiday = _money(data, "price_holiday") if "price_holiday" in data else price
+    cost_holiday = (_money(data, "booking_cost_holiday")
+                    if "booking_cost_holiday" in data else cost)
+
     cur.execute(
         """
         INSERT INTO mmg
             (name, url, period, ready_time_cost, reset_time_cost,
-             price, booking_cost, players, waitlist_limit, status, room_id,
+             price, price_holiday, booking_cost, booking_cost_holiday,
+             players, waitlist_limit, status, room_id,
              start_booking, end_booking,
              gm1_name, gm1_user, gm2_name, gm2_user,
              gm3_name, gm3_user, gm4_name, gm4_user)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
             data["name"].strip(), (data.get("url") or "").strip() or None,
             data.get("period"),
             data.get("ready_time_cost", 0.5), data.get("reset_time_cost", 0.5),
-            data.get("price"),
-            data.get("booking_cost"), data.get("players"),
+            price, price_holiday, cost, cost_holiday,
+            data.get("players"),
             data.get("waitlist_limit", 3), data.get("status", "active"),
             data.get("room_id") or 1,
             start, end,

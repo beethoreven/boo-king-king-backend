@@ -71,13 +71,16 @@ def seed(cur) -> None:
 
     cur.execute(
         """
-        INSERT INTO mmg (id, name, period, price, booking_cost, players,
+        INSERT INTO mmg (id, name, period, price, price_holiday,
+                         booking_cost, booking_cost_holiday, players,
                          gm1_name, gm2_name, gm3_name, gm4_name,
                          gm1_user, gm2_user, gm3_user, gm4_user, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (id) DO UPDATE
             SET name = EXCLUDED.name, period = EXCLUDED.period,
-                price = EXCLUDED.price, booking_cost = EXCLUDED.booking_cost,
+                price = EXCLUDED.price, price_holiday = EXCLUDED.price_holiday,
+                booking_cost = EXCLUDED.booking_cost,
+                booking_cost_holiday = EXCLUDED.booking_cost_holiday,
                 players = EXCLUDED.players,
                 gm1_name = EXCLUDED.gm1_name, gm2_name = EXCLUDED.gm2_name,
                 gm3_name = EXCLUDED.gm3_name, gm4_name = EXCLUDED.gm4_name,
@@ -86,8 +89,9 @@ def seed(cur) -> None:
                 status = EXCLUDED.status
         """,
         (
-            MMG["id"], MMG["name"], MMG["period"], MMG["price"],
-            MMG["booking_cost"], MMG["players"],
+            # 示範劇本只有一種價錢：假日沿用平日的值。
+            MMG["id"], MMG["name"], MMG["period"], MMG["price"], MMG["price"],
+            MMG["booking_cost"], MMG["booking_cost"], MMG["players"],
             *MMG["gm_names"],
             *MMG["gm_users"],
             MMG["status"],

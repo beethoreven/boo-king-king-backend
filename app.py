@@ -1428,6 +1428,10 @@ def admin_list_mmg():
 def admin_update_mmg(cur, body, mmg_id: int):
     changed = mmg_admin.update(cur, mmg_id, body)
     changed = _save_schedule(cur, mmg_id, body) or changed
+    # ★ 一定排在兩個寫入都做完之後：價格與排期是同一次存檔，要看的是
+    #   合併後的結果（理由見 check_deposit_coverage）。擋下來的話
+    #   _admin_write 會把整個交易 rollback，兩邊都不會寫進去。
+    bookings_db.check_deposit_coverage(cur, mmg_id)
     return jsonify({"changed": changed, "item": _mmg_with_schedule(cur, mmg_id)})
 
 
@@ -1437,6 +1441,7 @@ def admin_update_mmg(cur, body, mmg_id: int):
 def admin_create_mmg(cur, body):
     new_id = mmg_admin.create(cur, body)
     _save_schedule(cur, new_id, body)
+    bookings_db.check_deposit_coverage(cur, new_id)  # 同上
     return jsonify(_mmg_with_schedule(cur, new_id)), 201
 
 

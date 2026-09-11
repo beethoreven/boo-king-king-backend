@@ -136,13 +136,14 @@ def seed(cur) -> None:
     # 角色 1 有兩位主持人可選、角色 2 只有一位、角色 3/4 這個劇本沒有。
     cur.execute(
         """
-        INSERT INTO mmg (name, period, price, booking_cost, players,
+        INSERT INTO mmg (name, period, price, price_holiday, booking_cost,
+                         booking_cost_holiday, players,
                          gm1_name, gm2_name, gm1_user, gm2_user, waitlist_limit)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
-            f"{SEED_PREFIX} 範例劇本", 3.5, 1200, 300, "6-8 人",
+            f"{SEED_PREFIX} 範例劇本", 3.5, 1200, 1200, 300, 300, "6-8 人",
             "主控", "NPC",
             [user_ids["gm-alice"], user_ids["gm-bob"]],
             [user_ids["gm-alice"]],
@@ -158,9 +159,10 @@ def seed(cur) -> None:
         cur.execute(
             """
             INSERT INTO booking_record
-                (mmg_id, player_id, session_date, session_time, deposit,
+                (mmg_id, player_id, session_date, session_time, day_type, deposit,
                  gm1_user_id, gm2_user_id, request_id)
-            VALUES (%s, %s, DATE '2026-09-05', TIME '14:00', 300, %s, %s, gen_random_uuid())
+            VALUES (%s, %s, DATE '2026-09-05', TIME '14:00', 'holiday', 300, %s, %s,
+                    gen_random_uuid())
             """,
             (mmg_id, user_ids[label], user_ids["gm-alice"], user_ids["gm-alice"]),
         )

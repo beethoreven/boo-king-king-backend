@@ -471,9 +471,21 @@ def _ensure_mmg(cur) -> None:
             ready_time_cost NUMERIC(3, 1) NOT NULL DEFAULT 0.5,
             reset_time_cost NUMERIC(3, 1) NOT NULL DEFAULT 0.5,
 
-            -- 金額與訂金，都是整數（新台幣元，不處理角）
+            -- 金額與訂金，都是整數（新台幣元，不處理角）。
+            --
+            -- 平日／假日各一組（2026-09-12 加）。沒有後綴的那兩個是平日——
+            -- 欄位名沿用舊的，理由同 waitlist_limit：它們是資料庫識別碼，
+            -- 改名要遷移每一個讀它的地方，而使用者看不到欄位名。
+            --
+            -- 四個都可以留空：「只填其中一個」是合法的，那家店就只有一種價錢。
+            -- ★ 但訂金有功能後果（record_deposit 拿它比較），所以「有開放的
+            --   日子類型就必須有對應的訂金」由存檔時的檢查負責（見
+            --   db/bookings.py 的 check_deposit_coverage）。空與 0 不同：
+            --   0 是「這齣免訂金」，空是「沒設定」。售價純顯示，不在檢查範圍內。
             price INTEGER,
+            price_holiday INTEGER,
             booking_cost INTEGER,
+            booking_cost_holiday INTEGER,
 
             -- 遊戲人數。純顯示用字串，因為可能是「6-8 人」這種浮動描述，
             -- 不要改成數字型別——它不參與任何計算或比對。
@@ -553,6 +565,16 @@ def _ensure_mmg(cur) -> None:
     # 順序的語法，只能重建整張表。要讓現有資料庫也變成相鄰排列，
     # 跑一次 db/migrate_reorder_mms.py。
     existing = _existing_columns(cur, "mmg")
+    # 假日售價／假日訂金（2026-09-12）。既有的劇本假日一律沿用平日的值——
+    # 兩個數字相同時畫面只顯示一個，所以既有店家的畫面完全不變。
+    #
+    # ★ 回填只在「欄位剛建出來」那一次跑。ensure_schema 每次開機都會執行，
+    #   寫成每次都 UPDATE 的話，管理員之後把假日價改成跟平日不同，下一次
+    #   部署就會被默默改回去——而且不會有任何錯誤讓人發現。
+    for col, src in (("price_holiday", "price"), ("booking_cost_holiday", "booking_cost")):
+        if col not in existing:
+            cur.execute(f"ALTER TABLE mmg ADD COLUMN {col} INTEGER")
+            cur.execute(f"UPDATE mmg SET {col} = {src}")
     for col in ("ready_time_cost", "reset_time_cost"):
         if col not in existing:
             # 既有資料一律 0.5 小時。DEFAULT 會把現有的列一起填上，
@@ -801,9 +823,19 @@ def _ensure_booking_record(cur) -> None:
             session_date DATE NOT NULL,
             session_time TIME NOT NULL,
 
+            -- 平日場或假日場，決定這一筆比對哪一個訂金（2026-09-12 加）。
+            -- 建立時依日期推（週六日＝假日），之後管理員可以手動改——那是
+            -- 處理國定假日、補班日的方式；系統只認得週六日，其他它無從得知。
+            --
+            -- ★ 刻意沒有預設值。預設成 'weekday' 的話，任何忘了寫這一欄的
+            --   INSERT 會把週六的場次默默標成平日，比對到錯的訂金，而且不會
+            --   有任何錯誤。沒有預設值，漏寫就是 NOT NULL 當場失敗。
+            day_type TEXT NOT NULL CHECK (day_type IN ('weekday', 'holiday')),
+
             status TEXT NOT NULL DEFAULT 'gm_confirm',
 
-            -- 實際支付的訂金金額。與 mmg.booking_cost 分開存，因為後者是
+            -- 實際支付的訂金金額。與劇本的訂金（mmg.booking_cost／
+            -- booking_cost_holiday，依 day_type 取一個）分開存，因為後者是
             -- 「目前的定價」，會隨時間調整；這裡要的是「這筆預約當下收了多少」，
             -- 事後查帳不能被之後的改價影響。
             deposit INTEGER NOT NULL DEFAULT 0,
@@ -882,3 +914,25 @@ def _ensure_booking_record(cur) -> None:
                 f"ALTER TABLE booking_record ADD COLUMN gm{n}_confirmed "
                 f"BOOLEAN NOT NULL DEFAULT false"
             )
+    # 場次類型（2026-09-12）。分四步而不是一句 ADD COLUMN ... DEFAULT：
+    # 這一欄刻意沒有預設值（理由見上方 CREATE TABLE），而既有的列需要依
+    # 日期各自填值，所以先建可空的欄位 → 依日期回填 → 再上 NOT NULL 與 CHECK。
+    #
+    # EXTRACT(DOW) 是 0=週日 … 6=週六，跟這個專案的 weekday 慣例一致。
+    #
+    # ★ 同樣只在欄位剛建出來那一次跑。回填若每次開機都執行，管理員手動改過
+    #   的場次類型（把補班的週六改成平日場）會在下次部署時被改回去。
+    if "day_type" not in existing:
+        cur.execute("ALTER TABLE booking_record ADD COLUMN day_type TEXT")
+        cur.execute(
+            "UPDATE booking_record SET day_type = CASE "
+            "WHEN EXTRACT(DOW FROM session_date) IN (0, 6) THEN 'holiday' "
+            "ELSE 'weekday' END"
+        )
+        cur.execute("ALTER TABLE booking_record ALTER COLUMN day_type SET NOT NULL")
+        # 名稱跟 CREATE TABLE 行內 CHECK 自動取的名字一致，兩條路徑建出來的
+        # 資料庫長得一樣。
+        cur.execute(
+            "ALTER TABLE booking_record ADD CONSTRAINT booking_record_day_type_check "
+            "CHECK (day_type IN ('weekday', 'holiday'))"
+        )

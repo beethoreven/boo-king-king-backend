@@ -12,14 +12,19 @@
 from __future__ import annotations
 
 from db.bookings import (
+    AWAITING_DEPOSIT,
+    DAY_TYPES,
+    DUE_SQL,
     PAGE_SIZE,
     TAB_LABEL,
     VALID_STATUSES,
     BookingError,
     create_booking,
+    default_day_type,
     filter_clauses,
     paged,
     record_deposit,
+    require_deposit_set,
 )
 
 # 子頁籤 = status，順序即畫面上的順序（跟著流程走）。
@@ -57,16 +62,19 @@ def list_tab(cur, tab: str, *, start: int = 1, filters: dict | None = None) -> d
             "gm_user_ids": list(r[11:15]),
             "gm_confirmed": list(r[15:19]),
             "gm_names": list(r[19:23]),
+            "day_type": r[23],
         }
 
+    # booking_cost 是這一筆該收的訂金，依場次類型取——見 DUE_SQL。
     return paged(
         cur,
         f"""
         SELECT b.id, b.mmg_id, m.name, m.url, b.player_id, u.name,
-               b.session_date, b.session_time, b.deposit, m.booking_cost, b.note,
+               b.session_date, b.session_time, b.deposit, {DUE_SQL}, b.note,
                b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id,
                b.gm1_confirmed, b.gm2_confirmed, b.gm3_confirmed, b.gm4_confirmed,
-               m.gm1_name, m.gm2_name, m.gm3_name, m.gm4_name
+               m.gm1_name, m.gm2_name, m.gm3_name, m.gm4_name,
+               b.day_type
           FROM booking_record b
           JOIN mmg m   ON m.id = b.mmg_id
           JOIN users u ON u.id = b.player_id
@@ -118,6 +126,10 @@ def create(cur, data: dict) -> int:
         # 場次管理新增不受排期限制：可以補登過去的場次、開不在常態內的場。
         # 只放掉排期這一道，容量與撞期照樣擋（見上方 docstring 的理由）。
         allow_closed_slot=True,
+        # 管理員可能當場就指定場次類型（國定假日的週三）。沒指定就依日期推。
+        # 在建立時就寫對，而不是先寫預設值、再靠下面的 update() 改——
+        # 應收訂金的檢查在建立那一刻就要看對的類型。
+        day_type=data.get("day_type") or None,
     )
     # 狀態預設是 gm_confirm；管理員若指定了別的（或勾了確認），補一次更新。
     update(cur, result.id, data)
@@ -127,19 +139,24 @@ def create(cur, data: dict) -> int:
 def update(cur, booking_id: int, data: dict) -> bool:
     """編輯一筆場次。回傳是否真的改到任何欄位。
 
-    可編輯：劇本、預定者、日期、時間、狀態、訂金、備註，以及各角色的
-    主持人與「是否已確認」。
+    可編輯：劇本、預定者、日期、時間、場次類型、狀態、訂金、備註，以及
+    各角色的主持人與「是否已確認」。
 
     訂金沿用 record_deposit() 的自動轉態（gm_reviewed + 金額足額 →
     booked），但**手動指定的狀態優先**：管理員在這個畫面同時改了狀態和
     訂金時，以他選的狀態為準。理由是這個介面存在的目的就是人工介入，
     自動規則不該覆蓋掉管理員的明確意圖。
+
+    場次類型改了不會回頭動狀態：已成立的場次改成假日場、應收變多了，
+    也不會退回待收訂金——那會讓一筆玩家已經收到「預約成立」的場次突然
+    變回未成立。差額由畫面上的「訂金不足額／超收訂金」提示管理員處理。
     """
     cur.execute(
         """
         SELECT mmg_id, player_id, session_date, session_time, status, deposit, note,
                gm1_user_id, gm2_user_id, gm3_user_id, gm4_user_id,
-               gm1_confirmed, gm2_confirmed, gm3_confirmed, gm4_confirmed
+               gm1_confirmed, gm2_confirmed, gm3_confirmed, gm4_confirmed,
+               day_type
           FROM booking_record WHERE id = %s
         """,
         (booking_id,),
@@ -153,6 +170,7 @@ def update(cur, booking_id: int, data: dict) -> bool:
         "session_date": row[2], "session_time": row[3],
         "status": row[4], "deposit": row[5], "note": row[6],
         "gm_user_ids": list(row[7:11]), "gm_confirmed": list(row[11:15]),
+        "day_type": row[15],
     }
 
     status = data.get("status")
@@ -174,14 +192,38 @@ def update(cur, booking_id: int, data: dict) -> bool:
         "note": (data.get("note") or "").strip() or None,
         "gm_user_ids": list(gm_user_ids), "gm_confirmed": gm_confirmed,
     }
+
+    # 場次類型。有送就用送來的；沒送（還沒更新的舊前端）就看日期有沒有動：
+    # 沒動就保留現值——那可能是管理員先前手動改過的，例如國定假日的週三；
+    # 動了就依新日期重推，不讓一筆改到週三的場次還掛著週六推出來的假日場。
+    # 空字串跟沒送同一件事：新增場次的表單在還沒選日期之前送的就是空的。
+    day_type = data.get("day_type") or None
+    if day_type is None:
+        moved = new["session_date"] not in (None, current["session_date"])
+        day_type = default_day_type(new["session_date"]) if moved else current["day_type"]
+    elif day_type not in DAY_TYPES:
+        raise BookingError(f"未知的場次類型「{day_type}」")
+    new["day_type"] = day_type
+
     if all(new[k] == current[k] for k in current):
         return False
+
+    # 劇本、場次類型、狀態，這三樣決定「這一筆還要不要收訂金、收多少」。
+    # 任何一樣改了、而且改完之後這筆還在等訂金，那個金額就必須有設定——
+    # 否則之後收訂金時 record_deposit 找不到金額可比。
+    #
+    # 三樣都沒動就不查：這筆本來就在等同一個金額，查了也只會擋下跟這次
+    # 修改無關的存檔（例如只是改備註）。
+    if new["status"] in AWAITING_DEPOSIT and any(
+        new[k] != current[k] for k in ("mmg_id", "day_type", "status")
+    ):
+        require_deposit_set(cur, new["mmg_id"], new["day_type"], creating=False)
 
     cur.execute(
         """
         UPDATE booking_record SET
             mmg_id = %s, player_id = %s, session_date = %s, session_time = %s,
-            status = %s, deposit = %s, note = %s,
+            day_type = %s, status = %s, deposit = %s, note = %s,
             gm1_user_id = %s, gm1_confirmed = %s,
             gm2_user_id = %s, gm2_confirmed = %s,
             gm3_user_id = %s, gm3_confirmed = %s,
@@ -190,7 +232,7 @@ def update(cur, booking_id: int, data: dict) -> bool:
         """,
         (
             new["mmg_id"], new["player_id"], new["session_date"], new["session_time"],
-            new["status"], new["deposit"], new["note"],
+            new["day_type"], new["status"], new["deposit"], new["note"],
             new["gm_user_ids"][0], new["gm_confirmed"][0],
             new["gm_user_ids"][1], new["gm_confirmed"][1],
             new["gm_user_ids"][2], new["gm_confirmed"][2],

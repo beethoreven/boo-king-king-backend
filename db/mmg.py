@@ -12,7 +12,7 @@ def _row_to_dict(cur, row) -> dict:
     這個角色，那一組就不會出現在回傳的 gm_slots 裡。
     """
     (mid, name, url, period, price, cost, players, wl, status,
-     n1, u1, n2, u2, n3, u3, n4, u4) = row
+     n1, u1, n2, u2, n3, u3, n4, u4, price_holiday, cost_holiday) = row
 
     slots = []
     for idx, (gname, guids) in enumerate(((n1, u1), (n2, u2), (n3, u3), (n4, u4)), start=1):
@@ -37,8 +37,12 @@ def _row_to_dict(cur, row) -> dict:
         # NUMERIC 在 psycopg 是 Decimal，JSON 序列化不了，轉成 float。
         # 時長只有小數點後一位，float 的精度綽綽有餘。
         "period": float(period) if period is not None else None,
+        # 沒有後綴的是平日。兩個一樣時畫面只顯示一個；只填一個就只顯示
+        # 那一個（前端 ui.js 的 dualPrice）。
         "price": price,
+        "price_holiday": price_holiday,
         "booking_cost": cost,
+        "booking_cost_holiday": cost_holiday,
         "players": players,
         "waitlist_limit": wl,
         "status": status,
@@ -48,7 +52,8 @@ def _row_to_dict(cur, row) -> dict:
 
 _COLUMNS = (
     "id, name, url, period, price, booking_cost, players, waitlist_limit, status, "
-    "gm1_name, gm1_user, gm2_name, gm2_user, gm3_name, gm3_user, gm4_name, gm4_user"
+    "gm1_name, gm1_user, gm2_name, gm2_user, gm3_name, gm3_user, gm4_name, gm4_user, "
+    "price_holiday, booking_cost_holiday"
 )
 
 

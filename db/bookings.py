@@ -40,6 +40,134 @@ class BookingResult:
         return f"第 {self.position} 序位"
 
 
+# ── 平日場／假日場 ──────────────────────────────────────────────
+#
+# 每一筆預約記著自己是平日場還是假日場（booking_record.day_type），那決定
+# 它比對劇本的哪一個訂金。建立時依日期推，之後管理員可以在場次管理手動
+# 改——國定假日、補班日只有店家自己知道，系統只認得週六日。
+
+DAY_TYPES = ("weekday", "holiday")
+DAY_TYPE_LABEL = {"weekday": "平日", "holiday": "假日"}
+
+# 一筆預約「該收多少訂金」。用在查詢裡，需要 booking_record 別名 b、
+# mmg 別名 m。
+#
+# ★ 一筆預約的應收訂金一律從這裡取，不要直接讀 m.booking_cost——那個欄位
+#   現在只是「平日訂金」。直接讀的話假日場會比對到平日的金額，而兩個金額
+#   剛好一樣的店家（步經徑遷移後就是這樣）永遠看不出來寫錯了。
+DUE_SQL = (
+    "CASE WHEN b.day_type = 'holiday' "
+    "THEN m.booking_cost_holiday ELSE m.booking_cost END"
+)
+
+# 還會走到 record_deposit 那道比對的狀態。這兩個狀態的預約，應收訂金
+# 一定要有值——見 check_deposit_coverage。
+AWAITING_DEPOSIT = ("gm_confirm", "gm_reviewed")
+
+
+def default_day_type(session_date) -> str:
+    """依日期推場次類型：週六日是假日場，其餘是平日場。
+
+    schema.py 回填既有資料、前端場次管理換日期時帶的預設值，都是這條規則。
+    """
+    return "holiday" if session_date.isoweekday() % 7 in (0, 6) else "weekday"
+
+
+def require_deposit_set(cur, mmg_id: int, day_type: str, *, creating: bool) -> None:
+    """這齣戲在這個場次類型有設定訂金；沒有就擋下。
+
+    0 算有設定（這齣免訂金），空才是沒設定——空的話 record_deposit 拿
+    NULL 去比，這筆預約會永遠停在待收訂金，而且不會有任何錯誤。
+
+    creating 只影響訊息：建立時講「不能建立」；編輯時擋下的原因可能是
+    改了劇本、改了類型、或把狀態改回待收訂金，講「不能建立」會看不懂。
+    """
+    cur.execute(
+        "SELECT name, CASE WHEN %s = 'holiday' THEN booking_cost_holiday "
+        "ELSE booking_cost END FROM mmg WHERE id = %s",
+        (day_type, mmg_id),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise BookingError(f"劇本 id={mmg_id} 不存在")
+    name, due = row
+    if due is None:
+        label = DAY_TYPE_LABEL[day_type]
+        if creating:
+            raise BookingError(f"《{name}》還沒有設定{label}訂金，不能建立{label}場")
+        raise BookingError(
+            f"《{name}》還沒有設定{label}訂金，這筆{label}場之後收訂金時會沒有金額可以比對。"
+            f"請先到劇本管理補上（不收訂金請填 0）"
+        )
+
+
+def check_deposit_coverage(cur, mmg_id: int) -> None:
+    """劇本存檔的最後一道：有哪一種日子會產生預約，就必須有那一種訂金。
+
+    「會產生預約」指三件事，任何一件成立就算：
+      - 每週固定開放的星期（週六日 → 假日，其餘 → 平日）
+      - 今天以後的特例開放日（依那天是星期幾）
+      - 還在等訂金的既有預約（依它自己的場次類型——可能被手動改過）
+
+    ★ 第三件不能省。一齣戲把週末關掉、再把假日訂金清空，前兩件都不成立，
+      但先前訂下的週六場還在等訂金；讓它存下去，那幾筆之後收訂金時就沒有
+      金額可比。
+
+    跑在「劇本欄位與排期都寫完之後」、同一個交易裡：價格與排期是同一次
+    存檔送出來的，只看其中一邊，「同時打開週末＋填上假日訂金」這種合法
+    的改法會被舊值誤擋。
+    """
+    cur.execute(
+        "SELECT name, booking_cost, booking_cost_holiday, "
+        "(NOW() AT TIME ZONE 'Asia/Taipei')::date FROM mmg WHERE id = %s",
+        (mmg_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise BookingError(f"劇本 id={mmg_id} 不存在")
+    name, cost, cost_holiday, today = row
+    missing = [t for t, v in (("weekday", cost), ("holiday", cost_holiday)) if v is None]
+    if not missing:
+        return
+
+    cur.execute("SELECT weekday FROM mmg_weekly_slot WHERE mmg_id = %s", (mmg_id,))
+    weekly = {r[0] for r in cur.fetchall()}
+    cur.execute(
+        "SELECT exception_date FROM mmg_schedule_exception "
+        "WHERE mmg_id = %s AND is_open AND exception_date >= %s ORDER BY exception_date",
+        (mmg_id, today),
+    )
+    open_days = [r[0] for r in cur.fetchall()]
+    cur.execute(
+        "SELECT day_type, COUNT(*) FROM booking_record "
+        "WHERE mmg_id = %s AND status = ANY(%s) GROUP BY day_type",
+        (mmg_id, list(AWAITING_DEPOSIT)),
+    )
+    pending = dict(cur.fetchall())
+
+    problems = []
+    for day_type in missing:
+        label = DAY_TYPE_LABEL[day_type]
+        holiday = day_type == "holiday"
+        reasons = []
+        # 週一排到週日，週六日排在最後——講「週六、週日」比「週日、週六」順。
+        weekdays = sorted((w for w in weekly if (w in (0, 6)) == holiday),
+                          key=lambda w: (w + 6) % 7)
+        if weekdays:
+            reasons.append("每週" + "、".join(f"週{'日一二三四五六'[w]}" for w in weekdays)
+                           + "有開放時段")
+        dates = [d for d in open_days if default_day_type(d) == day_type]
+        if dates:
+            shown = "、".join(f"{d.month}/{d.day}" for d in dates[:3])
+            reasons.append(f"{shown}{'等日' if len(dates) > 3 else ''}有特別開放")
+        if pending.get(day_type):
+            reasons.append(f"還有 {pending[day_type]} 筆{label}場在等待收訂金")
+        if reasons:
+            problems.append(f"{'，'.join(reasons)}，必須設定{label}訂金")
+    if problems:
+        raise BookingError(f"《{name}》" + "；".join(problems) + "（不收訂金請填 0）")
+
+
 def _lock_slot(cur, mmg_id: int, session_date, session_time) -> None:
     """鎖住這個時段，直到交易結束。
 
@@ -348,10 +476,14 @@ def create_booking(
     note: str | None = None,
     detailed_conflict: bool = False,
     allow_closed_slot: bool = False,
+    day_type: str | None = None,
 ) -> BookingResult:
     """建立一筆預約，回傳它的順位。
 
     gm_user_ids 是四個位置的主持人 user id，沒有的角色放 None。
+
+    day_type 不給就依日期推（週六日＝假日場）。玩家那條路一律不給；只有
+    場次管理新增時，管理員可能當場就指定（例如國定假日的週三）。
 
     request_id 是冪等鍵，應該由前端在玩家「按下預約」當下產生，該次意圖的
     所有重試都沿用同一組。這裡允許不給（自動產生一組），只是為了讓腳本與
@@ -398,6 +530,16 @@ def create_booking(
             raise BookingError("這個時段已經過了，請重新選擇")
         if not schedule.is_open(cur, mmg_id, session_date, session_time):
             raise BookingError("此時間未開放")
+
+    day_type = day_type or default_day_type(session_date)
+    if day_type not in DAY_TYPES:
+        raise BookingError(f"未知的場次類型「{day_type}」")
+    # 玩家那條路其實走不到這裡會失敗的情況：劇本存檔時已經確認過「開放的
+    # 日子都有訂金」（check_deposit_coverage）。會擋到的是場次管理新增——
+    # 那條路不問排期，可以開在劇本根本沒開放的日子上。不在這裡擋的話，
+    # 這筆會帶著一個不存在的應收金額進入待收訂金，而且之後連劇本都存不了
+    # （coverage 會因為它而失敗）。
+    require_deposit_set(cur, mmg_id, day_type, creating=True)
 
     _lock_slot(cur, mmg_id, session_date, session_time)
     _lock_gms(cur, gm_ids)
@@ -448,13 +590,14 @@ def create_booking(
     cur.execute(
         """
         INSERT INTO booking_record
-            (mmg_id, player_id, session_date, session_time, deposit, note,
+            (mmg_id, player_id, session_date, session_time, day_type, deposit, note,
              gm1_user_id, gm2_user_id, gm3_user_id, gm4_user_id, request_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (request_id) DO NOTHING
         RETURNING id
         """,
-        (mmg_id, player_id, session_date, session_time, deposit, note, *gm_user_ids, request_id),
+        (mmg_id, player_id, session_date, session_time, day_type, deposit, note,
+         *gm_user_ids, request_id),
     )
     row = cur.fetchone()
 
@@ -551,13 +694,18 @@ VALID_STATUSES = ("gm_confirm", "gm_reviewed", "booked", "ended", "cancelled")
 
 
 def get_booking(cur, booking_id: int) -> dict | None:
-    """單筆預約的完整資料，含玩家與劇本名稱。"""
+    """單筆預約的完整資料，含玩家與劇本名稱。
+
+    booking_cost 是**這一筆**該收的訂金（依場次類型取平日或假日），不是
+    劇本的平日訂金——通知信與畫面要的都是前者。
+    """
     cur.execute(
-        """
+        f"""
         SELECT b.id, b.mmg_id, m.name, b.player_id, u.name, u.email,
                b.session_date, b.session_time, b.status, b.deposit,
-               m.booking_cost, b.note, b.created_at,
-               b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id
+               {DUE_SQL}, b.note, b.created_at,
+               b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id,
+               b.day_type
           FROM booking_record b
           JOIN mmg m   ON m.id = b.mmg_id
           JOIN users u ON u.id = b.player_id
@@ -583,6 +731,7 @@ def get_booking(cur, booking_id: int) -> dict | None:
         "note": row[11],
         "created_at": row[12].isoformat(),
         "gm_user_ids": list(row[13:17]),
+        "day_type": row[17],
     }
 
 
@@ -654,13 +803,15 @@ def list_player_tab(
             # 講序位只會讓人以為後面還有第 2、第 3。放在最後一欄，
             # 不動任何既有欄位的位置索引。
             "waitlist_limit": r[14],
+            "day_type": r[15],
         }
 
+    # booking_cost 是這一筆該收的訂金，依場次類型取——見 DUE_SQL。
     return paged(
         cur,
         f"""
         SELECT b.id, m.name, m.url, b.session_date, b.session_time, b.status,
-               b.deposit, m.booking_cost, b.note,
+               b.deposit, {DUE_SQL}, b.note,
                CASE WHEN b.status = 'cancelled' THEN NULL ELSE (
                    SELECT COUNT(*) + 1 FROM booking_record x
                     WHERE x.mmg_id = b.mmg_id
@@ -670,7 +821,7 @@ def list_player_tab(
                       AND x.created_at < b.created_at
                ) END AS position,
                u1.name, u2.name, u3.name, u4.name,
-               m.waitlist_limit
+               m.waitlist_limit, b.day_type
           FROM booking_record b
           JOIN mmg m ON m.id = b.mmg_id
           LEFT JOIN users u1 ON u1.id = b.gm1_user_id
@@ -721,25 +872,57 @@ def record_deposit(cur, booking_id: int, amount: int) -> dict:
     只負責把金額寫進去。狀態要不要跟著跳到 booked，在同一句 UPDATE 裡
     讓資料庫判斷，不由呼叫端另外決定：
 
-        目前 status = 'gm_reviewed'，且新金額 >= 該劇本的 booking_cost
+        目前 status = 'gm_reviewed'，且新金額 >= 這一筆的應收訂金
         → 這句 UPDATE 一併把 status 轉成 'booked'
 
+    應收訂金依這一筆的場次類型取劇本的平日或假日訂金（DUE_SQL）。
+
     只在 gm_reviewed 這個狀態才會自動轉——主持人都還沒審過的場次，
-    就算訂金收滿了也不該直接跳過審核變成成立。若 mmg.booking_cost
-    是 NULL（劇本沒設訂金金額），比較結果恆為 NULL、CASE 不會命中，
-    狀態就停在原地，需要用 set_status() 另外手動處理。
+    就算訂金收滿了也不該直接跳過審核變成成立。
+
+    ★ 應收訂金是空的時候直接擋下，不再默默不轉。原本的行為是比較結果
+      恆為 NULL、CASE 不會命中、狀態停在原地——金額寫進去了、畫面說
+      已儲存，這筆卻永遠等不到成立，沒有任何人會發現。現在劇本存檔與
+      建立預約都會先確認金額有設定（check_deposit_coverage、
+      require_deposit_set），走到這裡還是空的，代表有一條路漏掉了，
+      那要讓人看見。
 
     用 >=（達到即可）而不是嚴格等於：多收一點不該卡住轉態，也允許
     分兩次記錄金額湊足（先記一部分、之後補到滿額）。如果你要的是
     金額必須跟劇本要求分毫不差才轉態，這裡改成 = 即可。
     """
+    # 先鎖住這一列再看它的狀態與應收金額：鎖在 UPDATE 之前拿，中間就
+    # 不會有別人（主持人按確認）把狀態從 gm_confirm 推到 gm_reviewed，
+    # 讓這裡看到的跟 UPDATE 當下的不一樣。
     cur.execute(
-        """
+        f"""
+        SELECT b.status, b.day_type, m.name, {DUE_SQL}
+          FROM booking_record b JOIN mmg m ON m.id = b.mmg_id
+         WHERE b.id = %s
+           FOR UPDATE OF b
+        """,
+        (booking_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise BookingError(f"預約 id={booking_id} 不存在")
+    status, day_type, mmg_name, due = row
+    if status == "cancelled":
+        raise BookingError("已取消的預約不能記錄訂金")
+    if status == "gm_reviewed" and due is None:
+        label = DAY_TYPE_LABEL[day_type]
+        raise BookingError(
+            f"《{mmg_name}》沒有設定{label}訂金，無法判斷這筆是否已收足。"
+            f"請先到劇本管理補上（不收訂金請填 0）"
+        )
+
+    cur.execute(
+        f"""
         UPDATE booking_record b
            SET deposit = %s,
                status = CASE
                           WHEN b.status = 'gm_reviewed'
-                               AND %s >= (SELECT booking_cost FROM mmg WHERE id = b.mmg_id)
+                               AND %s >= (SELECT {DUE_SQL} FROM mmg m WHERE m.id = b.mmg_id)
                           THEN 'booked'
                           ELSE b.status
                         END
