@@ -48,20 +48,30 @@ def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None:
     """
     # 第 0 層。這支在開賣尖峰是最熱的讀取路徑之一，能少一次往返就少一次
     # 讓 Neon compute 保持清醒的理由（見 db/idle_gap.py）。
+    #
+    # 「現在」也在同一句裡取，不另外呼叫 listing.now_taipei()：理由跟它一樣
+    # 要用資料庫的時鐘（判定與寫入各用一個時間來源會自相矛盾），但熱路徑上
+    # 不值得為它多付一次往返。
     cur.execute(
-        "SELECT start_booking, end_booking FROM mmg WHERE id = %s",
+        "SELECT start_booking, end_booking, (NOW() AT TIME ZONE 'Asia/Taipei') "
+        "FROM mmg WHERE id = %s",
         (mmg_id,),
     )
     row = cur.fetchone()
     if row is None:
         return None
-    start, end = row
+    start, end, now = row
     if session_date < start.date():
         return None
     if end is not None and session_date > end.date():
         return None
 
     # 第 1 層：這一天有沒有例外。有就以它為準，完全不看常態。
+    #
+    # ★ 例外日也要經過 _bookable。原本這裡直接 return list(times)，沒有套
+    #   上下架邊界——而 calendar() 那邊有套，兩處因此不一致：上架日當天剛好
+    #   是例外日時，日曆會濾掉上架時刻之前的場次，這裡卻放行（2026-09-12
+    #   修正，順帶讓「已經過去」的過濾對例外日也生效）。
     cur.execute(
         "SELECT is_open, times FROM mmg_schedule_exception "
         "WHERE mmg_id = %s AND exception_date = %s",
@@ -70,7 +80,7 @@ def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None:
     row = cur.fetchone()
     if row is not None:
         is_open, times = row
-        return list(times) if is_open else None
+        return _bookable(list(times) if is_open else None, session_date, start, end, now)
 
     # 第 2 層：每週常態。沒有那一列就是那個星期不開（第 3 層兜底）。
     # weekday 用 0=週日 … 6=週六，與 JavaScript 的 Date.getDay() 一致，
@@ -81,11 +91,17 @@ def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None:
     )
     row = cur.fetchone()
     times = list(row[0]) if row is not None else None
-    return _within_listing(times, session_date, start, end)
+    return _bookable(times, session_date, start, end, now)
 
 
-def _within_listing(times, session_date: date, start, end) -> list[time] | None:
-    """上下架當天，把區間外的時段濾掉。
+def _bookable(times, session_date: date, start, end, now) -> list[time] | None:
+    """把一天的時段裡「實際訂得到的」留下來：上下架邊界，以及已經過去的。
+
+    open_times() 與 calendar() 都走這一支，而且兩條路（例外日、每週常態）
+    都要走——四層之中任何一層的時段，最後都得經過同一套邊界。這一支如果
+    被繞過，前端日曆跟 create_booking 的防線就會各說各話。
+
+    ## 上下架邊界
 
     ★ 這一步不能省。前面只比到「日期」，所以 14:00 上架的戲在當天會連
       10:00 的場次一起放行——那正是只存日期表達不出來、而案主要求要能
@@ -94,13 +110,29 @@ def _within_listing(times, session_date: date, start, end) -> list[time] | None:
     邊界方向刻意不同：上架時刻「當下」就開賣（>=），下架時刻「當下」
     就停賣（<）。兩邊都用 >= 的話，剛好等於下架時刻的那一場會落在
     已經下架的區間裡還能訂。
+
+    ## 已經過去的（2026-09-12 加）
+
+    原本四層都只看「日期」，沒有任何一層比「現在」——只要上架日在過去，
+    連過去的日期都訂得下去。那一筆會直接進排程的清理範圍，eli 那種直接
+    成立的組態下甚至會被轉成「已結束」，在歷史裡留下一場沒發生過的遊戲。
+
+    今天只留還沒開始的場次（t > now，嚴格大於：剛好此刻開場的那一場也不給訂，
+    按下送出的當下它就已經開始了）。更早的日期整天都不開。
+
+    ★ 管理員補登過去的場次不受這條影響——那條路走 allow_closed_slot，
+      根本不問排期（見 create_booking）。
     """
     if times is None:
         return times
+    if session_date < now.date():
+        return None
     if session_date == start.date():
         times = [t for t in times if t >= start.time()]
     if end is not None and session_date == end.date():
         times = [t for t in times if t < end.time()]
+    if session_date == now.date():
+        times = [t for t in times if t > now.time()]
     # 全部被濾掉時回 None 而不是 []：呼叫端用 `is None` 判斷「這天不開」，
     # 留一個空清單會讓「開了但沒有時段」混進來，那不是一個真實的狀態。
     return times or None
@@ -132,14 +164,16 @@ def calendar(cur, mmg_id: int, start: date, end: date) -> tuple[dict, bool]:
       每翻一個月就打一次的端點，而每一次往返都在讓 compute 保持清醒
       （見 db/idle_gap.py 的成本說明）。
     """
+    # 「現在」併在同一句裡取，理由同 open_times()：資料庫的時鐘、零額外往返。
     cur.execute(
-        "SELECT start_booking, end_booking FROM mmg WHERE id = %s",
+        "SELECT start_booking, end_booking, (NOW() AT TIME ZONE 'Asia/Taipei') "
+        "FROM mmg WHERE id = %s",
         (mmg_id,),
     )
     row = cur.fetchone()
     if row is None:
         return {}, False
-    lo, hi = row
+    lo, hi, now = row
 
     cur.execute(
         "SELECT weekday, times FROM mmg_weekly_slot WHERE mmg_id = %s",
@@ -156,14 +190,18 @@ def calendar(cur, mmg_id: int, start: date, end: date) -> tuple[dict, bool]:
     configured = bool(weekly or cur.fetchone()[0])
 
     # 第 0 層直接把查詢範圍夾掉，後面兩層就不必再各自判斷一次。
-    # 只夾到「日」——上架當天要保留下來，讓 _within_listing 去濾掉那天
+    # 只夾到「日」——上架當天要保留下來，讓 _bookable 去濾掉那天
     # 上架時刻之前的時段；整天砍掉的話上架當天就完全訂不到了。
     if lo.date() > start:
         start = lo.date()
-    # 同樣只夾到「日」，下架當天要留下來讓 _within_listing 濾掉
+    # 同樣只夾到「日」，下架當天要留下來讓 _bookable 濾掉
     # 下架時刻之後的時段。
     if hi is not None and hi.date() < end:
         end = hi.date()
+    # 過去的日子整天都不開，直接從今天起算——省下逐日跑一遍再全部丟掉。
+    # 今天本身要留，讓 _bookable 濾掉今天已經開始的場次。
+    if now.date() > start:
+        start = now.date()
     if start > end:
         return {}, configured
 
@@ -182,7 +220,7 @@ def calendar(cur, mmg_id: int, start: date, end: date) -> tuple[dict, bool]:
             times = times if is_open_day else None
         else:
             times = weekly.get(day.isoweekday() % 7)
-        times = _within_listing(times, day, lo, hi)
+        times = _bookable(times, day, lo, hi, now)
         if times:
             out[day.isoformat()] = [t.strftime("%H:%M") for t in sorted(times)]
         day = day.fromordinal(day.toordinal() + 1)

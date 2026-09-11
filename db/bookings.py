@@ -372,19 +372,32 @@ def create_booking(
     #   差一點，使用者就會看到「畫面上選得到卻訂不下去」。
     # 未上架或已下架的劇本一律訂不了。玩家的清單裡本來就沒有它，但清單
     # 是畫面，這裡是防線——舊分頁、書籤、或直接打 API 都繞得過畫面。
+    now = listing.now_taipei(cur)
     cur.execute(
         f"SELECT EXISTS (SELECT 1 FROM mmg WHERE id = %(id)s AND {listing.VISIBLE_SQL})",
-        {"id": mmg_id, "now": listing.now_taipei(cur)},
+        {"id": mmg_id, "now": now},
     )
     if not cur.fetchone()[0]:
         raise BookingError("此劇本目前未開放預約")
 
     if allow_closed_slot:
-        # 管理員代訂電話客人時可能真的要開一個不在常態內的場。這條路徑
-        # 只有 role 1 走得到（見 app.py），而且畫面上會先跳確認。
+        # 管理員在「場次管理」新增：不問排期，連過去的時間都可以——那是在
+        # 記錄已經發生的事（事後補登、電話預約的特殊場），不是在賣位子。
+        # 容量與撞期檢查照樣跑，那兩道擋的是超賣與主持人分身，跟排期無關。
+        #
+        # ★ 這個參數從 2026-08-29 加入起就沒有任何呼叫端，是設計了但沒接上的
+        #   功能；原本這裡的註解說「只有 role 1 走得到（見 app.py）」，實際上
+        #   連 role 1 也走不到。2026-09-12 接到 bookings_admin.create()。
         pass
-    elif not schedule.is_open(cur, mmg_id, session_date, session_time):
-        raise BookingError("此時間未開放")
+    else:
+        # 先單獨判斷「已經過去」，只是為了給一句說得清楚的錯誤——真正的
+        # 閘門仍然是下面的 is_open（它經過 schedule._bookable，同一條規則）。
+        # 會走到這裡的真實情境是：玩家把頁面開著，選了今天 19:00，拖到
+        # 19:01 才按送出。回「此時間未開放」會讓他以為這個時段本來就沒開。
+        if datetime.combine(session_date, session_time) <= now:
+            raise BookingError("這個時段已經過了，請重新選擇")
+        if not schedule.is_open(cur, mmg_id, session_date, session_time):
+            raise BookingError("此時間未開放")
 
     _lock_slot(cur, mmg_id, session_date, session_time)
     _lock_gms(cur, gm_ids)
@@ -457,6 +470,13 @@ def create_booking(
         # 一個已經成立的預約即使現在時段滿了，重試時仍該回報它原本的狀態，
         # 而不是因為「滿了」被拒絕。
         if current >= capacity:
+            # ★ 容量 1 的時段沒有「排隊」這回事，訊息要跟著換。
+            #   原本一律講「已額滿（最多 N 組）」：對容量 1 的店家，那是把一個
+            #   內部欄位的值講給玩家聽，而且「已額滿」暗示有人在排、等別人取消
+            #   就有機會——但這種店沒有候補制度，那個時段就是被訂走了，等下去
+            #   沒有意義。前端的 slotMessage 用同一條規則（看 slot.capacity）。
+            if waitlist_limit == 1:
+                raise BookingError("這個時段已經被預約了，請改選其他時間")
             raise BookingError(
                 f"《{mms_name}》{session_date} {session_time} 已額滿"
                 f"（最多 {waitlist_limit} 組）"
@@ -630,6 +650,10 @@ def list_player_tab(
             "deposit": r[6], "booking_cost": r[7], "note": r[8],
             "position": r[9],
             "gm_names": [n for n in r[10:14] if n],
+            # 前端決定要不要顯示「第 N 序位」用的：容量 1 的時段沒有排隊，
+            # 講序位只會讓人以為後面還有第 2、第 3。放在最後一欄，
+            # 不動任何既有欄位的位置索引。
+            "waitlist_limit": r[14],
         }
 
     return paged(
@@ -645,7 +669,8 @@ def list_player_tab(
                       AND x.status <> 'cancelled'
                       AND x.created_at < b.created_at
                ) END AS position,
-               u1.name, u2.name, u3.name, u4.name
+               u1.name, u2.name, u3.name, u4.name,
+               m.waitlist_limit
           FROM booking_record b
           JOIN mmg m ON m.id = b.mmg_id
           LEFT JOIN users u1 ON u1.id = b.gm1_user_id

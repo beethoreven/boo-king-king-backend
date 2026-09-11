@@ -115,6 +115,9 @@ def create(cur, data: dict) -> int:
         note=(data.get("note") or "").strip() or None,
         # 管理員要看得到是什麼撞到才處理得了；玩家那條路走預設值。
         detailed_conflict=True,
+        # 場次管理新增不受排期限制：可以補登過去的場次、開不在常態內的場。
+        # 只放掉排期這一道，容量與撞期照樣擋（見上方 docstring 的理由）。
+        allow_closed_slot=True,
     )
     # 狀態預設是 gm_confirm；管理員若指定了別的（或勾了確認），補一次更新。
     update(cur, result.id, data)
