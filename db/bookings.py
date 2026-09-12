@@ -847,36 +847,6 @@ def list_player_tab(
     )
 
 
-def cancel_booking(cur, booking_id: int) -> dict:
-    """取消一筆預約。
-
-    只改自己這一列的 status，**不做任何遞補處理**——順位是每次由
-    created_at 算出來的，後面的人自動往前遞補。這正是不存 priority 欄位
-    換來的好處：這裡沒有「把下一位升上來」的第二次寫入可以失敗。
-
-    ★ 刻意不碰 note。這支原本收一個 note 參數寫進去，而唯一的呼叫端是
-      玩家也打得到的取消路由，等於任何登入者都能往「主持人／管理員的
-      備註欄」寫字。取消原因要留字，是管理員在場次管理的備註欄寫——
-      那一欄本來就是給人寫的（2026-09-12 移除）。
-    """
-    cur.execute(
-        """
-        UPDATE booking_record
-           SET status = 'cancelled'
-         WHERE id = %s AND status <> 'cancelled'
-        RETURNING id
-        """,
-        (booking_id,),
-    )
-    if cur.fetchone() is None:
-        cur.execute("SELECT 1 FROM booking_record WHERE id = %s", (booking_id,))
-        if cur.fetchone() is None:
-            raise BookingError(f"預約 id={booking_id} 不存在")
-        raise BookingError("這筆預約已經取消過了")
-    slot_cache.clear()  # 見 create_booking 上方的說明
-    return get_booking(cur, booking_id)
-
-
 def record_deposit(cur, booking_id: int, amount: int) -> dict:
     """記錄實際收到的訂金金額。
 
@@ -1394,26 +1364,3 @@ def count_stale_booked(cur, *, lookback_days = ENDED_LOOKBACK_DAYS) -> int:
     return cur.fetchone()[0]
 
 
-def set_status(cur, booking_id: int, status: str, *, note: str | None = None) -> dict:
-    """更新狀態。取消請走 cancel_booking，不要用這支。"""
-    if status not in VALID_STATUSES:
-        raise BookingError(f"未知的狀態「{status}」")
-    if status == "cancelled":
-        raise BookingError("取消請用 cancel_booking，它會一併處理備註")
-
-    cur.execute(
-        """
-        UPDATE booking_record SET status = %s, note = COALESCE(%s, note)
-         WHERE id = %s AND status <> 'cancelled'
-        RETURNING id
-        """,
-        (status, note, booking_id),
-    )
-    if cur.fetchone() is None:
-        cur.execute("SELECT status FROM booking_record WHERE id = %s", (booking_id,))
-        row = cur.fetchone()
-        if row is None:
-            raise BookingError(f"預約 id={booking_id} 不存在")
-        raise BookingError("已取消的預約不能再改狀態")
-    slot_cache.clear()  # 見 create_booking 上方的說明
-    return get_booking(cur, booking_id)

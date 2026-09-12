@@ -1013,62 +1013,23 @@ def _is_assigned_gm(booking: dict, user_id: int) -> bool:
     return user_id in (booking.get("gm_user_ids") or [])
 
 
-@app.post("/api/bookings/<int:booking_id>/cancel")
-@require_auth
-def cancel_booking_route(booking_id: int):
-    """取消預約。玩家取消自己的，管理員可以取消任何一筆。
-
-    ★ 主持人不能取消別人的預約。他唯一比一般使用者多出來的寫入能力，
-      是確認自己被指定的那一場（/confirm）。取消牽涉到訂金、名額與客人
-      權益，那是店家的決定，不是單一主持人的——真的需要動的時候，打電話
-      給店家才是對的流程。
-      主持人以玩家身分自己訂的場，他仍然取消得掉，因為那是「自己的預約」。
-
-    取消之後後面的序位會自動往前遞補——序位是每次由 created_at 算出來的，
-    這裡不需要、也沒有任何「把下一位升上來」的寫入。
-    """
-    # ★ 不讀請求內容。這支原本會把 body 裡的 note 寫進備註欄，而備註欄是
-    #   主持人／管理員的欄位——任何登入者都打得到這支，等於開了一條讓客人
-    #   往店家的欄位寫字的路。要留取消原因，是管理員在場次管理寫。
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            booking = bookings_db.get_booking(cur, booking_id)
-            if booking is None:
-                return jsonify({"error": "找不到這筆預約"}), 404
-            if booking["player_id"] != g.user["id"] and g.user["role"] > 1:
-                return jsonify({"error": "只能取消自己的預約"}), 403
-            try:
-                updated = bookings_db.cancel_booking(cur, booking_id)
-            except BookingError as exc:
-                conn.rollback()
-                return jsonify({"error": str(exc)}), 409
-            conn.commit()
-    return jsonify(updated)
-
-
-@app.patch("/api/bookings/<int:booking_id>/status")
-@require_role(1)
-def set_booking_status(booking_id: int):
-    """管理員更新預約狀態。取消請走 /cancel。
-
-    ★ 曾經是 require_role(2)，也就是任何主持人都能把任何一場改成任何
-      狀態——包含跟他毫無關係的場。改狀態會牽動訂金與名額，那是店家的
-      決定。主持人的寫入能力只剩 /confirm 那一支，且限定自己被指定的場。
-    """
-    body = request.get_json(silent=True) or {}
-    status = (body.get("status") or "").strip()
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            try:
-                updated = bookings_db.set_status(
-                    cur, booking_id, status, note=body.get("note")
-                )
-            except BookingError as exc:
-                conn.rollback()
-                return jsonify({"error": str(exc)}), 400
-            conn.commit()
-    return jsonify(updated)
-
+# ★ 這裡曾經有兩支寫入路由，2026-09-12 移除：
+#
+#     POST  /api/bookings/<id>/cancel    任何登入者取消自己的（管理員取消任何一筆）
+#     PATCH /api/bookings/<id>/status    管理員直接改狀態
+#
+#   兩支都出自 2026-08-26 的第一批 API，那時候還沒有管理員介面。後來長出來
+#   的畫面兩支都沒用到：玩家的「我預定的場次」刻意唯讀（取消要經過店家，
+#   那支路由自己的說明也是這樣寫的），管理員的取消與改狀態都走場次管理的
+#   編輯（PUT /api/admin/bookings/<id>）。
+#
+#   留著的代價不只是沒人用：改狀態那支是編輯那條路的弱化版重複品——它直接
+#   寫 status，繞過「主持人全數確認 → 待收訂金」的自動轉態，也繞過應收訂金
+#   有沒有設定的檢查。同一個欄位兩扇門、其中一扇守衛比較少，遲早有人走錯。
+#
+#   哪天要做「玩家自行取消」，要一起決定的事情比這支多：離場多久前還能取消、
+#   訂金退不退、要不要通知已經確認的主持人、序位遞補要不要發信。屆時重寫一支
+#   帶著那些規則的，比沿用這支什麼規則都沒有的好。
 
 # ── 主持人介面 ──────────────────────────────────────────────────
 #
