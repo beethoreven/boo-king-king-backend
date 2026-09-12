@@ -34,6 +34,8 @@ from __future__ import annotations
 
 from datetime import date, time
 
+from db import slot_cache
+
 
 def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None:
     """這一天開放的時段清單。不開放（任何一層擋下）時回傳 None。
@@ -361,3 +363,6 @@ def set_rules(cur, mmg_id: int, weekly: list, exceptions: list) -> None:
             "(mmg_id, exception_date, is_open, times) VALUES (%s, %s, %s, %s)",
             (mmg_id, day, open_day, times),
         )
+    # 排期決定 /slot 的 is_open，整批換掉等於每一個時段的答案都可能變
+    # （2026-09-13 補）。
+    slot_cache.clear()

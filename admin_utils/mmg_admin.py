@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from db import slot_cache
 from db.bookings import BookingError
 
 # 台北是固定的 UTC+8，沒有日光節約，所以不需要 zoneinfo（那在某些精簡的
@@ -342,6 +343,9 @@ def update(cur, mmg_id: int, data: dict) -> bool:
             mmg_id,
         ),
     )
+    # /slot 回的是「這個時段的容量、開不開放、劇本叫什麼」，這一句改得動
+    # 其中每一樣（序位上限、上下架、名稱），所以要清（2026-09-13 補）。
+    slot_cache.clear()
     return True
 
 
@@ -395,4 +399,5 @@ def create(cur, data: dict) -> int:
             names[3], user_ids[3],
         ),
     )
+    slot_cache.clear()  # 同 update()：新劇本也可能佔用同一間包廂的時段
     return cur.fetchone()[0]

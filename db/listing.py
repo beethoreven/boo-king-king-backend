@@ -46,6 +46,8 @@ Neon 免費方案閒置 5 分鐘就讓 compute 休眠，每月額度 100 CU-hour
 
 from __future__ import annotations
 
+from db import slot_cache
+
 # 玩家看得到的狀態條件。惰性判定的核心，三個地方共用同一段 SQL：
 # 劇本清單、單一劇本查詢、slot 查詢。各自寫一份就會有一份先過期。
 #
@@ -85,6 +87,11 @@ def sync_status(cur) -> dict:
         """
     )
     listed = [{"id": r[0], "name": r[1]} for r in cur.fetchall()]
+    # 真的有劇本上架了才清。這一支被管理員的劇本清單（GET）與每日排程
+    # 呼叫，絕大多數時候一列都沒改——那時候清等於白白讓所有人重查一次
+    # （2026-09-13 補）。
+    if listed:
+        slot_cache.clear()
 
     # ★ 沒有「自動下架」這回事，這是刻意的（2026-09-01 拿掉的）。
     #

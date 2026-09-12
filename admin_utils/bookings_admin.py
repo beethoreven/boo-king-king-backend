@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from db import slot_cache
 from db.bookings import (
     AWAITING_DEPOSIT,
     DAY_TYPES,
@@ -277,6 +278,13 @@ def update(cur, booking_id: int, data: dict) -> bool:
     if new["status"] == current["status"] and new["deposit"] != current["deposit"]:
         record_deposit(cur, booking_id, new["deposit"])
 
+    # ★ 這條路沒有走 db/bookings.py 的寫入函式（它自己下 UPDATE），所以
+    #   /slot 的快取失效不會自動涵蓋到它——2026-09-13 補上。改日期、時間、
+    #   劇本、狀態（含改成已取消）每一樣都會改變某些時段的答案。
+    #
+    #   只清得掉自己這個行程那一份：正式環境是 gunicorn 兩個 worker，另一個
+    #   worker 仍然靠 TTL 收尾。加了這一行不代表快取一定是準的。
+    slot_cache.clear()
     return True
 
 

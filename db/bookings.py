@@ -922,6 +922,9 @@ def record_deposit(cur, booking_id: int, amount: int) -> dict:
         #   這一行留著是為了「哪天有人把上面的鎖或那段檢查拿掉」——那時這裡
         #   會大聲失敗，而不是默默沒寫進去。
         raise BookingError(f"預約 id={booking_id} 在寫入前被改掉了，請重新整理再試")
+    # 待收訂金 → 已成立會改變 /slot 的答案：has_booked 是「這個時段有沒有
+    # 已成立的組別」，而撞期判定只算 booked，所以連別的劇本的時段都會變。
+    slot_cache.clear()  # 見 create_booking 上方的說明
     return get_booking(cur, booking_id)
 
 
@@ -1006,6 +1009,11 @@ def confirm_gm(cur, booking_id: int, gm_id: int) -> dict:
             "WHERE id = %s AND status = 'gm_confirm'",
             (booking_id,),
         )
+    # 這一支目前不影響 /slot 的任何欄位（容量算「沒取消」、撞期算 booked，
+    # 主持人確認兩者都不動）。還是清，是為了讓規則保持一句話：**寫
+    # booking_record 就清**。payload 哪天多一個欄位時，不必回頭重新推一次
+    # 哪些狀態轉換會影響它。
+    slot_cache.clear()  # 見 create_booking 上方的說明
     return get_booking(cur, booking_id)
 
 

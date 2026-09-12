@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 
 from auth_utils import whitelist
+from db import slot_cache
 
 # LINE ID 允許英數字與 . - _ ——官方允許的就是這些。只認英數字會把合法的
 # ID 判成錯誤，使用者會卡在一個他改不掉的紅字上。
@@ -123,4 +124,7 @@ def delete_self(cur, user_id: int) -> int:
     )
     if email:
         whitelist.invalidate(email)
+    # 上面那句 UPDATE 把這個人未成立的場次全取消了，等於某些時段空出位子。
+    # 這條路同樣沒有走 db/bookings.py 的寫入函式（2026-09-13 補上）。
+    slot_cache.clear()
     return cancelled
