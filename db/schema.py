@@ -560,10 +560,18 @@ def _ensure_mmg(cur) -> None:
         )
         """
     )
-    # 既有資料庫補欄位。注意這條路徑補出來的欄位會排在最後面，
-    # 拿不到上面 CREATE TABLE 的相鄰順序——Postgres 沒有調整既有欄位
-    # 順序的語法，只能重建整張表。要讓現有資料庫也變成相鄰排列，
-    # 跑一次 db/migrate_reorder_mms.py。
+    # 既有資料庫補欄位。注意這條路徑補出來的欄位會排在最後面，拿不到上面
+    # CREATE TABLE 的相鄰順序——Postgres 沒有調整既有欄位順序的語法，只能
+    # 重建整張表。
+    #
+    # ★ 那種重建腳本這個專案寫過三支（mms→mmg、mmg 欄位重排、booking_record
+    #   加 gm{n}_confirmed），跑完就刪掉了（2026-09-12）。理由是它們會逐欄
+    #   列出「正確的欄位」，而那份清單一旦落後於 schema，再跑一次就會把後來
+    #   加的欄位連資料一起洗掉——而且它自己的驗證只比對清單內的欄位，會回報
+    #   成功。真的需要再排一次的話，寫一支新的、以當下的 schema 為準。
+    #
+    # 順序只是給人讀資料表時方便，不影響任何查詢：這個專案沒有 SELECT *，
+    # 每一支查詢都逐欄列名。
     existing = _existing_columns(cur, "mmg")
     # 假日售價／假日訂金（2026-09-12）。既有的劇本假日一律沿用平日的值——
     # 兩個數字相同時畫面只顯示一個，所以既有店家的畫面完全不變。
@@ -904,9 +912,10 @@ def _ensure_booking_record(cur) -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_booking_player ON booking_record (player_id)")
 
     # 既有資料庫補欄位。這裡補出來的欄位會排在最後面，拿不到上面
-    # CREATE TABLE 的相鄰順序——正式環境已用
-    # db/migrate_add_gm_confirmed.py 重建過一次表，這裡純粹是防呆：
-    # 就算漏跑那支腳本，這個專案至少也不會因為缺欄位而整個壞掉。
+    # CREATE TABLE 的相鄰順序——正式環境的 gm{n}_confirmed 是用一支一次性
+    # 腳本重建整張表得到相鄰順序的，那支跑完已經刪掉（理由見 _ensure_mmg
+    # 的同一段）。這裡留著純粹是防呆：就算有一個資料庫沒經過那次重建，
+    # 這個專案至少也不會因為缺欄位而整個壞掉。
     existing = _existing_columns(cur, "booking_record")
     for n in (1, 2, 3, 4):
         if f"gm{n}_confirmed" not in existing:
