@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from db import listing, schedule, slot_cache
 
@@ -932,10 +932,14 @@ def record_deposit(cur, booking_id: int, amount: int) -> dict:
         (amount, amount, booking_id),
     )
     if cur.fetchone() is None:
-        cur.execute("SELECT 1 FROM booking_record WHERE id = %s", (booking_id,))
-        if cur.fetchone() is None:
-            raise BookingError(f"預約 id={booking_id} 不存在")
-        raise BookingError("已取消的預約不能記錄訂金")
+        # ★ 走不到：上面那句 SELECT ... FOR UPDATE 已經確認這一列存在、不是
+        #   已取消，而且鎖住它到交易結束，中間沒有別人動得了。原本這裡還會
+        #   再查一次分辨「不存在」與「已取消」，那兩句在加了鎖之後永遠不會
+        #   執行，所以拿掉了。
+        #
+        #   這一行留著是為了「哪天有人把上面的鎖或那段檢查拿掉」——那時這裡
+        #   會大聲失敗，而不是默默沒寫進去。
+        raise BookingError(f"預約 id={booking_id} 在寫入前被改掉了，請重新整理再試")
     return get_booking(cur, booking_id)
 
 

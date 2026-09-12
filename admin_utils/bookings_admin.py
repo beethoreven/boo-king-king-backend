@@ -15,7 +15,6 @@ from db.bookings import (
     AWAITING_DEPOSIT,
     DAY_TYPES,
     DUE_SQL,
-    PAGE_SIZE,
     TAB_LABEL,
     VALID_STATUSES,
     BookingError,

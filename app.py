@@ -7,7 +7,7 @@ boo-king-king 後端。
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, time, timedelta
+from datetime import date, time
 from functools import wraps
 
 from dotenv import load_dotenv
