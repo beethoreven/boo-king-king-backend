@@ -889,6 +889,11 @@ def create_booking_route():
     該次意圖的所有重試都沿用同一組。刻意不允許省略：如果這裡自動產生，
     每次重試都會變成一次新的意圖，冪等保護就形同虛設——玩家網路不穩
     重送一次就可能佔到兩個名額，而名額是有限且被搶的。
+
+    ★ 這支**只取它列出來的那幾個鍵**。請求裡多帶的東西一律不看：訂金是
+      店家收到錢才算數、備註是主持人／管理員的欄位、狀態與預定者更不是
+      玩家能決定的。這條規則要靠「後端只讀自己要的欄位」來守，不能靠
+      「前端不會送」——任何人都能直接打這支 API。
     """
     body = request.get_json(silent=True) or {}
 
@@ -945,8 +950,6 @@ def create_booking_route():
                     session_date=d, session_time=t,
                     gm_user_ids=gm_user_ids,
                     request_id=request_id,
-                    deposit=int(body.get("deposit") or 0),
-                    note=body.get("note"),
                 )
             except BookingError as exc:
                 conn.rollback()
@@ -1024,7 +1027,9 @@ def cancel_booking_route(booking_id: int):
     取消之後後面的序位會自動往前遞補——序位是每次由 created_at 算出來的，
     這裡不需要、也沒有任何「把下一位升上來」的寫入。
     """
-    body = request.get_json(silent=True) or {}
+    # ★ 不讀請求內容。這支原本會把 body 裡的 note 寫進備註欄，而備註欄是
+    #   主持人／管理員的欄位——任何登入者都打得到這支，等於開了一條讓客人
+    #   往店家的欄位寫字的路。要留取消原因，是管理員在場次管理寫。
     with pool.connection() as conn:
         with conn.cursor() as cur:
             booking = bookings_db.get_booking(cur, booking_id)
@@ -1033,7 +1038,7 @@ def cancel_booking_route(booking_id: int):
             if booking["player_id"] != g.user["id"] and g.user["role"] > 1:
                 return jsonify({"error": "只能取消自己的預約"}), 403
             try:
-                updated = bookings_db.cancel_booking(cur, booking_id, note=body.get("note"))
+                updated = bookings_db.cancel_booking(cur, booking_id)
             except BookingError as exc:
                 conn.rollback()
                 return jsonify({"error": str(exc)}), 409

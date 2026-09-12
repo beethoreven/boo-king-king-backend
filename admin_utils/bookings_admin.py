@@ -106,6 +106,11 @@ def create(cur, data: dict) -> int:
 
     建立之後再套一次 update()，把狀態、訂金、備註、確認勾這些
     create_booking() 不收的欄位寫進去。
+
+    ★ 這句話一度是假的：程式碼同時也在 create_booking() 那一步傳了訂金與
+      備註，同一個值寫兩次（update() 比對之後發現沒變，就什麼都不做）。
+      2026-09-12 那兩個參數從 create_booking() 拿掉了，現在這條路是唯一
+      的——也是唯一會跑轉態規則與應收金額檢查的那一條。
     """
     gm_user_ids = data.get("gm_user_ids") or [None] * 4
     if len(gm_user_ids) != 4:
@@ -118,8 +123,6 @@ def create(cur, data: dict) -> int:
         session_date=data.get("session_date"),
         session_time=data.get("session_time"),
         gm_user_ids=list(gm_user_ids),
-        deposit=int(data.get("deposit") or 0),
-        note=(data.get("note") or "").strip() or None,
         # 管理員要看得到是什麼撞到才處理得了；玩家那條路走預設值。
         detailed_conflict=True,
         # 場次管理新增不受排期限制：可以補登過去的場次、開不在常態內的場。

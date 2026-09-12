@@ -472,8 +472,6 @@ def create_booking(
     session_time,
     gm_user_ids: list[int | None],
     request_id: str | None = None,
-    deposit: int = 0,
-    note: str | None = None,
     detailed_conflict: bool = False,
     allow_closed_slot: bool = False,
     day_type: str | None = None,
@@ -484,6 +482,16 @@ def create_booking(
 
     day_type 不給就依日期推（週六日＝假日場）。玩家那條路一律不給；只有
     場次管理新增時，管理員可能當場就指定（例如國定假日的週三）。
+
+    ★ 刻意**不收訂金與備註**。一列剛誕生時這兩欄一定是「還沒收」與「沒有」：
+      訂金要等主持人確認完才收（流程是 待確認 → 待收訂金 → 成立），備註是
+      主持人／管理員的欄位。管理員代訂時先收了錢、或要留一句話，是建立之後
+      由 bookings_admin.update() 寫進去的——那條路會跑轉態規則與應收金額
+      檢查，這裡不會。
+      這兩個參數原本存在（2026-08-26 設計成「唯一的寫入口」時一併收下），
+      而玩家那支路由把請求內容原封不動轉手進來，等於任何人手打一個
+      {"deposit": 99999} 就能在自己的預約上記一筆店家沒收到的錢。
+      2026-09-12 移除。
 
     request_id 是冪等鍵，應該由前端在玩家「按下預約」當下產生，該次意圖的
     所有重試都沿用同一組。這裡允許不給（自動產生一組），只是為了讓腳本與
@@ -590,13 +598,13 @@ def create_booking(
     cur.execute(
         """
         INSERT INTO booking_record
-            (mmg_id, player_id, session_date, session_time, day_type, deposit, note,
+            (mmg_id, player_id, session_date, session_time, day_type,
              gm1_user_id, gm2_user_id, gm3_user_id, gm4_user_id, request_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (request_id) DO NOTHING
         RETURNING id
         """,
-        (mmg_id, player_id, session_date, session_time, day_type, deposit, note,
+        (mmg_id, player_id, session_date, session_time, day_type,
          *gm_user_ids, request_id),
     )
     row = cur.fetchone()
@@ -839,22 +847,26 @@ def list_player_tab(
     )
 
 
-def cancel_booking(cur, booking_id: int, *, note: str | None = None) -> dict:
+def cancel_booking(cur, booking_id: int) -> dict:
     """取消一筆預約。
 
     只改自己這一列的 status，**不做任何遞補處理**——順位是每次由
     created_at 算出來的，後面的人自動往前遞補。這正是不存 priority 欄位
     換來的好處：這裡沒有「把下一位升上來」的第二次寫入可以失敗。
+
+    ★ 刻意不碰 note。這支原本收一個 note 參數寫進去，而唯一的呼叫端是
+      玩家也打得到的取消路由，等於任何登入者都能往「主持人／管理員的
+      備註欄」寫字。取消原因要留字，是管理員在場次管理的備註欄寫——
+      那一欄本來就是給人寫的（2026-09-12 移除）。
     """
     cur.execute(
         """
         UPDATE booking_record
-           SET status = 'cancelled',
-               note = COALESCE(%s, note)
+           SET status = 'cancelled'
          WHERE id = %s AND status <> 'cancelled'
         RETURNING id
         """,
-        (note, booking_id),
+        (booking_id,),
     )
     if cur.fetchone() is None:
         cur.execute("SELECT 1 FROM booking_record WHERE id = %s", (booking_id,))
