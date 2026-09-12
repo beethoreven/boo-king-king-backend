@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from db import listing, schedule, slot_cache
+from db import functions, listing, schedule, slot_cache
 
 
 class BookingError(Exception):
@@ -81,7 +81,13 @@ def require_deposit_set(cur, mmg_id: int, day_type: str, *, creating: bool) -> N
 
     creating 只影響訊息：建立時講「不能建立」；編輯時擋下的原因可能是
     改了劇本、改了類型、或把狀態改回待收訂金，講「不能建立」會看不懂。
+
+    ★ 不收訂金的店（functions 表 deposit=off）整段不適用：那些店的預約
+      不會經過「待收訂金」，訂金欄位在畫面上也不存在，要求他們填金額
+      只會讓每一次存檔都被擋下來。
     """
+    if not functions.deposit_required(cur):
+        return
     cur.execute(
         "SELECT name, CASE WHEN %s = 'holiday' THEN booking_cost_holiday "
         "ELSE booking_cost END FROM mmg WHERE id = %s",
@@ -116,7 +122,11 @@ def check_deposit_coverage(cur, mmg_id: int) -> None:
     跑在「劇本欄位與排期都寫完之後」、同一個交易裡：價格與排期是同一次
     存檔送出來的，只看其中一邊，「同時打開週末＋填上假日訂金」這種合法
     的改法會被舊值誤擋。
+
+    ★ 不收訂金的店整段跳過，理由同 require_deposit_set。
     """
+    if not functions.deposit_required(cur):
+        return
     cur.execute(
         "SELECT name, booking_cost, booking_cost_holiday, "
         "(NOW() AT TIME ZONE 'Asia/Taipei')::date FROM mmg WHERE id = %s",
@@ -249,6 +259,12 @@ def has_room_conflict(cur, mmg_id: int, session_date, session_time) -> tuple | N
     排除「同一個劇本的同一個時段」：那是同一場遊戲的各個序位，不是被排了
     兩場。不同劇本在同一個時段就是真的撞了，不能排除。
     """
+    # 這家店不卡包廂就沒有這件事。eli 那種一人一室、同一時間只可能有一場的
+    # 店，包廂卡場等於重複擋一次主持人卡場已經擋掉的東西（functions 表的
+    # conflict.room）。
+    if not functions.room_conflict_on(cur):
+        return None
+
     cur.execute(
         f"""
         WITH me AS (
@@ -290,6 +306,11 @@ def conflicting_gm(
     不是「這位主持人」本身——同一場遊戲底下各序位掛的是同一位主持人，
     那是同一件事被記錄很多次，不是這位主持人被排了兩場不同的戲。
     """
+    # functions 表的 conflict.gm。關掉的店等於「同一位主持人可以同時帶
+    # 兩場」——那不是一個真實的營運模式，所以預設開著；留成可關是因為
+    # 卡場條件本來就是每家店不同的那一組設定。
+    if not functions.gm_conflict_on(cur):
+        return None
     if not gm_ids:
         return None
     cur.execute(
@@ -436,7 +457,18 @@ def _validate_gm_choice(cur, mmg_id: int, gm_user_ids: list[int | None]) -> None
     這條規則資料庫擋不了：booking_record.gm1_user_id 的外鍵只保證「是一個
     存在的使用者」，不保證「這個人在 mmg.gm1_user 的名單裡」。跨表的成員
     檢查要寫成約束得用 trigger，不划算，所以在這裡擋。
+
+    ★ 三種主持人模式在這裡的差別（functions 表的 gm.mode）：
+
+        assign  每個有名字的角色都必須指定，而且要在該角色的名單裡（現況）
+        option  可以不指定；有指定的還是要在名單裡
+        single  完全不驗。那個模式下主持人不是呼叫端挑的，是系統依組態
+                填進去的（見 create_booking），驗名單只會變成「店家忘記把
+                自己加進每一齣戲的名單」就全店訂不了。
     """
+    mode = functions.gm_mode(cur)
+    if mode == "single":
+        return
     cur.execute(
         "SELECT name, gm1_name, gm2_name, gm3_name, gm4_name,"
         "       gm1_user, gm2_user, gm3_user, gm4_user "
@@ -456,6 +488,8 @@ def _validate_gm_choice(cur, mmg_id: int, gm_user_ids: list[int | None]) -> None
                 raise BookingError(f"《{mms_name}》沒有角色 {i}，不能指定主持人")
             continue
         if chosen is None:
+            if mode == "option":
+                continue      # 「不指定」是合法的選擇，不是漏填
             raise BookingError(f"《{mms_name}》的角色 {i}「{name}」尚未指定主持人")
         if chosen not in (pool_ or []):
             raise BookingError(
@@ -539,6 +573,32 @@ def create_booking(
         if not schedule.is_open(cur, mmg_id, session_date, session_time):
             raise BookingError("此時間未開放")
 
+    # ★ single 模式：主持人不是呼叫端挑的。店裡只有一位主持人（functions 表
+    #   的 gm.mode = single），所以這裡直接把有名字的角色全部填成他，並且
+    #   當場標成「已確認」——後面每一段判斷「還在等誰確認」的程式碼因此
+    #   完全不需要知道 single 這回事。
+    #
+    #   固定用 users.id = 1：那家店的第一個帳號就是店主本人。案主明確承擔
+    #   這個風險（2026-09-11）：「你不用擔心 DB 搬移意外，要真的發生我來改正」。
+    gm_confirmed = [False, False, False, False]
+    if functions.gm_mode(cur) == "single":
+        cur.execute(
+            "SELECT gm1_name, gm2_name, gm3_name, gm4_name FROM mmg WHERE id = %s",
+            (mmg_id,),
+        )
+        names = cur.fetchone() or (None, None, None, None)
+        gm_user_ids = [functions.SINGLE_GM_USER_ID if n else None for n in names]
+        gm_confirmed = [n is not None for n in names]
+        gm_ids = [i for i in gm_user_ids if i is not None]
+
+    # 劇本卡場（同一齣戲同時間只能有一場，跟包廂、主持人同級的硬擋）
+    # **尚未實作**。功能表裡有這個鍵、值固定 off，被打開就當場失敗——
+    # 默默不生效的話，店家會以為自己開了保護，而系統照樣讓兩場同時開。
+    if functions.script_conflict_on(cur):
+        raise BookingError(
+            "劇本卡場（conflict.script）尚未實作，請把 functions 表裡那一列改回 off"
+        )
+
     day_type = day_type or default_day_type(session_date)
     if day_type not in DAY_TYPES:
         raise BookingError(f"未知的場次類型「{day_type}」")
@@ -595,17 +655,27 @@ def create_booking(
     )
     current = cur.fetchone()[0]
 
+    # ★ 狀態用推導的，不是靠欄位的預設值。assign＋收訂金（步經徑）推出來
+    #   就是 gm_confirm，跟原本的 DEFAULT 一樣；single＋不收訂金的店則是
+    #   一建立就 booked，不會卡在一個那家店根本沒有的狀態上。
+    status = derive_status(
+        cur, pending=pending_gm_count(gm_user_ids, gm_confirmed,
+                                      mode=functions.gm_mode(cur))
+    )
     cur.execute(
         """
         INSERT INTO booking_record
-            (mmg_id, player_id, session_date, session_time, day_type,
-             gm1_user_id, gm2_user_id, gm3_user_id, gm4_user_id, request_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (mmg_id, player_id, session_date, session_time, day_type, status,
+             gm1_user_id, gm1_confirmed, gm2_user_id, gm2_confirmed,
+             gm3_user_id, gm3_confirmed, gm4_user_id, gm4_confirmed, request_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (request_id) DO NOTHING
         RETURNING id
         """,
-        (mmg_id, player_id, session_date, session_time, day_type,
-         *gm_user_ids, request_id),
+        (mmg_id, player_id, session_date, session_time, day_type, status,
+         gm_user_ids[0], gm_confirmed[0], gm_user_ids[1], gm_confirmed[1],
+         gm_user_ids[2], gm_confirmed[2], gm_user_ids[3], gm_confirmed[3],
+         request_id),
     )
     row = cur.fetchone()
 
@@ -699,6 +769,43 @@ def list_slot(cur, mmg_id: int, session_date, session_time) -> list[tuple]:
 #   booked       已成立
 #   cancelled    已取消
 VALID_STATUSES = ("gm_confirm", "gm_reviewed", "booked", "ended", "cancelled")
+
+
+def pending_gm_count(gm_user_ids, gm_confirmed, *, mode: str) -> int:
+    """還在等幾位主持人確認。狀態推導唯一的輸入。
+
+    「等」的定義依主持人模式而不同，但算法只有一種：**已指定、還沒確認的
+    角色數**。三種模式自然落在同一條式子上：
+
+        assign  指定了就要確認 → 通常 > 0，全員確認後變 0
+        single  建立時就指定好並標成已確認 → 恆為 0
+        option  沒指定的角色是「不指定」，不列入計算 → 可能一開始就是 0
+
+    ★ assign 模式多一個守衛：一位都沒指派時回 1，不是 0。一筆還沒排主持人
+      的預約不該被當成「大家都確認了」而自己往下一個狀態跳（後台新增時
+      可以不填主持人，玩家那條路則被 _validate_gm_choice 擋著）。
+      這一條是既有行為，不是新規則——原本寫在 bookings_admin.update 裡。
+    """
+    assigned = [(u, c) for u, c in zip(gm_user_ids, gm_confirmed) if u]
+    if mode == "assign" and not assigned:
+        return 1
+    return sum(1 for _u, confirmed in assigned if not confirmed)
+
+
+def derive_status(cur, *, pending: int) -> str:
+    """一筆預約現在應該是什麼狀態。**所有轉移點都走這一支。**
+
+        還在等主持人確認     → gm_confirm
+        沒有人要等了 + 收訂金 → gm_reviewed（待收訂金）
+        沒有人要等了 + 不收   → booked（直接成立）
+
+    這支取代了原本散在六個地方的寫死值（建立時的預設、主持人確認完之後、
+    後台勾完確認之後…）。散著的時候，一家不收訂金的店會在「主持人確認完」
+    那一步掉進「待收訂金」，而畫面上沒有地方可以付——而且管理員救不回來。
+    """
+    if pending > 0:
+        return "gm_confirm"
+    return "gm_reviewed" if functions.deposit_required(cur) else "booked"
 
 
 def get_booking(cur, booking_id: int) -> dict | None:
@@ -891,7 +998,7 @@ def record_deposit(cur, booking_id: int, amount: int) -> dict:
     status, day_type, mmg_name, due = row
     if status == "cancelled":
         raise BookingError("已取消的預約不能記錄訂金")
-    if status == "gm_reviewed" and due is None:
+    if status == "gm_reviewed" and due is None and functions.deposit_required(cur):
         label = DAY_TYPE_LABEL[day_type]
         raise BookingError(
             f"《{mmg_name}》沒有設定{label}訂金，無法判斷這筆是否已收足。"
@@ -1004,10 +1111,12 @@ def confirm_gm(cur, booking_id: int, gm_id: int) -> dict:
         raise BookingError("這筆預約已經不在待確認狀態")
 
     if row[0]:
+        # 全部確認完了 → 還在等的人數是 0，下一個狀態由 derive_status 決定：
+        # 收訂金的店是「待收訂金」，不收的店直接成立。
         cur.execute(
-            "UPDATE booking_record SET status = 'gm_reviewed' "
+            "UPDATE booking_record SET status = %s "
             "WHERE id = %s AND status = 'gm_confirm'",
-            (booking_id,),
+            (derive_status(cur, pending=0), booking_id),
         )
     # 這一支目前不影響 /slot 的任何欄位（容量算「沒取消」、撞期算 booked，
     # 主持人確認兩者都不動）。還是清，是為了讓規則保持一句話：**寫

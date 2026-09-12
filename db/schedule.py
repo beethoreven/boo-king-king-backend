@@ -20,7 +20,24 @@
 
 第 3 層是這個模型能保持簡單的原因：五種情境（只開週末／只開平日／
 只開指定日／平常開臨時休／平常不開臨時加場）共用同一套結構，
-沒有 if-else 分岔，也不需要任何「模式」旗標。
+沒有 if-else 分岔。
+
+## 兩種開放方式（functions 表的 schedule.mode）
+
+    positive  預設不開放，管理員排出來的時段才開（上面那四層，步經徑）
+    negative  預設全開放（每半小時一個單位，一天 48 格），只有被關掉的
+              日子不開
+
+negative 只換掉第 2、3 層：第 0 層上下架、第 1 層例外照常生效，而且例外
+**只允許關閉**——negative 模式下建立 is_open=true 的例外會被 set_rules
+擋下來。不是「有就忽略」：忽略掉的設定一定會有人問「我明明設了為什麼
+沒有作用」。
+
+★ 這裡原本寫著「不需要任何模式旗標」，因為 negative 確實表達得出來
+  （七天各自排滿 48 格）。案主 2026-09-11 否決了那個做法，理由比原本的
+  好：**「全時段開放」是店家的營運模式，不是排班表**——要她七天各自勾
+  48 格，等於把一個屬性偽裝成設定，而且下一次她想「整週都開」還要再勾
+  一次。實作代價也比預期小：一個早退分支，不是散落的 if。
 
 ## ★ 這支是唯一的判斷來源
 
@@ -34,7 +51,18 @@ from __future__ import annotations
 
 from datetime import date, time
 
-from db import slot_cache
+from db import functions, slot_cache
+
+# negative 模式下「全時段開放」到底是哪些時段：00:00 到 23:30，每半小時
+# 一格，共 48 格。
+#
+# ★ 粒度是案主定的（2026-09-11）。再細沒有意義（沒有人用 15 分鐘開場），
+#   再粗表達不出 19:30 這種常見的開場時間。
+#
+# ★ 實際上一天開不了 48 場：主持人卡場打開時，一場 3.5 小時的戲含前後
+#   各半小時的佈置還原會佔掉 9 格。下拉列 48 個但真正訂得到的只有幾個，
+#   玩家要一個一個試才知道——等真的用過再看要不要改成只列「還開得成」的。
+ALL_DAY = tuple(time(h, m) for h in range(24) for m in (0, 30))
 
 
 def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None:
@@ -83,6 +111,10 @@ def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None:
     if row is not None:
         is_open, times = row
         return _bookable(list(times) if is_open else None, session_date, start, end, now)
+
+    # 第 2、3 層。negative 模式在這裡早退：沒有被例外關掉的日子一律全開。
+    if functions.schedule_mode(cur) == "negative":
+        return _bookable(list(ALL_DAY), session_date, start, end, now)
 
     # 第 2 層：每週常態。沒有那一列就是那個星期不開（第 3 層兜底）。
     # weekday 用 0=週日 … 6=週六，與 JavaScript 的 Date.getDay() 一致，
@@ -177,6 +209,7 @@ def calendar(cur, mmg_id: int, start: date, end: date) -> tuple[dict, bool]:
         return {}, False
     lo, hi, now = row
 
+    negative = functions.schedule_mode(cur) == "negative"
     cur.execute(
         "SELECT weekday, times FROM mmg_weekly_slot WHERE mmg_id = %s",
         (mmg_id,),
@@ -189,7 +222,11 @@ def calendar(cur, mmg_id: int, start: date, end: date) -> tuple[dict, bool]:
     )
     # 「排得出場」＝有星期常態或特例日。上架日期不算，因為那是必填的，
     # 每一齣都有；拿它當判準的話這個旗標永遠是真，就沒有意義了。
-    configured = bool(weekly or cur.fetchone()[0])
+    #
+    # negative 模式沒有「還沒設定」這回事——預設就是全開，所以恆為真。
+    # 不這樣寫的話，一家全時段開放的店會在前端看到「這齣戲尚未設定開放
+    # 時段，目前無法預約」，而畫面上每一天其實都可以選。
+    configured = negative or bool(weekly or cur.fetchone()[0])
 
     # 第 0 層直接把查詢範圍夾掉，後面兩層就不必再各自判斷一次。
     # 只夾到「日」——上架當天要保留下來，讓 _bookable 去濾掉那天
@@ -220,6 +257,9 @@ def calendar(cur, mmg_id: int, start: date, end: date) -> tuple[dict, bool]:
         if day in exceptions:
             is_open_day, times = exceptions[day]
             times = times if is_open_day else None
+        elif negative:
+            # 沒被例外關掉的日子全開——第 2、3 層在這個模式下不存在。
+            times = list(ALL_DAY)
         else:
             times = weekly.get(day.isoweekday() % 7)
         times = _bookable(times, day, lo, hi, now)
@@ -337,12 +377,17 @@ def set_rules(cur, mmg_id: int, weekly: list, exceptions: list) -> None:
     if len({wd for wd, _ in cleaned_weekly}) != len(cleaned_weekly):
         raise ScheduleError("同一個星期不能設定兩次")
 
+    negative = functions.schedule_mode(cur) == "negative"
     cleaned_exceptions = []
     for item in exceptions or []:
         day = str(item.get("date") or "").strip()
         if not day:
             raise ScheduleError("特例日期不能空白")
         open_day = bool(item.get("is_open"))
+        if open_day and negative:
+            raise ScheduleError(
+                f"這家店是全時段開放，例外日只能用來關閉（{day} 設成了開放）"
+            )
         # 關閉的那一天不看時段——「整天不開」沒有時段可言。前端就算送了
         # 一串過來也直接丟掉，免得畫面上留著一組永遠不會生效的時間。
         times = _clean_times(item.get("times"), f"{day}") if open_day else []

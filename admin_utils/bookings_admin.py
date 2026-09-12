@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from db import slot_cache
+from db import functions, slot_cache
 from db.bookings import (
     AWAITING_DEPOSIT,
     DAY_TYPES,
@@ -21,8 +21,10 @@ from db.bookings import (
     BookingError,
     create_booking,
     default_day_type,
+    derive_status,
     filter_clauses,
     paged,
+    pending_gm_count,
     record_deposit,
     require_deposit_set,
 )
@@ -254,19 +256,19 @@ def update(cur, booking_id: int, data: dict) -> bool:
     #   結果是兩位主持人都確認了、狀態卻停在 gm_confirm，那筆預約卡在那裡
     #   直到有人手動改狀態——而且管理員收不到「待收訂金」的通知信。
     #
-    # 「全數確認」的定義跟 confirm_gm 一致：沒指派人的角色不算數。
-    # 但多一個守衛——一位主持人都沒指派時不算全員確認，否則一筆還沒排
-    # 主持人的預約會自己跳到「待收訂金」。
-    assigned = [(u, c) for u, c in zip(new["gm_user_ids"], new["gm_confirmed"]) if u]
-    if (
-        new["status"] == current["status"] == "gm_confirm"
-        and assigned
-        and all(c for _, c in assigned)
-    ):
+    # 「全數確認」的定義跟 confirm_gm 一致：沒指派人的角色不算數，而且
+    # 一位都沒指派時不算全員確認（否則一筆還沒排主持人的預約會自己往前跳）
+    # ——這兩條現在都在 pending_gm_count 裡，三個轉移點共用同一份。
+    #
+    # 下一個狀態也是推導的：收訂金的店是「待收訂金」，不收的店直接成立。
+    pending = pending_gm_count(
+        new["gm_user_ids"], new["gm_confirmed"], mode=functions.gm_mode(cur)
+    )
+    if new["status"] == current["status"] == "gm_confirm" and pending == 0:
         cur.execute(
-            "UPDATE booking_record SET status = 'gm_reviewed' "
+            "UPDATE booking_record SET status = %s "
             "WHERE id = %s AND status = 'gm_confirm'",
-            (booking_id,),
+            (derive_status(cur, pending=0), booking_id),
         )
 
     # 2) 訂金收足 → booked。
@@ -275,7 +277,13 @@ def update(cur, booking_id: int, data: dict) -> bool:
     #   能一路走到底：第一條把狀態推到 gm_reviewed，record_deposit 從資料庫
     #   讀狀態（不是讀 current），所以看得到剛剛那一步的結果，再推到 booked。
     #   順序顛倒的話這種存檔只會走一半。
-    if new["status"] == current["status"] and new["deposit"] != current["deposit"]:
+    # 不收訂金的店沒有這條規則——那些店的預約不會停在「待收訂金」，
+    # 訂金欄位在畫面上也不存在。
+    if (
+        functions.deposit_required(cur)
+        and new["status"] == current["status"]
+        and new["deposit"] != current["deposit"]
+    ):
         record_deposit(cur, booking_id, new["deposit"])
 
     # ★ 這條路沒有走 db/bookings.py 的寫入函式（它自己下 UPDATE），所以

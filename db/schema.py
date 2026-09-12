@@ -60,6 +60,7 @@ def ensure_schema(cur) -> None:
         cur.execute("SELECT pg_advisory_xact_lock(hashtext('boo-king-king:ensure_schema'))")
 
         _ensure_settings(cur)
+        _ensure_functions(cur)
         _ensure_notification_template(cur)
         default_templates.ensure(cur)
         # roles 要在 users 之前——users.role 有外鍵指過來。
@@ -185,6 +186,51 @@ def _ensure_settings(cur) -> None:
             ('site_url',     'https://tutor-arthur.boo-king-king.workers.dev'),
             ('sender_name',  '步經徑'),
             ('sender_email', 'beethoreven@gmail.com')
+        ON CONFLICT (key) DO NOTHING
+        """
+    )
+
+
+def _ensure_functions(cur) -> None:
+    """這家店開了哪些功能。每一個值都會改變流程，說明見 db/functions.py。
+
+    ★ 預設值就是步經徑現在的行為。ON CONFLICT DO NOTHING 是「沒有才給
+      預設值」，不是「每次啟動都覆蓋回預設值」——後者會把店家調過的設定
+      默默蓋掉（同 abuse_rule、settings）。
+
+    ★ 新開一家店的資料庫會拿到這組預設值，然後用 SQL 改成那家店的組態。
+      例如 eli：
+
+        UPDATE functions SET value = 'off'      WHERE key = 'deposit';
+        UPDATE functions SET value = 'single'   WHERE key = 'gm.mode';
+        UPDATE functions SET value = 'negative' WHERE key = 'schedule.mode';
+        UPDATE functions SET value = 'off'      WHERE key = 'conflict.room';
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS functions (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            -- 給人看的說明。程式不讀它，但用 SQL 改設定的人需要知道
+            -- 這個鍵是什麼、有哪些值可選。
+            note  TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO functions (key, value, note) VALUES
+            ('deposit',         'on',
+             '收不收訂金。off：主持人確認完就直接成立，沒有「待收訂金」這個狀態'),
+            ('gm.mode',         'assign',
+             '主持人怎麼指定。assign 必須指定且要確認／single 固定唯一主持人、'
+             '建立時就視為已確認／option 可以不指定'),
+            ('schedule.mode',   'positive',
+             '排期怎麼開放。positive 預設不開放、設定的時段才開／'
+             'negative 預設全開、只有被關掉的時段不開'),
+            ('conflict.room',   'on',  '包廂卡場（軟擋：管理員看得到撞到什麼，仍可自行處理）'),
+            ('conflict.gm',     'on',  '主持人卡場（硬擋）'),
+            ('conflict.script', 'off', '同一齣劇本卡場（硬擋）。★ 尚未實作，值固定 off')
         ON CONFLICT (key) DO NOTHING
         """
     )
