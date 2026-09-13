@@ -25,6 +25,7 @@ from db.bookings import (
     filter_clauses,
     paged,
     pending_gm_count,
+    reachable_tabs,
     record_deposit,
     require_deposit_set,
 )
@@ -91,8 +92,12 @@ def list_tab(cur, tab: str, *, start: int = 1, filters: dict | None = None) -> d
 
 
 def overview(cur) -> dict:
-    """初次載入：五個子頁籤各第一頁。"""
-    return {tab: list_tab(cur, tab) for tab in TABS}
+    """初次載入：畫面上會出現的每一個子頁籤各第一頁。
+
+    ★ 跟著 reachable_tabs 走，不是固定五個：抓一個畫面上不存在的頁籤
+      只是白跑一趟查詢，而且回來的空清單沒有任何地方會顯示。
+    """
+    return {tab: list_tab(cur, tab) for tab in reachable_tabs(cur)}
 
 
 def create(cur, data: dict) -> int:

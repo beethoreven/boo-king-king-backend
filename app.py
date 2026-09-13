@@ -988,8 +988,14 @@ def create_booking_route():
 @app.get("/api/bookings/mine/tabs")
 @require_auth
 def my_booking_tabs():
-    """頁籤清單。只是把後端定義的順序與標籤交給前端，讓兩邊不會各寫一份。"""
-    return jsonify({"tabs": bookings_db.PLAYER_TABS})
+    """頁籤清單。只是把後端定義的順序與標籤交給前端，讓兩邊不會各寫一份。
+
+    ★ 給的是「這家店到得了的那幾個」，不是全部五個——理由見
+      db/bookings.reachable_tabs。
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            return jsonify({"tabs": bookings_db.reachable_tabs(cur)})
 
 
 @app.get("/api/bookings/mine/tab/<tab>")
@@ -1497,7 +1503,7 @@ def admin_bookings_overview():
     with pool.connection() as conn:
         with conn.cursor() as cur:
             return jsonify({
-                "tabs": bookings_admin.TABS,
+                "tabs": bookings_db.reachable_tabs(cur),
                 "data": bookings_admin.overview(cur),
             })
 

@@ -880,6 +880,40 @@ TAB_LABEL = {
 # 玩家的頁籤就是這五個狀態。
 PLAYER_TABS = TAB_LABEL
 
+
+def reachable_tabs(cur) -> dict[str, str]:
+    """這家店的設定下，哪些狀態真的到得了。
+
+    single 模式的待確認主持人數恆為 0，所以 gm_confirm 推導不出來；
+    不收訂金的店不會停在 gm_reviewed。把到不了的頁籤留在畫面上，店家
+    會一直點進去看到空的，然後問「我又不收訂金，為什麼有『等待支付
+    訂金』」——那是設定沒有反映到畫面上，不是她看錯。
+
+    ★ 但「現在真的有紀錄」的狀態一律保留，就算它已經到不了。設定是可以
+      改的，而改之前留下的那些場次不能因此從管理畫面上消失——看不見的
+      資料比多一個空頁籤危險得多。這也是唯一能把那些場次救回來的入口。
+
+    ★ 這支只決定「畫面上列出哪幾個」。list_tab 仍然接受全部五個，直接
+      用網址指定一個沒列出來的頁籤照樣查得到——把它擋掉只會讓上面那條
+      救援路徑斷掉。
+    """
+    out = dict(TAB_LABEL)
+    unreachable = set()
+    if functions.gm_mode(cur) == "single":
+        unreachable.add("gm_confirm")
+    if not functions.deposit_required(cur):
+        unreachable.add("gm_reviewed")
+    if not unreachable:
+        return out
+    cur.execute(
+        "SELECT DISTINCT status FROM booking_record WHERE status = ANY(%s)",
+        (sorted(unreachable),),
+    )
+    has_rows = {r[0] for r in cur.fetchall()}
+    for key in unreachable - has_rows:
+        out.pop(key, None)
+    return out
+
 # 已結束與已取消看最近的，其餘看最早的——待處理的先做舊的，已完結的
 # 通常是查最近那幾筆。跟主持人與管理員的清單同一個原則。
 _PLAYER_DESC_TABS = ("ended", "cancelled")
