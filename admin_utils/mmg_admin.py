@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from db import slot_cache
+from db import functions, slot_cache
 from db.bookings import BookingError
 
 # 台北是固定的 UTC+8，沒有日光節約，所以不需要 zoneinfo（那在某些精簡的
@@ -138,9 +138,35 @@ def get(cur, mmg_id: int) -> dict | None:
 
 
 def list_rooms(cur) -> list[dict]:
-    """所有包廂。給管理員編輯劇本時選用。"""
+    """所有包廂。給管理員編輯劇本時選用。
+
+    ★ 不看包廂的店（functions 表 conflict_room=off）回空的。
+
+      那種店的「包廂」不是一個少了幾間的清單，而是**這個概念不存在**——
+      rooms 表裡那一列只是因為 mmg.room_id 是 NOT NULL 外鍵而必須存在的
+      佔位（見 db/schema.py 的 _ensure_rooms），不是一間真的包廂。把它
+      端出去讓店家選，她會以為自己在設定一件有意義的事。
+
+      回空陣列而不是不回這個鍵：呼叫端不必分辨「沒有包廂」與「這個欄位
+      不見了」，前者用一個空清單就表達得完整。
+    """
+    if not functions.room_conflict_on(cur):
+        return []
     cur.execute("SELECT id, name FROM rooms ORDER BY id")
     return [{"id": r[0], "name": r[1]} for r in cur.fetchall()]
+
+
+def _room_id(cur, data: dict) -> int:
+    """這次寫入要用哪一間包廂。
+
+    ★ 不看包廂的店一律 1，收到什麼都不理。理由同 list_rooms：那種店沒有
+      「選包廂」這個動作，畫面上也沒有這個欄位，收到的值只可能來自手打
+      API 或是別家店的前端。全部落在同一間，也讓這個開關哪天被打開時，
+      「所有戲共用一間」這個事實立刻就是對的。
+    """
+    if not functions.room_conflict_on(cur):
+        return 1
+    return data.get("room_id") or 1
 
 
 def list_gm_candidates(cur) -> list[dict]:
@@ -279,7 +305,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
         "players": data.get("players"),
         "waitlist_limit": data.get("waitlist_limit"),
         "status": data["status"],
-        "room_id": data.get("room_id") or 1,
+        "room_id": _room_id(cur, data),
         # ★ 上架日期不可為空，見下方 _require_start 的說明。
         "start_booking": _require_start(data),
         # 下架日期可以留空 → NULL ＝ 沒有上限。日期輸入框清空時送過來的
@@ -391,7 +417,7 @@ def create(cur, data: dict) -> int:
             price, price_holiday, cost, cost_holiday,
             data.get("players"),
             data.get("waitlist_limit", 3), data.get("status", "active"),
-            data.get("room_id") or 1,
+            _room_id(cur, data),
             start, end,
             names[0], user_ids[0],
             names[1], user_ids[1],

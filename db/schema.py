@@ -459,6 +459,11 @@ def _ensure_rooms(cur) -> None:
         """
     )
     # 至少要有一間，否則 mmg.room_id 的預設值 1 會指向不存在的列。
+    #
+    # ★ 這一段**刻意不看 functions.conflict_room**，跟其他碰到包廂的地方
+    #   相反。那個開關管的是「要不要拿包廂當卡場條件」，這裡建的是外鍵
+    #   指得到的那一列——不看包廂的店，mmg.room_id 仍然是 NOT NULL，那一
+    #   列不存在的話整張 mmg 寫不進去。是結構需求，不是行為。
     cur.execute("SELECT COUNT(*) FROM rooms")
     if cur.fetchone()[0] == 0:
         cur.execute("INSERT INTO rooms (id, name) VALUES (1, %s)", ("包廂",))
