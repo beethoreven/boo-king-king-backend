@@ -910,7 +910,18 @@ def create_booking_route():
     except BookingError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    # ★ 整個省略是允許的，形狀錯才擋。single 模式的店（functions 表的
+    #   gm_mode）根本沒有「選主持人」這個畫面——主持人是系統依組態填的，
+    #   不是呼叫端挑的（見 db/bookings.create_booking），要求那種店的前端
+    #   送一個它沒有概念的空陣列過來只是儀式。
+    #
+    #   對 assign 模式也沒有放鬆：填成四個 null 之後 _validate_gm_choice
+    #   照樣擋，而且訊息更好——「《X》的角色 1「Y」尚未指定主持人」比
+    #   「gm_user_ids 需要是長度 4 的陣列」看得懂。真正壞掉的形狀
+    #   （字串、長度不對）仍然在這裡就被擋下。
     gm_user_ids = body.get("gm_user_ids")
+    if gm_user_ids is None:
+        gm_user_ids = [None, None, None, None]
     if not isinstance(gm_user_ids, list) or len(gm_user_ids) != 4:
         return bad_request("gm_user_ids 需要是長度 4 的陣列，沒有的角色填 null")
 
