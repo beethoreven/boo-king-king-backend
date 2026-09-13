@@ -175,7 +175,13 @@ def list_gm_candidates(cur) -> list[dict]:
     停用的不列出來——不該讓管理員把一個已經停用的帳號指派成新場次的
     主持人。已經被指派的停用帳號仍會留在 gm{n}_user 陣列裡（那是歷史
     事實），只是不會出現在「新增」的選項中。
+
+    ★ single 模式回空的，理由同 list_rooms。那種店沒有「挑主持人」這個
+      動作——主持人是系統依組態填的（見 db/bookings.create_booking）。
+      端一份名單出去，等於告訴店家有一個她做不到、也不該做的選擇。
     """
+    if functions.gm_mode(cur) == "single":
+        return []
     cur.execute(
         "SELECT id, name, email, role FROM users "
         "WHERE role <= 2 AND status = 'active' ORDER BY role, name"

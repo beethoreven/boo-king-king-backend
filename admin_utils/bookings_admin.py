@@ -198,7 +198,11 @@ def update(cur, booking_id: int, data: dict) -> bool:
     new = {
         "mmg_id": data.get("mmg_id"), "player_id": data.get("player_id"),
         "session_date": data.get("session_date"), "session_time": data.get("session_time"),
-        "status": status, "deposit": int(data.get("deposit") or 0),
+        # ★ 不收訂金的店一律 0，收到什麼都不理。那種店畫面上沒有這個欄位，
+        #   值只可能來自手打 API——而 record_deposit 在那種店本來就不會跑，
+        #   放行只會在紀錄裡留下一個沒有人收過、也不會影響任何流程的金額。
+        "status": status,
+        "deposit": int(data.get("deposit") or 0) if functions.deposit_required(cur) else 0,
         "note": (data.get("note") or "").strip() or None,
         "gm_user_ids": list(gm_user_ids), "gm_confirmed": gm_confirmed,
     }
