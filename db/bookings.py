@@ -311,8 +311,27 @@ def conflicting_gm(
     # 卡場條件本來就是每家店不同的那一組設定。
     if not functions.gm_conflict_on(cur):
         return None
-    if not gm_ids:
-        return None
+
+    # ★ single 模式**不看紀錄上掛了誰**。
+    #
+    #   這家店只有一位主持人，任何一場已成立的場次都佔著她的時間——包括
+    #   那些因為劇本沒替角色取名字、gm{n}_user_id 全是 null 的紀錄。照
+    #   gm{n}_user_id 比對的話那些紀錄一筆都對不上，而這種店沒有包廂概念、
+    #   劇本卡場也還沒實作，主持人卡場是**唯一**的保護——它安靜地失效的
+    #   症狀是同一個時間被訂走兩場不同的戲，要等到當天才會發現。
+    single = functions.gm_mode(cur) == "single"
+    if single:
+        who_join = "JOIN users u ON u.id = %(gms)s"
+        gms = functions.SINGLE_GM_USER_ID
+    else:
+        if not gm_ids:
+            return None
+        who_join = (
+            "JOIN users u ON u.id = ANY(%(gms)s)\n"
+            "                      AND u.id IN (b.gm1_user_id, b.gm2_user_id,\n"
+            "                                   b.gm3_user_id, b.gm4_user_id)"
+        )
+        gms = gm_ids
     cur.execute(
         f"""
         WITH me AS (
@@ -324,9 +343,7 @@ def conflicting_gm(
         SELECT u.id
           FROM booking_record b
           JOIN mmg m2 ON m2.id = b.mmg_id
-          JOIN users u ON u.id = ANY(%(gms)s)
-                      AND u.id IN (b.gm1_user_id, b.gm2_user_id,
-                                   b.gm3_user_id, b.gm4_user_id)
+          {who_join}
           CROSS JOIN me
          WHERE b.status = 'booked'
            AND NOT (b.mmg_id = %(mmg)s
@@ -336,7 +353,7 @@ def conflicting_gm(
            AND me.occupy_start < {_OCCUPY_END}
          LIMIT 1
         """,
-        {"gms": gm_ids, "mmg": mmg_id, "d": session_date, "t": session_time},
+        {"gms": gms, "mmg": mmg_id, "d": session_date, "t": session_time},
     )
     row = cur.fetchone()
     return row[0] if row else None
@@ -589,7 +606,18 @@ def create_booking(
         names = cur.fetchone() or (None, None, None, None)
         gm_user_ids = [functions.SINGLE_GM_USER_ID if n else None for n in names]
         gm_confirmed = [n is not None for n in names]
-        gm_ids = [i for i in gm_user_ids if i is not None]
+
+        # ★ 卡場要鎖、要查的那個人，跟「紀錄上掛了誰」不是同一件事。
+        #
+        #   這家店只有一位主持人，她的時間被佔住跟劇本有沒有替角色取名字
+        #   完全無關。沒取名的劇本上面那行會算出四個 null，拿它去查等於
+        #   _lock_gms 不鎖、conflicting_gm 第一行就 return None——**卡場
+        #   保護安靜地整個不存在**，而那是這種店唯一防止自己被重複預約的
+        #   機制（沒有包廂概念、劇本卡場尚未實作）。
+        #
+        #   症狀會是「同一個時間被訂走兩場不同的戲」，而且沒有任何錯誤
+        #   訊息，要等到當天才會發現。所以這裡不看名字，直接就是店主。
+        gm_ids = [functions.SINGLE_GM_USER_ID]
 
     # 劇本卡場（同一齣戲同時間只能有一場，跟包廂、主持人同級的硬擋）
     # **尚未實作**。功能表裡有這個鍵、值固定 off，被打開就當場失敗——
