@@ -202,9 +202,9 @@ def _ensure_functions(cur) -> None:
       例如 eli：
 
         UPDATE functions SET value = 'off'      WHERE key = 'deposit';
-        UPDATE functions SET value = 'single'   WHERE key = 'gm.mode';
-        UPDATE functions SET value = 'negative' WHERE key = 'schedule.mode';
-        UPDATE functions SET value = 'off'      WHERE key = 'conflict.room';
+        UPDATE functions SET value = 'single'   WHERE key = 'gm_mode';
+        UPDATE functions SET value = 'negative' WHERE key = 'schedule_mode';
+        UPDATE functions SET value = 'off'      WHERE key = 'conflict_room';
     """
     cur.execute(
         """
@@ -222,15 +222,15 @@ def _ensure_functions(cur) -> None:
         INSERT INTO functions (key, value, note) VALUES
             ('deposit',         'on',
              '收不收訂金。off：主持人確認完就直接成立，沒有「待收訂金」這個狀態'),
-            ('gm.mode',         'assign',
+            ('gm_mode',         'assign',
              '主持人怎麼指定。assign 必須指定且要確認／single 固定唯一主持人、'
              '建立時就視為已確認／option 可以不指定'),
-            ('schedule.mode',   'positive',
+            ('schedule_mode',   'positive',
              '排期怎麼開放。positive 預設不開放、設定的時段才開／'
              'negative 預設全開、只有被關掉的時段不開'),
-            ('conflict.room',   'on',  '包廂卡場（軟擋：管理員看得到撞到什麼，仍可自行處理）'),
-            ('conflict.gm',     'on',  '主持人卡場（硬擋）'),
-            ('conflict.script', 'off', '同一齣劇本卡場（硬擋）。★ 尚未實作，值固定 off')
+            ('conflict_room',   'on',  '包廂卡場（軟擋：管理員看得到撞到什麼，仍可自行處理）'),
+            ('conflict_gm',     'on',  '主持人卡場（硬擋）'),
+            ('conflict_script', 'off', '同一齣劇本卡場（硬擋）。★ 尚未實作，值固定 off')
         ON CONFLICT (key) DO NOTHING
         """
     )

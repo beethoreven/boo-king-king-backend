@@ -45,20 +45,20 @@ ALLOWED = {
     #   assign  必須指定，指定的人要按確認（步經徑）
     #   single  固定唯一主持人，建立時就指定好並視為已確認，不需要確認流程
     #   option  可以不指定；沒指定的角色不列入「還在等誰確認」
-    "gm.mode": ("assign", "single", "option"),
+    "gm_mode": ("assign", "single", "option"),
 
     # 排期怎麼開放：
     #   positive  預設不開放，管理員設定的時段才開放（步經徑）
     #   negative  預設全開放，只有被關掉的時段不開放
-    "schedule.mode": ("positive", "negative"),
+    "schedule_mode": ("positive", "negative"),
 
     # 卡場條件：同一個時間點，什麼東西被佔用就不能再開一場。
-    #   conflict.room    包廂（軟擋：管理員看得到是什麼撞到，仍可自行處理）
-    #   conflict.gm      主持人（硬擋）
-    #   conflict.script  同一齣劇本（硬擋）★ 尚未實作，值一定是 off
-    "conflict.room": ("on", "off"),
-    "conflict.gm": ("on", "off"),
-    "conflict.script": ("on", "off"),
+    #   conflict_room    包廂（軟擋：管理員看得到是什麼撞到，仍可自行處理）
+    #   conflict_gm      主持人（硬擋）
+    #   conflict_script  同一齣劇本（硬擋）★ 尚未實作，值一定是 off
+    "conflict_room": ("on", "off"),
+    "conflict_gm": ("on", "off"),
+    "conflict_script": ("on", "off"),
 }
 
 # single 模式下那位唯一的主持人。寫死 users.id = 1——一人店的第一個帳號
@@ -142,20 +142,20 @@ def deposit_required(cur) -> bool:
 
 
 def gm_mode(cur) -> str:
-    return get(cur, "gm.mode")
+    return get(cur, "gm_mode")
 
 
 def schedule_mode(cur) -> str:
-    return get(cur, "schedule.mode")
+    return get(cur, "schedule_mode")
 
 
 def room_conflict_on(cur) -> bool:
-    return on(cur, "conflict.room")
+    return on(cur, "conflict_room")
 
 
 def gm_conflict_on(cur) -> bool:
-    return on(cur, "conflict.gm")
+    return on(cur, "conflict_gm")
 
 
 def script_conflict_on(cur) -> bool:
-    return on(cur, "conflict.script")
+    return on(cur, "conflict_script")

@@ -22,7 +22,7 @@
 只開指定日／平常開臨時休／平常不開臨時加場）共用同一套結構，
 沒有 if-else 分岔。
 
-## 兩種開放方式（functions 表的 schedule.mode）
+## 兩種開放方式（functions 表的 schedule_mode）
 
     positive  預設不開放，管理員排出來的時段才開（上面那四層，步經徑）
     negative  預設全開放（每半小時一個單位，一天 48 格），只有被關掉的

@@ -261,7 +261,7 @@ def has_room_conflict(cur, mmg_id: int, session_date, session_time) -> tuple | N
     """
     # 這家店不卡包廂就沒有這件事。eli 那種一人一室、同一時間只可能有一場的
     # 店，包廂卡場等於重複擋一次主持人卡場已經擋掉的東西（functions 表的
-    # conflict.room）。
+    # conflict_room）。
     if not functions.room_conflict_on(cur):
         return None
 
@@ -306,7 +306,7 @@ def conflicting_gm(
     不是「這位主持人」本身——同一場遊戲底下各序位掛的是同一位主持人，
     那是同一件事被記錄很多次，不是這位主持人被排了兩場不同的戲。
     """
-    # functions 表的 conflict.gm。關掉的店等於「同一位主持人可以同時帶
+    # functions 表的 conflict_gm。關掉的店等於「同一位主持人可以同時帶
     # 兩場」——那不是一個真實的營運模式，所以預設開著；留成可關是因為
     # 卡場條件本來就是每家店不同的那一組設定。
     if not functions.gm_conflict_on(cur):
@@ -458,7 +458,7 @@ def _validate_gm_choice(cur, mmg_id: int, gm_user_ids: list[int | None]) -> None
     存在的使用者」，不保證「這個人在 mmg.gm1_user 的名單裡」。跨表的成員
     檢查要寫成約束得用 trigger，不划算，所以在這裡擋。
 
-    ★ 三種主持人模式在這裡的差別（functions 表的 gm.mode）：
+    ★ 三種主持人模式在這裡的差別（functions 表的 gm_mode）：
 
         assign  每個有名字的角色都必須指定，而且要在該角色的名單裡（現況）
         option  可以不指定；有指定的還是要在名單裡
@@ -574,7 +574,7 @@ def create_booking(
             raise BookingError("此時間未開放")
 
     # ★ single 模式：主持人不是呼叫端挑的。店裡只有一位主持人（functions 表
-    #   的 gm.mode = single），所以這裡直接把有名字的角色全部填成他，並且
+    #   的 gm_mode = single），所以這裡直接把有名字的角色全部填成他，並且
     #   當場標成「已確認」——後面每一段判斷「還在等誰確認」的程式碼因此
     #   完全不需要知道 single 這回事。
     #
@@ -596,7 +596,7 @@ def create_booking(
     # 默默不生效的話，店家會以為自己開了保護，而系統照樣讓兩場同時開。
     if functions.script_conflict_on(cur):
         raise BookingError(
-            "劇本卡場（conflict.script）尚未實作，請把 functions 表裡那一列改回 off"
+            "劇本卡場（conflict_script）尚未實作，請把 functions 表裡那一列改回 off"
         )
 
     day_type = day_type or default_day_type(session_date)
