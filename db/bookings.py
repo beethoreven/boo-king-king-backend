@@ -376,6 +376,15 @@ def find_conflicts(cur, booking_id: int) -> dict:
     用的是同一組定義（_OCCUPY_*）。三支必須一致：一支說可以、另一支說
     不行，畫面就會自相矛盾。
 
+    ★ 「一致」包含**功能表**，不只佔用區間（2026-09-13 補）。這支原本
+      無條件查兩種衝突，而另外兩支早就會看 conflict_room／conflict_gm。
+      關掉包廂卡場的店（例如一人店，所有戲共用同一個 room_id）因此會被
+      一堆它自己說不在乎的「包廂撞期」洗版——警告被洗到失去意義，比沒有
+      警告更糟：人會學會直接按過去，連真的那一次也按過去。
+
+      主持人那邊跟著 conflicting_gm 的同一條規則：single 模式看的是店主
+      本人，不是紀錄上掛了誰（劇本沒替角色取名字時那些欄位是空的）。
+
     都只看 status = 'booked'。同一個時段有好幾組在排隊是正常的（那正是
     序位的意義），真正的衝突是「已經成立的那一場把資源佔住了」。
     """
@@ -415,55 +424,70 @@ def find_conflicts(cur, booking_id: int) -> dict:
               "d": session_date, "t": session_time}
 
     # ── 包廂被兩場戲同時佔著 ──
-    cur.execute(
-        f"""
-        {me_cte}
-        SELECT DISTINCT m2.name, b2.session_date, b2.session_time
-          FROM booking_record b2
-          JOIN mmg m2 ON m2.id = b2.mmg_id
-          CROSS JOIN me
-         WHERE b2.status = 'booked'
-           AND b2.id <> %(booking_id)s
-           AND m2.room_id = me.room_id
-           {overlap}
-         ORDER BY b2.session_date, b2.session_time
-        """,
-        params,
-    )
-    room = [
-        {"mmg_name": r[0], "session_date": r[1].isoformat(),
-         "session_time": r[2].strftime("%H:%M")}
-        for r in cur.fetchall()
-    ]
-
-    # ── 某位主持人同時段已經有場 ──
-    gms = []
-    if gm_ids:
+    room = []
+    if functions.room_conflict_on(cur):
         cur.execute(
             f"""
             {me_cte}
-            SELECT DISTINCT u.id, u.name, m2.name, b2.session_date, b2.session_time
+            SELECT DISTINCT m2.name, b2.session_date, b2.session_time
               FROM booking_record b2
-              JOIN mmg m2  ON m2.id = b2.mmg_id
-              JOIN users u ON u.id = ANY(%(gm_ids)s)
-                          AND u.id IN (b2.gm1_user_id, b2.gm2_user_id,
-                                       b2.gm3_user_id, b2.gm4_user_id)
+              JOIN mmg m2 ON m2.id = b2.mmg_id
               CROSS JOIN me
              WHERE b2.status = 'booked'
                AND b2.id <> %(booking_id)s
+               AND m2.room_id = me.room_id
                {overlap}
              ORDER BY b2.session_date, b2.session_time
             """,
-            {**params, "gm_ids": gm_ids},
+            params,
         )
-        gms = [
-            {
-                "gm_id": r[0], "gm_name": r[1], "mmg_name": r[2],
-                "session_date": r[3].isoformat(),
-                "session_time": r[4].strftime("%H:%M"),
-            }
+        room = [
+            {"mmg_name": r[0], "session_date": r[1].isoformat(),
+             "session_time": r[2].strftime("%H:%M")}
             for r in cur.fetchall()
         ]
+
+    # ── 某位主持人同時段已經有場 ──
+    #
+    # single 模式不看 b2 的 gm 欄位，理由與 conflicting_gm 完全相同：
+    # 這家店只有一位主持人，任何一場已成立的場次都佔著她的時間，跟那筆
+    # 紀錄上有沒有寫她的 id 無關（劇本沒替角色取名字時那些欄位是空的）。
+    gms = []
+    if functions.gm_conflict_on(cur):
+        if functions.gm_mode(cur) == "single":
+            who_join = "JOIN users u ON u.id = %(gm_ids)s"
+            who = functions.SINGLE_GM_USER_ID
+        else:
+            who_join = (
+                "JOIN users u ON u.id = ANY(%(gm_ids)s)\n"
+                "                          AND u.id IN (b2.gm1_user_id, b2.gm2_user_id,\n"
+                "                                       b2.gm3_user_id, b2.gm4_user_id)"
+            )
+            who = gm_ids
+        if who:
+            cur.execute(
+                f"""
+                {me_cte}
+                SELECT DISTINCT u.id, u.name, m2.name, b2.session_date, b2.session_time
+                  FROM booking_record b2
+                  JOIN mmg m2  ON m2.id = b2.mmg_id
+                  {who_join}
+                  CROSS JOIN me
+                 WHERE b2.status = 'booked'
+                   AND b2.id <> %(booking_id)s
+                   {overlap}
+                 ORDER BY b2.session_date, b2.session_time
+                """,
+                {**params, "gm_ids": who},
+            )
+            gms = [
+                {
+                    "gm_id": r[0], "gm_name": r[1], "mmg_name": r[2],
+                    "session_date": r[3].isoformat(),
+                    "session_time": r[4].strftime("%H:%M"),
+                }
+                for r in cur.fetchall()
+            ]
 
     return {"room": room, "gms": gms}
 
