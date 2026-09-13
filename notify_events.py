@@ -25,6 +25,7 @@ import logging
 from datetime import date, datetime
 
 import notifications as nf
+from db import functions
 
 log = logging.getLogger(__name__)
 
@@ -180,16 +181,26 @@ def on_transition(cur, before: dict | None, after: dict | None) -> list:
 
     # ① 這次新被指定到的主持人。已經被指定過的不重寄——管理員為了改備註
     #    存一次檔，不該讓所有主持人再收一封「你被指定了」。
-    for gm in nf.users_by_id(cur, new_gms):
-        msg = nf.build(cur, "gm_assigned", [gm], {
-            **base,
-            "gm_name": gm["name"] or "主持人",
-            "gm_role": _gm_role_name(
-                cur, after["mmg_id"], after["gm_user_ids"], gm["id"]
-            ),
-        })
-        if msg:
-            out.append(msg)
+    #
+    # ★ single 模式整段跳過。那種店的主持人不是「被指定」的，是系統依組態
+    #   自動填上去的店主本人——她每收到一筆預約就收一封「你被指定為主持人，
+    #   請前往確認」，而信裡的按鈕連到的主持人介面在那種店根本不存在
+    #   （前端沒有那個畫面）。
+    #
+    #   她真正需要的那封是 ③「預約成立」，那封本來就會寄給訂場的玩家；
+    #   店家要知道有新預約的話，是另一件事、要另一種信，不是把一封講錯
+    #   對象的信留著充數。
+    if functions.gm_mode(cur) != "single":
+        for gm in nf.users_by_id(cur, new_gms):
+            msg = nf.build(cur, "gm_assigned", [gm], {
+                **base,
+                "gm_name": gm["name"] or "主持人",
+                "gm_role": _gm_role_name(
+                    cur, after["mmg_id"], after["gm_user_ids"], gm["id"]
+                ),
+            })
+            if msg:
+                out.append(msg)
 
     # ② 主持人全數確認 → 通知管理員去收訂金。
     if after["status"] == "gm_reviewed" != old_status:
