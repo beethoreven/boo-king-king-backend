@@ -1066,6 +1066,15 @@ def record_deposit(cur, booking_id: int, amount: int) -> dict:
     分兩次記錄金額湊足（先記一部分、之後補到滿額）。如果你要的是
     金額必須跟劇本要求分毫不差才轉態，這裡改成 = 即可。
     """
+    # ★ 不收訂金的店直接拒絕，不是靠呼叫端記得問。
+    #
+    #   目前兩個呼叫端都有問（bookings_admin.update 與玩家那條路），但
+    #   這是一支 public 函式——下一個呼叫點忘記問的時候，症狀是「這家店
+    #   明明不收訂金，卻有一筆預約因為訂金而改了狀態」，而那跟設定完全
+    #   對不起來，會查很久。守在這裡的話它當場就說得出原因。
+    if not functions.deposit_required(cur):
+        raise BookingError("這家店不收訂金（functions 表 deposit=off），不能記錄訂金")
+
     # 先鎖住這一列再看它的狀態與應收金額：鎖在 UPDATE 之前拿，中間就
     # 不會有別人（主持人按確認）把狀態從 gm_confirm 推到 gm_reviewed，
     # 讓這裡看到的跟 UPDATE 當下的不一樣。

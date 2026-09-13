@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from db import listing
+from db import functions, listing
 
 
 def _row_to_dict(cur, row) -> dict:
@@ -10,7 +10,13 @@ def _row_to_dict(cur, row) -> dict:
 
     角色是「名稱 + 可帶的人」一組：gm{n}_name 為 NULL 代表這個劇本沒有
     這個角色，那一組就不會出現在回傳的 gm_slots 裡。
+
+    ★ single 模式下 gms 一律回空的。這是玩家看得到的回應，而那種店的
+      玩家沒有「挑主持人」這個動作——主持人是系統依組態填的。名單送出去
+      只是把店裡誰是主持人這件事丟給每一個瀏覽劇本清單的人，而且前端
+      根本沒有地方用它（理由同 mmg_admin.list_gm_candidates）。
     """
+    single = functions.gm_mode(cur) == "single"
     (mid, name, url, period, price, cost, players, wl, status,
      n1, u1, n2, u2, n3, u3, n4, u4, price_holiday, cost_holiday) = row
 
@@ -19,7 +25,7 @@ def _row_to_dict(cur, row) -> dict:
         if gname is None:
             continue
         gms = []
-        if guids:
+        if guids and not single:
             cur.execute(
                 "SELECT id, name FROM users "
                 " WHERE id = ANY(%s) AND status = 'active' ORDER BY id",

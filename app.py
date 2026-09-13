@@ -804,6 +804,20 @@ def get_slot(mmg_id: int):
             #   玩家會看到「可進行預約」、把主持人也選完，直到按下送出
             #   才被 create_booking() 退回來。錯誤要出現在他還能改的時候。
             clash = bookings_db.has_room_conflict(cur, mmg_id, d, t)
+            # ★ 主持人卡場也要在這裡問，不能只問包廂。
+            #
+            #   一人店（gm_mode=single）通常同時是 conflict_room=off——
+            #   她沒有包廂的概念。那樣上面那一問永遠回 None，/slot 就永遠
+            #   說「可進行預約」，玩家把日期時間填完、按下送出，才被
+            #   create_booking() 用「某某在這個時間有場次」退回來。
+            #   **那正是這支端點存在要防的事。**
+            #
+            #   conflicting_gm 自己會判斷：single 模式下主持人是已知的
+            #   （就是店主），傳空陣列照樣查得出來；assign／option 模式
+            #   下主持人是玩家在畫面上挑的，這一刻還不知道是誰，那支會
+            #   直接回 None——那兩種模式仍然靠 /api/bookings/check-gm
+            #   在玩家選人的當下即時問。
+            gm_clash = bookings_db.conflicting_gm(cur, [], mmg_id, d, t)
             # 排期跟容量、撞期是三件不同的事，各自回一個旗標，訊息的
             # 優先序交給前端排（見 booking.js 的 slotMessage）。
             slot_open = schedule.is_open(cur, mmg_id, d, t)
@@ -830,7 +844,7 @@ def get_slot(mmg_id: int):
         #   看得到，所以不顯示的資訊也不要送。
         #   管理員與主持人要看細節，走 /api/bookings/<id>/conflicts，
         #   那一支有 role <= 2 的把關。
-        "has_conflict": clash is not None,
+        "has_conflict": clash is not None or gm_clash is not None,
         # ★ 刻意不回排隊清單。玩家需要知道的只有「排了幾組、我會是第幾個、
         #   訂不訂得成」——前面排的是誰、他們的預約在什麼狀態，那是別的
         #   客人的資料，跟他要做的決定無關。
@@ -1499,7 +1513,8 @@ def admin_create_user(cur, body):
 @app.get("/api/admin/bookings")
 @require_role(1)
 def admin_bookings_overview():
-    """初次載入：五個子頁籤各第一頁。翻頁與篩選走 /tab/<tab>。"""
+    """初次載入：這家店到得了的每一個子頁籤各第一頁（不是固定五個，
+    見 db/bookings.reachable_tabs）。翻頁與篩選走 /tab/<tab>。"""
     with pool.connection() as conn:
         with conn.cursor() as cur:
             return jsonify({

@@ -395,6 +395,13 @@ def set_rules(cur, mmg_id: int, weekly: list, exceptions: list) -> None:
     if len({d for d, _, _ in cleaned_exceptions}) != len(cleaned_exceptions):
         raise ScheduleError("同一個日期不能設定兩筆特例")
 
+    # ★ negative 模式不留 weekly。那個模式下第 2 層根本不會被讀
+    #   （open_times／is_open 在前面就早退了），寫進去的列是一份「看起來
+    #   像設定、實際上沒有任何作用」的資料——之後有人翻資料庫看到它，
+    #   會以為這家店有每週排班。前端送的是空陣列，但這條規則不能靠前端：
+    #   手打 API 照樣塞得進來。
+    if negative:
+        cleaned_weekly = []
     cur.execute("DELETE FROM mmg_weekly_slot WHERE mmg_id = %s", (mmg_id,))
     for wd, times in cleaned_weekly:
         cur.execute(
