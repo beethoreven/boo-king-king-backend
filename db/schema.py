@@ -75,8 +75,61 @@ def ensure_schema(cur) -> None:
         _ensure_sessions(cur)
         _ensure_abuse_log(cur)
         _ensure_abuse_rule(cur)
+        _ensure_line_template(cur)
 
         _schema_ready = True
+
+
+def _ensure_line_template(cur) -> None:
+    """LINE bot 在群組裡的回覆文字。
+
+    跟 notification_template 分開，不是重複：那張是 email 用的
+    （subject + body_html），LINE 回覆是**純文字、沒有主旨**。硬塞進去
+    會讓那兩個欄位都在說謊——subject 永遠用不到，body_html 裡裝的不是
+    HTML。分成兩張表，各自的欄位就都是真的。
+
+    ★ 沒有介面，用 SQL 改（同 settings、functions、abuse_rule）：
+
+        UPDATE line_template SET text = '好的，{date} {time} 的《{mmg_name}》排好了'
+         WHERE key = 'booked';
+
+    可用的變數見每一列的 note。用 str.format 展開，所以文字裡的大括號
+    要成對——寫錯會在回覆時當場失敗，而不是默默送出一段壞掉的字。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS line_template (
+            key  TEXT PRIMARY KEY,
+            text TEXT NOT NULL,
+            -- 給人看的說明：這句話什麼時候會出現、可以用哪些變數。
+            note TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO line_template (key, text, note) VALUES
+            ('booked',
+             '✅ 已排定《{mmg_name}》{date} {time}',
+             '訂場成功。變數：mmg_name、date、time'),
+            ('conflict',
+             '❌ 這個時間已經有場次了，請換一個時間',
+             '撞場（主持人或包廂被佔住）。沒有變數'),
+            ('not_open',
+             '❌ 這個時間沒有開放',
+             '該時段不在開放範圍，或已經過了。沒有變數'),
+            ('bad_datetime',
+             '❌ 日期時間看不懂。格式是「2026/10/5 14:00」，年份要寫',
+             '日期或時間解析失敗。沒有變數'),
+            ('script_not_found',
+             '❌ 找不到《{name}》這齣，請確認名稱',
+             '劇本名稱對不到。變數：name（使用者打的那串）'),
+            ('unknown',
+             '抱歉，我不知道你在說什麼',
+             '有 tag 我但不是「預訂」開頭。沒有變數')
+        ON CONFLICT (key) DO NOTHING
+        """
+    )
 
 
 def _ensure_sessions(cur) -> None:
@@ -376,6 +429,19 @@ def _ensure_users(cur) -> None:
     for ddl in (
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS abuse_point INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_until TIMESTAMPTZ",
+        # LINE Messaging API 的 userId（U 開頭 32 碼）。推播要用它當收件人。
+        #
+        # ★ 跟 users.line_id **是兩個不同的東西，不要共用**。line_id 是
+        #   使用者註冊時自己打的「LINE ID」，那是給店家人工聯絡用的字串，
+        #   跟 Messaging API 完全無關——拿它去推播只會 400。
+        #
+        # ★ userId 是 per-channel 的：每店一個 LINE 官方帳號，各自是獨立的
+        #   id 空間，跟每店獨立基礎設施的架構一致。
+        #
+        # 只有需要收 LINE 推播的人要填（目前是店主本人），其餘留空。
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS line_user_id TEXT",
+        "CREATE UNIQUE INDEX IF NOT EXISTS users_line_user_id_key "
+        "ON users (line_user_id) WHERE line_user_id IS NOT NULL",
     ):
         cur.execute(ddl)
 

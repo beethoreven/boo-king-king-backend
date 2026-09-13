@@ -34,6 +34,9 @@ from db import slot_cache  # noqa: E402
 from db.bookings import BookingError  # noqa: E402
 from db.connection import pool  # noqa: E402
 from db.schema import ensure_schema  # noqa: E402
+from line_utils import client as line_client  # noqa: E402
+from line_utils import handler as line_handler  # noqa: E402
+from line_utils import signature as line_signature  # noqa: E402
 import notifications  # noqa: E402
 import notify_events  # noqa: E402
 
@@ -226,6 +229,17 @@ else:
         flush=True,
     )
 
+# 同一個理由：LINE 沒設定時整包停用，而「停用」在外面看起來跟「正常」
+# 一模一樣——群組裡 tag bot 沒反應，沒有人會知道是憑證沒設。
+if line_client.enabled():
+    print("[info] LINE bot 已啟用（群組訂場 + 推播）", flush=True)
+else:
+    print(
+        "[warn] LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN 未設定，"
+        "LINE bot 停用——webhook 會回 503。",
+        flush=True,
+    )
+
 # Flask 預設會把 JSON 物件的鍵照字母排序輸出。對大部分回應無所謂，但
 # 管理員場次管理的 tabs 是「照營運流程排的子頁籤順序」
 # （待主持確認 → 待收訂金 → 已成立 → 已結束 → 已取消），排序過會變成
@@ -354,6 +368,90 @@ def run_weekly_jobs():
 
     result = jobs.run_weekly(pool)
     return jsonify(result), (500 if result.get("errors") else 200)
+
+
+@app.post("/line/webhook")
+def line_webhook():
+    """LINE Messaging API 的 webhook。
+
+    ## 這支沒有登入，簽章就是把關
+
+    網址是公開的、沒有 session。唯一能證明「這包資料真的來自 LINE」的是
+    X-Line-Signature。驗不過一律 401——否則任何人都能 POST 一包假事件
+    進來，在店家的系統上訂出場次。
+
+    ## 5 秒
+
+    LINE 的逾時是 5 秒，超過就當失敗並重送。所以這裡只做非做不可的事：
+    驗簽、查劇本、寫入、回覆。推播丟背景佇列。
+    真正的風險不在這段程式，在 Render 免費方案的冷啟動（約 60 秒）——
+    那靠 24/7 保活解決。
+
+    ## 一律回 200（除了驗簽失敗）
+
+    ★ 處理單一事件失敗時**不要**回 5xx。LINE 會重送整包，而那包裡可能
+      有已經處理成功的事件——雖然 request_id 擋得住重複訂場，但重送也
+      會重新回覆一次，群組裡就會出現兩句一樣的話。失敗記 log，回 200。
+    """
+    if not line_client.enabled():
+        return jsonify({"error": "LINE 未設定"}), 503
+
+    raw = request.get_data()
+    # ★ 一定要用原始 bytes。先 json.loads 再 dumps 會改變空白與鍵序，
+    #   雜湊就對不上——症狀是「設定明明都對卻一直 401」。
+    if not line_signature.verify(
+        raw, request.headers.get("X-Line-Signature"), line_client.channel_secret()
+    ):
+        return jsonify({"error": "簽章驗證失敗"}), 401
+
+    body = request.get_json(silent=True) or {}
+    for event in body.get("events") or []:
+        try:
+            _handle_line_event(event)
+        except Exception as exc:  # noqa: BLE001 - 見上面「一律回 200」
+            app.logger.warning("LINE 事件處理失敗：%s", exc, exc_info=True)
+    return jsonify({"ok": True})
+
+
+def _handle_line_event(event: dict) -> None:
+    """一則事件。寫入與回覆分開：commit 之後才回，才不會回了卻沒存進去。"""
+    source = event.get("source") or {}
+    msg = event.get("message") or {}
+    reply_token = event.get("replyToken")
+
+    # ── 一對一：拿自己的 userId ──
+    #
+    # 推播要有收件人的 userId，而那只有在對方跟 bot 有互動之後才拿得到。
+    # 店主私訊一句「我的ID」，bot 把 id 回給她，再由人寫進 users
+    # .line_user_id。一次性，所以不做綁定流程。
+    #
+    # ★ 回的是「你自己的 id」，對任何人都一樣——不是誰的秘密，沒有洩漏。
+    if (
+        source.get("type") == "user"
+        and msg.get("type") == "text"
+        and (msg.get("text") or "").strip().replace(" ", "").upper() in ("我的ID", "MYID")
+    ):
+        if reply_token and source.get("userId"):
+            line_client.reply(reply_token, f"你的 LINE userId：\n{source['userId']}")
+        return
+
+    if not line_handler.is_group_text_to_me(event):
+        # 沒 tag 我就完全不反應——不回覆、不寫入、不記 log。群組裡大部分
+        # 訊息都跟 bot 無關，每一則都留一筆 log 只會把真的錯誤淹掉。
+        return
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            text, booked = line_handler.handle_group_message(cur, event)
+            targets = line_handler.push_targets(cur) if booked else []
+        conn.commit()
+
+    if reply_token:
+        line_client.reply(reply_token, text)
+    # ★ commit 之後才推播，跟 notifications.dispatch 同一條規則：交易回捲
+    #   時不該有人已經收到「訂好了」。
+    if targets:
+        line_client.push(targets, text)
 
 
 @app.get("/internal/idle-gap-stats")
