@@ -4,7 +4,8 @@
 
 兩個環境變數缺任何一個，整支停用——路由回 503、不收訊、不推播。
 理由跟 BREVO_API_KEY 一樣：憑證不是行為，不放進 functions 表。
-步經徑的部署不設，等於它完全沒有 LINE 這個面。
+步經徑的部署不設，等於它完全沒有 LINE 這個面——資料庫裡也不建 LINE 的
+表與欄位（見 db/schema.py 的 ensure_schema）。
 
     LINE_CHANNEL_SECRET        驗 webhook 簽章用
     LINE_CHANNEL_ACCESS_TOKEN  呼叫 Reply／Push API 用

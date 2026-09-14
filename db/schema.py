@@ -22,6 +22,7 @@ from __future__ import annotations
 import threading
 
 from db import default_templates
+from line_utils import client as line_client
 
 _schema_ready = False
 _schema_lock = threading.Lock()
@@ -75,9 +76,38 @@ def ensure_schema(cur) -> None:
         _ensure_sessions(cur)
         _ensure_abuse_log(cur)
         _ensure_abuse_rule(cur)
-        _ensure_line_template(cur)
+
+        # ★ LINE 是模組，不是每一家都有。沒設定 LINE 的店，資料庫裡就不建
+        #   它的表與欄位——那家店用不到的東西不該留在它的資料庫裡（案主
+        #   2026-09-14）。判斷用的是跟 webhook 同一支 enabled()，所以「服務
+        #   說 LINE 開著」跟「資料庫有 LINE 的表」不會兜不起來。
+        #
+        #   之後要開：設好兩個環境變數、重新部署，開機時就會建出來。
+        #   反過來把 LINE 關掉，已經建好的不會自己消失：移除是一次刻意的資料
+        #   庫操作（重建搬舊資料），不是開機時順手做的事。
+        if line_client.enabled():
+            _ensure_line(cur)
 
         _schema_ready = True
+
+
+def _ensure_line(cur) -> None:
+    """LINE 模組需要的全部 schema。只有這一店有設定 LINE 才會被呼叫。"""
+    # LINE Messaging API 的 userId（U 開頭 32 碼）。推播要用它當收件人，
+    # 也用它判斷「傳訊息來的是不是店家人員」。
+    #
+    # ★ 跟 users.line_id **是兩個不同的東西，不要共用**。line_id 是
+    #   使用者註冊時自己打的「LINE ID」，那是給店家人工聯絡用的字串，
+    #   跟 Messaging API 完全無關——拿它去推播只會 400。
+    #
+    # ★ userId 是 per-channel 的：每店一個 LINE 官方帳號，各自是獨立的
+    #   id 空間，跟每店獨立基礎設施的架構一致。
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS line_user_id TEXT")
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS users_line_user_id_key "
+        "ON users (line_user_id) WHERE line_user_id IS NOT NULL"
+    )
+    _ensure_line_template(cur)
 
 
 def _ensure_line_template(cur) -> None:
@@ -436,19 +466,7 @@ def _ensure_users(cur) -> None:
     for ddl in (
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS abuse_point INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_until TIMESTAMPTZ",
-        # LINE Messaging API 的 userId（U 開頭 32 碼）。推播要用它當收件人。
-        #
-        # ★ 跟 users.line_id **是兩個不同的東西，不要共用**。line_id 是
-        #   使用者註冊時自己打的「LINE ID」，那是給店家人工聯絡用的字串，
-        #   跟 Messaging API 完全無關——拿它去推播只會 400。
-        #
-        # ★ userId 是 per-channel 的：每店一個 LINE 官方帳號，各自是獨立的
-        #   id 空間，跟每店獨立基礎設施的架構一致。
-        #
-        # 只有需要收 LINE 推播的人要填（目前是店主本人），其餘留空。
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS line_user_id TEXT",
-        "CREATE UNIQUE INDEX IF NOT EXISTS users_line_user_id_key "
-        "ON users (line_user_id) WHERE line_user_id IS NOT NULL",
+        # LINE 的 line_user_id 不在這裡：它只屬於有開 LINE 的店，見 _ensure_line。
     ):
         cur.execute(ddl)
 
