@@ -1,4 +1,4 @@
-"""五個觸發點：把「發生了什麼事」翻成「要寄哪封信給誰」。
+"""通知的觸發點：把「發生了什麼事」翻成「要寄哪封信給誰」。
 
 跟 notifications.py 分開，是因為兩者變動的理由不同：那支是寄信的機制
 （佇列、逾時、重試），這支是業務規則（誰該被通知）。改「主持人確認後也要
@@ -153,9 +153,36 @@ def _booking_values(cur, booking: dict) -> dict:
     }
 
 
-# ── ①②③ 預約的狀態變化 ────────────────────────────────────────
+def _contact_text(cur, user_id: int) -> str:
+    """預定者的 LINE ID 與電話，跟使用者管理畫面同一個寫法（LINE xxx · 電話）。
+
+    兩個都沒填就回空字串——範本裡那一列會整列拿掉，不留一行空白的「聯絡」。
+    """
+    cur.execute("SELECT line_id, phone FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    if row is None:
+        return ""
+    line_id, phone = ((v or "").strip() for v in row)
+    parts = ([f"LINE {line_id}"] if line_id else []) + ([phone] if phone else [])
+    return " · ".join(parts)
+
+
+def _deposit_paid_text(cur, booking: dict) -> str:
+    """已收／應收。不收訂金的店回空字串（範本裡那一列會整列拿掉）。
+
+    ★ 看功能表，不是看金額是不是 0：收訂金的店也可能有一筆記成 0 元（管理員
+      在後台直接改成預約成立），那正是管理員該在信裡看到的事。
+    """
+    if not functions.deposit_required(cur):
+        return ""
+    paid = booking.get("deposit") or 0
+    due = booking.get("booking_cost")
+    return f"已收 {paid} 元（應收 {due} 元）" if due is not None else f"已收 {paid} 元"
+
+
+# ── ①②③⑥ 預約的狀態變化 ──────────────────────────────────────
 #
-# 三封預約通知都由**同一支**函式決定，比對「動作前」與「動作後」的預約。
+# 預約相關的通知都由**同一支**函式決定，比對「動作前」與「動作後」的預約。
 # 這樣寫而不是在四個路由各自插一段，是因為同一個狀態可以從好幾條路到達：
 # booked 可以是玩家付了訂金自動轉的，也可以是管理員在後台直接改的；
 # gm_reviewed 可以是最後一位主持人按了確認，也可以是管理員勾了確認欄。
@@ -187,9 +214,8 @@ def on_transition(cur, before: dict | None, after: dict | None) -> list:
     #   請前往確認」，而信裡的按鈕連到的主持人介面在那種店根本不存在
     #   （前端沒有那個畫面）。
     #
-    #   她真正需要的那封是 ③「預約成立」，那封本來就會寄給訂場的玩家；
-    #   店家要知道有新預約的話，是另一件事、要另一種信，不是把一封講錯
-    #   對象的信留著充數。
+    #   店家要知道有新預約，靠的是 ⑥「場次成立通知」（寄給管理員），不是把
+    #   一封講錯對象的信留著充數。
     if functions.gm_mode(cur) != "single":
         for gm in nf.users_by_id(cur, new_gms):
             msg = nf.build(cur, "gm_assigned", [gm], {
@@ -209,10 +235,28 @@ def on_transition(cur, before: dict | None, after: dict | None) -> list:
             out.append(msg)
 
     # ③ 預約成立 → 通知玩家。唯一一封寄給一般玩家的信，也是唯一一封
-    #    結尾寫「（請勿回覆）」的：其他四封的收件人都是店內人員。
+    #    結尾寫「（請勿回覆）」的：其他幾封的收件人都是店內人員。
     if after["status"] == "booked" != old_status:
         player = nf.users_by_id(cur, [after["player_id"]])
         msg = nf.build(cur, "player_booked", player, base)
+        if msg:
+            out.append(msg)
+
+    # ⑥ 預約成立 → 通知所有管理員（案主 2026-09-14）。
+    #
+    #    跟 ③ 同一個條件，寄給店家這一側。讓場次成立的人本身是管理員時
+    #    **不排除他**（案主決定）——例如步經徑是管理員登記訂金收足才成立，
+    #    他照樣會收到這封。
+    #
+    #    選填的列交給範本決定出不出現：這裡給空字串，那一列就整列拿掉。
+    if after["status"] == "booked" != old_status:
+        msg = nf.build(cur, "admin_booked", nf.admins(cur), {
+            **base,
+            "gm_list": "" if functions.gm_mode(cur) == "single" else base["gm_list"],
+            "contact": _contact_text(cur, after["player_id"]),
+            "deposit_paid": _deposit_paid_text(cur, after),
+            "note": (after.get("note") or "").strip(),
+        })
         if msg:
             out.append(msg)
 

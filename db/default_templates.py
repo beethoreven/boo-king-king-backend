@@ -1,4 +1,4 @@
-"""五封通知信的預設內容。
+"""通知信的預設內容。
 
 只在 `notification_template` 還沒有那一列時寫進去（ON CONFLICT DO NOTHING），
 所以案主用 SQL 改過的內容不會被下一次部署蓋掉。要恢復預設就把那一列刪掉，
@@ -71,10 +71,31 @@ def _row(key: str, value: str) -> str:
     return f'<div><span style="{_KEY}">{key}</span>{value}</div>'
 
 
+# 懸掛縮排：值太長折到第二行時，第二行對齊值那一欄，不縮回標籤底下。
+# 手機上最明顯——場次時間、聯絡方式都常常一行放不下。
+_ROW_HANG = "padding-left:4.5em;text-indent:-4.5em;"
+
+
+def _hrow(key: str, value: str, *, only_if: str | None = None) -> str:
+    """一列資料（懸掛縮排版）。
+
+    only_if 給一個變數名：寄出前那個變數沒有值（None 或空字串），整列就
+    拿掉，見 notifications.render。
+
+    ★ text-indent 會被 inline-block 的標籤繼承，所以標籤要自己歸零，不然
+      標籤的字會被推出框外。
+    """
+    cond = f' data-if="{only_if}"' if only_if else ""
+    return (
+        f'<div{cond} style="{_ROW_HANG}">'
+        f'<span style="{_KEY}text-indent:0;">{key}</span>{value}</div>'
+    )
+
+
 def _btn(text: str) -> str:
     """按鈕，底下固定跟著那行紅色警語。
 
-    綁在一起而不是各封自己加，是為了讓「之後新增第六封信」不會漏掉——
+    綁在一起而不是各封自己加，是為了讓「之後再新增一封信」不會漏掉——
     漏掉的後果是那封信的收件人少一道提醒，而這種漏掉沒有人會發現。
 
     ★ href 用 {{link}} 而不是 {{site_url}}：site_url 是站台根目錄，而根
@@ -178,6 +199,32 @@ TEMPLATES: dict[str, tuple[str, str]] = {
 {_foot()}
 </div>''',
     ),
+    # ── ⑥ 管理員：預約成立 ──────────────────────────────────
+    #
+    # 跟 ③（寄給玩家）同一個時間點，寄給店家這一側（案主 2026-09-14）。
+    #
+    # 選填的四列跟著功能表與資料出現，值是空字串就整列拿掉：
+    #   主持  gm_mode 是 single 時不給——那種店的主持人就是店主本人
+    #   聯絡  預定者沒填 LINE ID 也沒填電話時不給
+    #   訂金  deposit 關掉時不給
+    #   備註  沒寫時不給；有換行就照原樣換行
+    "admin_booked": (
+        "【場次成立通知】《{{mmg_name}}》{{session_short}}",
+        f'''<div style="{_WRAP}">
+<p style="margin:0 0 20px;">有一筆預約<strong>已經成立</strong>。</p>
+<div style="{_BOX}">
+{_hrow("劇本", "<strong>{{mmg_name}}</strong>")}
+{_hrow("場次", "<strong>{{session}}</strong>")}
+{_hrow("主持", "{{gm_list}}", only_if="gm_list")}
+{_hrow("預定者", "{{player_name}}")}
+{_hrow("聯絡", "{{contact}}", only_if="contact")}
+{_hrow("訂金", "{{deposit_paid}}", only_if="deposit_paid")}
+{_hrow("備註", "{{note}}", only_if="note")}
+</div>
+{_btn("查看場次")}
+{_foot()}
+</div>''',
+    ),
 }
 
 
@@ -217,7 +264,7 @@ def ensure(cur) -> None:
 
 def reset(cur, *keys: str) -> list[str]:
     """把指定的範本**覆蓋**成這個檔案裡的預設值，回傳實際改到的 key。
-    不給 keys 就是全部五封。
+    不給 keys 就是全部。
 
     ★ 這支會蓋掉案主用 SQL 改過的內容，所以刻意**不在啟動時呼叫**——
       ensure() 才是啟動時跑的那支。這支是給「改了程式碼的預設內容，要把

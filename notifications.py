@@ -130,10 +130,10 @@ _RAW_VALUES = ("site_url", "link")
 #
 # ★ **這是唯一寫著路由形狀的地方。** 不要把 ?view=... 寫進範本——範本存在
 #   資料庫裡，寫死的話之後路由一改（查詢參數換成真路徑、或頁籤改名）就要
-#   改五列資料，而且改漏了不會有任何錯誤，只會有人點了信落在錯的地方。
+#   改每一列資料，而且改漏了不會有任何錯誤，只會有人點了信落在錯的地方。
 #
 # ★ 沒對到的 key 退回 site_url，也就是站台首頁——跟做路由之前一樣。新增
-#   第六封信而忘了加對應時，它會落在首頁（可以接受），而不是變成一個壞掉
+#   一封信而忘了加對應時，它會落在首頁（可以接受），而不是變成一個壞掉
 #   的連結（不能接受）。
 _BUTTON_TARGET = {
     "gm_assigned": "view=gm&tab=pending",
@@ -141,13 +141,14 @@ _BUTTON_TARGET = {
     "player_booked": "view=mybookings&tab=booked",
     "abuse_point": "view=admin&tab=abuse",
     "abuse_banned": "view=admin&tab=users",
+    "admin_booked": "view=admin&tab=bookings&sub=booked",
 }
 
 
 def _check_button_targets() -> None:
     """_BUTTON_TARGET 必須**剛好**覆蓋所有範本，不多不少。
 
-    ★ 這裡刻意不做「對不到就退回首頁」。退回首頁的話，新增第六封信而忘了
+    ★ 這裡刻意不做「對不到就退回首頁」。退回首頁的話，新增一封信而忘了
       給它目的地時，信照樣寄得出去、按鈕照樣點得動，只是每個收件人都落在
       預約畫面——沒有錯誤、沒有人回報，而那正是這整件事一開始要修的毛病。
       寧可讓程式在啟動時就起不來：那時候只有工程師在看，而且一定看得到。
@@ -182,7 +183,16 @@ def _button_link(site_url: str, key: str) -> str:
     return f"{site_url}{'&' if '?' in site_url else '?'}{_BUTTON_TARGET[key]}"
 
 
-def render(text: str, values: dict) -> str:
+# 選填的列：<div data-if="note" …>…</div>。note 沒有值（None 或空字串）
+# 就整列拿掉。範本用 default_templates._hrow(..., only_if=...) 產生這個形狀。
+#
+# ★ 只認「一層 div、裡面沒有別的 div」——範本裡的每一列本來就是這樣（標籤是
+#   span、值是行內文字）。用 SQL 改範本時在這種列裡再塞 div 的話，這裡會切在
+#   第一個 </div>，版面會壞得看得見，不會安靜地少一段。
+_OPTIONAL_ROW = re.compile(r'<div\b([^>]*?)\s+data-if="(\w+)"([^>]*)>(.*?)</div>', re.S)
+
+
+def render(text: str, values: dict, *, body: bool = False) -> str:
     """把 {{name}} 換成 values['name']，**值會做 HTML 逃逸**。
 
     逃逸是必要的而不是保險：劇本名稱與使用者暱稱都是使用者輸入，裡面
@@ -195,15 +205,36 @@ def render(text: str, values: dict) -> str:
       照原樣代入是安全的。
 
     找不到的變數留原樣不換——那是範本寫錯，讓它顯眼比悄悄變成空字串好，
-    因為空字串會讓信看起來只是「少了一行」，沒有人會發現。
+    因為空字串會讓信看起來只是「少了一行」，沒有人會發現。選填的列也一樣：
+    data-if 指的變數根本沒給，那一列就留著（連 {{name}} 一起）。
+
+    body=True（信的內文）時多做兩件事：拿掉沒有值的選填列、值裡的換行變成
+    <br>——備註是 textarea 打的，換行是寫的人自己排的。逃逸之後才換，所以
+    使用者打不出任何標籤。主旨不做：主旨裡不會有列，也不能有 <br>。
     """
+    if body:
+        def keep_or_drop(m):
+            name = m.group(2)
+            if name not in values:
+                return m.group(0)
+            if values[name] is None or values[name] == "":
+                return ""
+            return f"<div{m.group(1)}{m.group(3)}>{m.group(4)}</div>"
+
+        text = _OPTIONAL_ROW.sub(keep_or_drop, text)
+
     def sub(m):
         name = m.group(1)
         if name not in values:
             return m.group(0)
         raw = values[name]
         text_val = "" if raw is None else str(raw)
-        return text_val if name in _RAW_VALUES else html.escape(text_val)
+        if name in _RAW_VALUES:
+            return text_val
+        escaped = html.escape(text_val)
+        if body:
+            escaped = escaped.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+        return escaped
 
     return _HOLE.sub(sub, text)
 
@@ -230,7 +261,7 @@ def build(cur, key: str, recipients: list[dict], values: dict) -> Message | None
     if tpl is None or not tpl["enabled"]:
         return None
     values = {**settings(cur), **values}
-    # 算在這裡而不是讓五個觸發點各自傳：build() 是每一封信都會經過的地方，
+    # 算在這裡而不是讓每個觸發點各自傳：build() 是每一封信都會經過的地方，
     # 所以 link 不可能漏掉。理由跟 default_templates._btn() 把警語綁在按鈕
     # 上是同一個——會漏掉而且漏了不會有人發現的事，要放在共用的那一層。
     values["link"] = _button_link(values.get("site_url") or "", key)
@@ -241,7 +272,7 @@ def build(cur, key: str, recipients: list[dict], values: dict) -> Message | None
             "name": values.get("sender_name") or values.get("site_name") or "",
         },
         subject=render(tpl["subject"], values),
-        html_body=render(tpl["body"], values),
+        html_body=render(tpl["body"], values, body=True),
     )
 
 

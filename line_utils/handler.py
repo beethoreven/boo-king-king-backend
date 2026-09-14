@@ -16,6 +16,7 @@ from db.bookings import (
     REASON_OVERLAP,
     REASON_SAME_TIME,
     BookingError,
+    BookingResult,
     create_booking,
 )
 
@@ -88,7 +89,7 @@ def mentionees_of(event: dict) -> list[dict]:
     return ((msg.get("mention") or {}).get("mentionees")) or []
 
 
-def handle_group_message(cur, event: dict) -> tuple[str, bool]:
+def handle_group_message(cur, event: dict) -> tuple[str, BookingResult | None]:
     """群組裡 tag 我的那一則：先把 @mention 挖掉，剩下的交給 handle_command。"""
     msg = event["message"]
     text = commands.strip_mentions(msg.get("text") or "", mentionees_of(event))
@@ -97,14 +98,18 @@ def handle_group_message(cur, event: dict) -> tuple[str, bool]:
 
 
 def handle_command(cur, text: str, webhook_event_id: str, *,
-                   sender: str | None) -> tuple[str, bool]:
-    """處理一段已經清乾淨的指令文字，回傳 (要回覆的字, 有沒有真的訂到)。
+                   sender: str | None) -> tuple[str, BookingResult | None]:
+    """處理一段已經清乾淨的指令文字，回傳 (要回覆的字, 訂到的那一筆)。
+
+    第二個值沒訂到就是 None；訂到了是 create_booking 的結果——呼叫端要靠它的
+    already_existed 分辨「這次新訂的」與「LINE 重送同一個事件、先前就訂好的」，
+    後者不該再推播、再寄信。
 
     群組（tag 之後）與私訊共用這一段——兩條路的差別只在「怎麼判斷是在跟
     bot 講話」，**誰有資格、指令規則、回覆文字全部一樣**。分開寫的話，哪天
     改了其中一條，另一條就會忘了跟著改。
 
-    ★ 第二個值不能靠看第一個值的內容推。回覆文字是店家自己在
+    ★ 訂沒訂到不能靠看第一個值的內容推。回覆文字是店家自己在
       line_template 裡改的，用「開頭是不是 ✅」來判斷成不成功的話，她
       哪天把那個 emoji 拿掉，推播就會安靜地停掉——而「通知沒發出去」
       這種事沒有人會回報。
@@ -124,14 +129,14 @@ def handle_command(cur, text: str, webhook_event_id: str, *,
     #   （同一天稍早的版本是先看「是不是預訂」，不是預訂的回「我不知道你在說
     #   什麼」；案主改成不管說什麼都回沒有權限。）
     if not is_staff(cur, sender):
-        return line_template.render(cur, "no_permission", owner_name=_owner_name(cur)), False
+        return line_template.render(cur, "no_permission", owner_name=_owner_name(cur)), None
 
     kind, payload = commands.parse(text)
 
     if kind == commands.UNKNOWN:
-        return line_template.render(cur, "unknown"), False
+        return line_template.render(cur, "unknown"), None
     if kind == commands.BAD_DATETIME:
-        return line_template.render(cur, "bad_datetime"), False
+        return line_template.render(cur, "bad_datetime"), None
 
     name = payload["name"]
     cur.execute(
@@ -140,7 +145,7 @@ def handle_command(cur, text: str, webhook_event_id: str, *,
     )
     row = cur.fetchone()
     if row is None:
-        return line_template.render(cur, "script_not_found", name=name), False
+        return line_template.render(cur, "script_not_found", name=name), None
     mmg_id, mmg_name = row
 
     # ★ 這裡把 BookingError 接住、翻成回覆文字、不往外拋——所以這一段依賴
@@ -150,7 +155,7 @@ def handle_command(cur, text: str, webhook_event_id: str, *,
     #   了」、資料庫卻多一筆。哪天 create_booking 又改回先寫後查，這裡要跟著
     #   補一道 SAVEPOINT。
     try:
-        create_booking(
+        result = create_booking(
             cur,
             mmg_id=mmg_id,
             player_id=STORE_ACCOUNT_ID,
@@ -163,14 +168,14 @@ def handle_command(cur, text: str, webhook_event_id: str, *,
     except BookingError as exc:
         # 後端的訊息是寫給管理員看的（帶劇本名、主持人名）。群組裡有別的
         # 客人，所以這裡換成店家自己寫的那幾句，不把內部細節倒出去。
-        return _failure_text(cur, exc), False
+        return _failure_text(cur, exc), None
 
     return line_template.render(
         cur, "booked",
         mmg_name=mmg_name,
         date=payload["date"].strftime("%Y/%-m/%-d"),
         time=payload["time"].strftime("%H:%M"),
-    ), True
+    ), result
 
 
 # 被拒的原因代碼 → 回哪一句（line_template 的 key）。

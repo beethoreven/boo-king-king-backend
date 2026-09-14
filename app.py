@@ -423,6 +423,8 @@ def _handle_line_event(event: dict) -> None:
 
     ★ 私訊這條是因為 **LINE for Mac 的 @ 選單不列官方帳號**（2026-09-14
       實測，手機版可以），而店主就是用 Mac。私訊不需要 tag，Mac 上通。
+
+    訂到之後兩條路做一樣的事，見 _after_line_booking。
     """
     source = event.get("source") or {}
     msg = event.get("message") or {}
@@ -447,17 +449,16 @@ def _handle_line_event(event: dict) -> None:
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 # 權限在 handle_command 裡判斷，群組那條也是同一段。
-                reply_text, booked = line_handler.handle_command(
+                reply_text, result = line_handler.handle_command(
                     cur, text, event["webhookEventId"], sender=sender
                 )
-                # ★ 只有訂成功才找收件人：任何錯誤（沒權限、格式錯、撞場…）
-                #   都不推播。
-                targets = line_handler.push_targets(cur, exclude=sender) if booked else []
+                targets, outbox = _after_line_booking(cur, result, sender)
             conn.commit()
         if reply_token:
             line_client.reply(reply_token, reply_text)
         if targets:
             line_client.push(targets, reply_text)
+        notifications.dispatch(outbox)
         return
 
     # ── 群組 ──
@@ -468,18 +469,38 @@ def _handle_line_event(event: dict) -> None:
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            text, booked = line_handler.handle_group_message(cur, event)
-            # 排除發訊的人，理由見 push_targets。
-            targets = (line_handler.push_targets(cur, exclude=source.get("userId"))
-                       if booked else [])
+            text, result = line_handler.handle_group_message(cur, event)
+            targets, outbox = _after_line_booking(cur, result, source.get("userId"))
         conn.commit()
 
     if reply_token:
         line_client.reply(reply_token, text)
-    # ★ commit 之後才推播，跟 notifications.dispatch 同一條規則：交易回捲
-    #   時不該有人已經收到「訂好了」。
+    # ★ commit 之後才推播、才寄信，跟網站那幾條路同一條規則：交易回捲時
+    #   不該有人已經收到「訂好了」。
     if targets:
         line_client.push(targets, text)
+    notifications.dispatch(outbox)
+
+
+def _after_line_booking(cur, result, sender: str | None) -> tuple[list, list | None]:
+    """LINE 訂到場之後要發的東西：(推播收件人, 通知信)。在 commit 之前呼叫。
+
+    ★ 沒訂到（沒權限、格式錯、撞場…）什麼都不發。
+
+    ★ LINE 重送同一個事件時 create_booking 回 already_existed——那一筆第一次
+      就發過了，這次什麼都不重發，不然店家會收到兩次一樣的推播與信。
+
+    ★ 信跟網站走同一支 notify_events.on_transition（案主 2026-09-14：LINE 訂的
+      場也要寄）。要寄哪幾封、寄給誰，規則只有那一份；哪一封在這家店不寄，
+      是 notification_template.enabled 的事，不在這裡挑。
+    """
+    if result is None or result.already_existed:
+        return [], []
+    booking = bookings_db.get_booking(cur, result.id)
+    # 排除發訊的人，理由見 push_targets。
+    targets = line_handler.push_targets(cur, exclude=sender)
+    outbox = notify_events.on_transition(cur, None, booking)
+    return targets, outbox
 
 
 @app.get("/internal/idle-gap-stats")
