@@ -11,7 +11,13 @@ import logging
 import uuid
 
 from db import line_template
-from db.bookings import BookingError, create_booking
+from db.bookings import (
+    REASON_NOT_OPEN,
+    REASON_OVERLAP,
+    REASON_SAME_TIME,
+    BookingError,
+    create_booking,
+)
 
 from line_utils import commands
 
@@ -128,7 +134,7 @@ def handle_command(cur, text: str, webhook_event_id: str) -> tuple[str, bool]:
     except BookingError as exc:
         # 後端的訊息是寫給管理員看的（帶劇本名、主持人名）。群組裡有別的
         # 客人，所以這裡換成店家自己寫的那幾句，不把內部細節倒出去。
-        return _failure_text(cur, str(exc)), False
+        return _failure_text(cur, exc), False
 
     return line_template.render(
         cur, "booked",
@@ -138,28 +144,30 @@ def handle_command(cur, text: str, webhook_event_id: str) -> tuple[str, bool]:
     ), True
 
 
-# 後端錯誤 → 要回哪一句。比對的是那幾句錯誤訊息裡穩定的片語。
+# 被拒的原因代碼 → 回哪一句（line_template 的 key）。
 #
-# ★ 對不到就回 conflict（最常見的那一種），而且**記一筆 log**。安靜地
-#   回錯一句話是最難發現的——群組裡看到「已經有場次了」的人不會想到
-#   那其實是別的原因。
-_FAILURE_HINTS = (
-    ("未開放", "not_open"),
-    ("已經過了", "not_open"),
-    ("未開放預約", "not_open"),
-    ("衝突", "conflict"),
-    ("無法預定", "conflict"),
-    ("已經被預約", "conflict"),
-    ("額滿", "conflict"),
-)
+# ★ 看的是 BookingError.reason，**不是錯誤訊息的文字**。原本這裡是拿
+#   「無法預定」「已經被預約」這些中文片語去比對，那樣後端哪天為了網頁改一
+#   個字，這邊就會悄悄分錯類，而且不會報錯（2026-09-14 改掉）。
+#
+#   template key 的 conflict 沿用舊名：店家可能已經改過那一列的字，換成新
+#   key 的話她改過的內容會被晾在一列沒人讀的資料上。
+_REASON_TEMPLATE = {
+    REASON_SAME_TIME: "conflict",   # ❌ 這個時間已經有場次了
+    REASON_OVERLAP: "overlap",      # ❌ 與其他場次所需時間重疊
+    REASON_NOT_OPEN: "not_open",    # ❌ 這個時間沒有開放
+}
 
 
-def _failure_text(cur, message: str) -> str:
-    for needle, key in _FAILURE_HINTS:
-        if needle in message:
-            return line_template.render(cur, key)
-    log.warning("LINE：分類不到的訂場失敗，回了 conflict。原訊息：%s", message)
-    return line_template.render(cur, "conflict")
+def _failure_text(cur, exc: BookingError) -> str:
+    key = _REASON_TEMPLATE.get(exc.reason)
+    if key is None:
+        # ★ 沒有原因代碼的拒絕（例如劇本設定有問題）。回 conflict 是退而求其次，
+        #   而且**一定要記 log**：安靜地回錯一句話是最難發現的——群組裡看到
+        #   「已經有場次了」的人不會想到那其實是別的原因。
+        log.warning("LINE：沒有原因代碼的訂場失敗，回了 conflict。原訊息：%s", exc)
+        key = "conflict"
+    return line_template.render(cur, key)
 
 
 def is_staff(cur, line_user_id: str | None) -> bool:

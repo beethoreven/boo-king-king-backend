@@ -15,8 +15,26 @@ from datetime import datetime
 from db import functions, listing, schedule, slot_cache
 
 
+# 預約被拒的原因代碼。給程式分流用，見 BookingError.reason。
+REASON_SAME_TIME = "same_time"  # 那個開始時間已經有場（不管是哪一齣）
+REASON_OVERLAP = "overlap"      # 跟其他場次的佔用時間重疊，但開始時間不同
+REASON_NOT_OPEN = "not_open"    # 劇本沒上架、時段沒開放、或時間已經過了
+
+
 class BookingError(Exception):
-    """預約無法成立。訊息是給使用者看的。"""
+    """預約無法成立。訊息是給使用者看的。
+
+    reason 是**給程式看的**原因代碼（REASON_*），沒有特別分類的錯誤是 None。
+
+    ★ 要依原因分流時看 reason，**不要比對訊息文字**。訊息是寫給人看的，
+      會因為畫面不同而措辭不同、也會被人為了語氣改掉；拿中文字串去比對，
+      改一個字就會悄悄分錯類，而且不會報錯（LINE bot 原本就是這樣做的，
+      2026-09-14 改掉）。
+    """
+
+    def __init__(self, message: str, *, reason: str | None = None):
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass
@@ -291,6 +309,60 @@ def has_room_conflict(cur, mmg_id: int, session_date, session_time) -> tuple | N
         {"mmg": mmg_id, "d": session_date, "t": session_time},
     )
     return cur.fetchone()
+
+
+def _occupied_reason(cur, resource: str, mmg_id: int, session_date, session_time,
+                     *, gm_ids: list[int] | None = None) -> str:
+    """已經確定要因為「被佔住」而拒絕時，分辨是哪一種：同一個開始時間，還是
+    時間重疊。
+
+    ★ 只在拒絕的那條路上呼叫，成功訂場完全不會多這一次查詢。
+
+    ★ 刻意**不改** has_room_conflict／conflicting_gm 的回傳值：conflicting_gm
+      的回傳被 /api/bookings/check-gm 當成使用者 id 去查名字，has_room_conflict
+      的回傳會進管理員看到的詳細訊息。改它們的排序或形狀，步經徑的畫面就會跟著
+      變。這裡另外問一句「那個開始時間點有沒有場」，只用來決定原因代碼。
+
+    規則（案主 2026-09-14 選的規則 B）：**只看開始時間是否相同，不管是哪一齣**。
+    已經有「丹水山莊 14:00」時，有人訂「傀儡的記憶 14:00」也算 same_time——那個
+    時間點已經有場了；訂「丹水山莊 15:00」才算 overlap。
+
+    範圍跟觸發拒絕的那一支一致：包廂看同一間包廂，主持人看同一位主持人
+    （single 模式下就是店主，任何一場都算）。狀態只看 booked，跟兩支衝突檢查
+    相同。
+
+    ★ **不排除同一齣戲**。兩支衝突檢查會排除「同一齣戲、同一個開始時間」，
+      但這裡不能照抄：如果那個時間點已經有同一齣的場，而隔壁時段又有別齣
+      撞到主持人，主持人檢查會先觸發——這時那個時間點確實已經有場，照規則 B
+      要回 same_time，排除掉就會錯判成 overlap。
+    """
+    base = """
+        SELECT 1 FROM booking_record b
+         WHERE b.status = 'booked'
+           AND b.session_date = %(d)s
+           AND b.session_time = %(t)s
+    """
+    params = {"mmg": mmg_id, "d": session_date, "t": session_time}
+    if resource == "room":
+        sql = base + """
+           AND (SELECT room_id FROM mmg WHERE id = b.mmg_id)
+             = (SELECT room_id FROM mmg WHERE id = %(mmg)s)
+        """
+    elif functions.gm_mode(cur) == "single":
+        sql = base
+    else:
+        # ★ 一定要明確轉成 integer[]。psycopg 會把 Python 的 [1] 轉成
+        #   smallint[]，而 ARRAY[b.gm1_user_id, …] 是 integer[]，兩邊型別不同
+        #   && 就找不到運算子，整個查詢直接拋 UndefinedFunction。
+        #   這條路在每一次「主持人撞期被拒」都會跑（不只 LINE），沒轉型的話
+        #   步經徑原本回 409 的情況會變成 500（2026-09-14 測試抓到）。
+        sql = base + """
+           AND %(gms)s::integer[] && ARRAY[b.gm1_user_id, b.gm2_user_id,
+                                          b.gm3_user_id, b.gm4_user_id]
+        """
+        params["gms"] = list(gm_ids or [])
+    cur.execute(sql + " LIMIT 1", params)
+    return REASON_SAME_TIME if cur.fetchone() else REASON_OVERLAP
 
 
 def conflicting_gm(
@@ -593,7 +665,7 @@ def create_booking(
         {"id": mmg_id, "now": now},
     )
     if not cur.fetchone()[0]:
-        raise BookingError("此劇本目前未開放預約")
+        raise BookingError("此劇本目前未開放預約", reason=REASON_NOT_OPEN)
 
     if allow_closed_slot:
         # 管理員在「場次管理」新增：不問排期，連過去的時間都可以——那是在
@@ -610,9 +682,9 @@ def create_booking(
         # 會走到這裡的真實情境是：玩家把頁面開著，選了今天 19:00，拖到
         # 19:01 才按送出。回「此時間未開放」會讓他以為這個時段本來就沒開。
         if datetime.combine(session_date, session_time) <= now:
-            raise BookingError("這個時段已經過了，請重新選擇")
+            raise BookingError("這個時段已經過了，請重新選擇", reason=REASON_NOT_OPEN)
         if not schedule.is_open(cur, mmg_id, session_date, session_time):
-            raise BookingError("此時間未開放")
+            raise BookingError("此時間未開放", reason=REASON_NOT_OPEN)
 
     # ★ single 模式：主持人不是呼叫端挑的。店裡只有一位主持人（functions 表
     #   的 gm_mode = single），所以這裡直接把有名字的角色全部填成他，並且
@@ -681,23 +753,29 @@ def create_booking(
 
     clash = has_room_conflict(cur, mmg_id, session_date, session_time)
     if clash is not None:
+        reason = _occupied_reason(cur, "room", mmg_id, session_date, session_time)
         # ★ 預設不講是被什麼撞到。這支同時服務玩家與管理員兩條路徑，
         #   而玩家不該知道包廂裡在演什麼、誰訂的、演到幾點——那是別的
         #   客人的預約。管理員要處理衝突，才傳 detailed_conflict=True。
         if not detailed_conflict:
-            raise BookingError("本時段有衝突場次，請改選其他時間")
+            raise BookingError("本時段有衝突場次，請改選其他時間", reason=reason)
         other_name, other_d, other_t, other_period, other_reset = clash
         raise BookingError(
             f"包廂在這段時間已經排了《{other_name}》"
             f"（{other_d} {other_t:%H:%M} 起 {other_period:g} 小時"
-            f"，另需 {other_reset:g} 小時還原場地），時段衝突"
+            f"，另需 {other_reset:g} 小時還原場地），時段衝突",
+            reason=reason,
         )
 
     conflicting = conflicting_gm(cur, gm_ids, mmg_id, session_date, session_time)
     if conflicting is not None:
         cur.execute("SELECT name FROM users WHERE id = %s", (conflicting,))
         gm_name = cur.fetchone()[0]
-        raise BookingError(f"{gm_name}在這個時間有場次無法預定")
+        raise BookingError(
+            f"{gm_name}在這個時間有場次無法預定",
+            reason=_occupied_reason(cur, "gm", mmg_id, session_date, session_time,
+                                    gm_ids=gm_ids),
+        )
 
     cur.execute(
         "SELECT COUNT(*) FROM booking_record "
@@ -748,11 +826,15 @@ def create_booking(
             #   內部欄位的值講給玩家聽，而且「已額滿」暗示有人在排、等別人取消
             #   就有機會——但這種店沒有候補制度，那個時段就是被訂走了，等下去
             #   沒有意義。前端的 slotMessage 用同一條規則（看 slot.capacity）。
+            # 容量擋下的一定是「同一齣戲、同一個開始時間」（衝突檢查已經把
+            # 這種情況排除在外了），所以原因固定是 same_time。
             if waitlist_limit == 1:
-                raise BookingError("這個時段已經被預約了，請改選其他時間")
+                raise BookingError("這個時段已經被預約了，請改選其他時間",
+                                   reason=REASON_SAME_TIME)
             raise BookingError(
                 f"《{mms_name}》{session_date} {session_time} 已額滿"
-                f"（最多 {waitlist_limit} 組）"
+                f"（最多 {waitlist_limit} 組）",
+                reason=REASON_SAME_TIME,
             )
         cur.execute(
             """
