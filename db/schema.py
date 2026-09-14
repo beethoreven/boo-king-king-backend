@@ -129,10 +129,10 @@ def _ensure_line_template(cur) -> None:
              '劇本名稱對不到。變數：name（使用者打的那串）'),
             ('unknown',
              '抱歉，我不知道你在說什麼',
-             '有 tag 我但不是「預訂」開頭。沒有變數'),
+             '店家人員傳來、但不是「預訂」開頭（群組 tag 或私訊）。沒有變數'),
             ('no_permission',
              '抱歉，你沒有權限透過我預訂，請聯繫{owner_name}。',
-             '不是店家人員卻傳了「預訂」（群組或私訊）。'
+             '不是店家人員傳來的任何訊息（群組 tag 或私訊；私訊「我的ID」除外）。'
              '變數：owner_name（LINE 訂場掛名的帳號的名字，即 users.id = 1）')
         ON CONFLICT (key) DO NOTHING
         """

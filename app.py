@@ -416,10 +416,10 @@ def line_webhook():
 def _handle_line_event(event: dict) -> None:
     """一則事件。寫入與回覆分開：commit 之後才回，才不會回了卻沒存進去。
 
-    兩條路會訂場，**資格一樣**——只有綁定過 LINE 的店家人員（見 is_staff）：
+    兩條路**資格一樣**——只有綁定過 LINE 的店家人員（見 is_staff）能用：
 
-        群組  tag 我    其他人傳「預訂」回 no_permission（沒有權限，請聯繫店主）
-        私訊  私訊我    同上
+        群組  tag 我    其他人不管傳什麼都回 no_permission（沒有權限，請聯繫店主）
+        私訊  私訊我    同上；只有「我的ID」誰都能問（綁定要先拿到這個 id）
 
     ★ 私訊這條是因為 **LINE for Mac 的 @ 選單不列官方帳號**（2026-09-14
       實測，手機版可以），而店主就是用 Mac。私訊不需要 tag，Mac 上通。

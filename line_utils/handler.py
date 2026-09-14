@@ -113,21 +113,23 @@ def handle_command(cur, text: str, webhook_event_id: str, *,
       無從判斷是「格式錯」還是「bot 死了」。唯一不回的情況是伺服器
       根本沒醒（那時候這支不會被呼叫到），那沒辦法。
     """
+    # ★ 權限排在**所有判斷之前**（案主 2026-09-14）。
+    #
+    #   只有店家人員能跟 bot 互動，群組與私訊都一樣：不是店家人員的，不管傳
+    #   什麼（「預訂 …」、「哈囉」、格式打錯）一律回 no_permission。
+    #
+    #   排在最前面也代表沒權限的人拿不到「找不到這齣」「那個時間已經有場」
+    #   這些回覆——那些等於在告訴他劇本名單與場次狀況。
+    #
+    #   （同一天稍早的版本是先看「是不是預訂」，不是預訂的回「我不知道你在說
+    #   什麼」；案主改成不管說什麼都回沒有權限。）
+    if not is_staff(cur, sender):
+        return line_template.render(cur, "no_permission", owner_name=_owner_name(cur)), False
+
     kind, payload = commands.parse(text)
 
     if kind == commands.UNKNOWN:
         return line_template.render(cur, "unknown"), False
-
-    # ★ 權限排在「是不是預訂」之後、**其他所有檢查之前**（案主 2026-09-14）。
-    #
-    #   只有店家人員能透過 bot 訂場，群組與私訊都一樣。排在最前面是刻意的：
-    #   沒權限的人不該先拿到「找不到這齣」「日期時間看不懂」「那個時間已經
-    #   有場」這些回覆——那些等於在告訴他劇本名單與場次狀況，而他本來就不能
-    #   訂。不是預訂的訊息（例如「哈囉」）照舊回「我不知道你在說什麼」，那句
-    #   對任何人都一樣。
-    if not is_staff(cur, sender):
-        return line_template.render(cur, "no_permission", owner_name=_owner_name(cur)), False
-
     if kind == commands.BAD_DATETIME:
         return line_template.render(cur, "bad_datetime"), False
 
@@ -207,7 +209,8 @@ def is_staff(cur, line_user_id: str | None) -> bool:
 
     LINE 訂的場一律掛在店主名下（STORE_ACCOUNT_ID），所以能訂場的人必須是
     店家自己人。私訊任何人加了好友都能傳；群組裡則是玩家也在——案主
-    2026-09-14 定：玩家在群組 tag 也不能訂，一律回 no_permission 那句。
+    2026-09-14 定：玩家在群組 tag 也不能用；不是店家人員的訊息，不管內容
+    一律回 no_permission 那句。
     （更早的版本群組是誰都能訂，理由是「群組是店家邀的私人群組」，已改掉。）
 
     ## 為什麼是「綁定＋角色」而不是把某個 id 寫在程式裡
