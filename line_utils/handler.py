@@ -108,19 +108,12 @@ def handle_command(cur, text: str, webhook_event_id: str) -> tuple[str, bool]:
         return line_template.render(cur, "script_not_found", name=name), False
     mmg_id, mmg_name = row
 
-    # ★ 一定要包 SAVEPOINT，失敗時自己退回。
-    #
-    #   create_booking 的順序是**先 INSERT、再檢查容量**，超過才拋 BookingError
-    #   ——它把「退掉那一筆」交給呼叫端（網頁那條路是 conn.rollback()）。但這裡
-    #   把錯誤接住、翻成回覆文字、**不往外拋**，呼叫端接著就 commit 了。
-    #
-    #   沒有這一道的症狀：群組裡 bot 回「這個時間已經有場次了」，**資料庫裡
-    #   卻多了一筆**。在序位上限 1 的店就是超賣，而且回覆說的跟事實相反，
-    #   沒有任何人會發現（2026-09-14 私訊訂場的測試抓到）。
-    #
-    #   用 SAVEPOINT 而不是要求呼叫端 rollback：這支函式就應該保證「回傳 False
-    #   時什麼都沒留下」，不該讓每個呼叫點各自記得收拾。
-    cur.execute("SAVEPOINT line_booking")
+    # ★ 這裡把 BookingError 接住、翻成回覆文字、不往外拋——所以這一段依賴
+    #   create_booking 的保證：**拋錯的時候什麼都沒寫**（先查再寫，見那支的
+    #   說明）。那個保證是 2026-09-14 補的；在那之前它是「先寫、滿了才拋」，
+    #   靠呼叫端 rollback，而這裡沒有 rollback，結果就是回覆說「已經有場次
+    #   了」、資料庫卻多一筆。哪天 create_booking 又改回先寫後查，這裡要跟著
+    #   補一道 SAVEPOINT。
     try:
         create_booking(
             cur,
@@ -133,11 +126,9 @@ def handle_command(cur, text: str, webhook_event_id: str) -> tuple[str, bool]:
             request_id=request_id_for(webhook_event_id),
         )
     except BookingError as exc:
-        cur.execute("ROLLBACK TO SAVEPOINT line_booking")
         # 後端的訊息是寫給管理員看的（帶劇本名、主持人名）。群組裡有別的
         # 客人，所以這裡換成店家自己寫的那幾句，不把內部細節倒出去。
         return _failure_text(cur, str(exc)), False
-    cur.execute("RELEASE SAVEPOINT line_booking")
 
     return line_template.render(
         cur, "booked",

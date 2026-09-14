@@ -714,34 +714,34 @@ def create_booking(
         cur, pending=pending_gm_count(gm_user_ids, gm_confirmed,
                                       mode=functions.gm_mode(cur))
     )
-    cur.execute(
-        """
-        INSERT INTO booking_record
-            (mmg_id, player_id, session_date, session_time, day_type, status,
-             gm1_user_id, gm1_confirmed, gm2_user_id, gm2_confirmed,
-             gm3_user_id, gm3_confirmed, gm4_user_id, gm4_confirmed, request_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (request_id) DO NOTHING
-        RETURNING id
-        """,
-        (mmg_id, player_id, session_date, session_time, day_type, status,
-         gm_user_ids[0], gm_confirmed[0], gm_user_ids[1], gm_confirmed[1],
-         gm_user_ids[2], gm_confirmed[2], gm_user_ids[3], gm_confirmed[3],
-         request_id),
-    )
-    row = cur.fetchone()
+    # ── 先查再寫（2026-09-14 改）──────────────────────────────────
+    #
+    # 原本的順序是「先 INSERT、再檢查容量、滿了才拋錯」，把退掉那一筆交給
+    # 呼叫端（網頁與管理員兩條路都有 conn.rollback()）。那是一個**隱性約定**：
+    # 每個新的呼叫點都得記得失敗要退。LINE bot 那一條沒記得，結果回覆說
+    # 「已經有場次了」，資料庫卻多了一筆。
+    #
+    # 要不要拒絕，在寫入之前就已經算得出來——current 是上面數的，而且在
+    # _lock_slot 裡。INSERT 原本擺在前面，唯一的理由是讓「同一次意圖的重試」
+    # 先被攔下來；那件事用 request_id 先查一樣做得到。所以改成：
+    #
+    #     先查是不是重試 → 是新的才看容量 → 沒滿才寫
+    #
+    # 對原本兩個呼叫點，**最後的資料庫結果完全相同**，差別只在「滿了的時候
+    # 根本不寫」——它們的 rollback 從此沒有東西可退，但留著無害。
+    cur.execute("SELECT id FROM booking_record WHERE request_id = %s", (request_id,))
+    existing = cur.fetchone()
 
-    if row is None:
-        # 這個 request_id 先前就寫進去了——同一次意圖的重試。
-        # 回報成功並附上原本那筆，不是失敗：玩家只按了一次，
+    if existing is not None:
+        # 同一次意圖的重試。回報成功並附上原本那筆，不是失敗：玩家只按了一次，
         # 中間是網路出問題，不該讓他以為預約沒成立而再按一次。
-        cur.execute("SELECT id FROM booking_record WHERE request_id = %s", (request_id,))
-        booking_id = cur.fetchone()[0]
+        #
+        # ★ 刻意**不看容量**：一個已經成立的預約即使現在時段滿了，重試時仍該
+        #   回報它原本的狀態，而不是因為「滿了」被拒絕。（原本 INSERT 擺在
+        #   容量檢查前面就是為了這一點，現在由這個分支保證。）
+        booking_id = existing[0]
         already_existed = True
     else:
-        # 容量檢查放在 INSERT 之後才判斷，是為了讓重試能先被上面攔下來：
-        # 一個已經成立的預約即使現在時段滿了，重試時仍該回報它原本的狀態，
-        # 而不是因為「滿了」被拒絕。
         if current >= capacity:
             # ★ 容量 1 的時段沒有「排隊」這回事，訊息要跟著換。
             #   原本一律講「已額滿（最多 N 組）」：對容量 1 的店家，那是把一個
@@ -754,8 +754,32 @@ def create_booking(
                 f"《{mms_name}》{session_date} {session_time} 已額滿"
                 f"（最多 {waitlist_limit} 組）"
             )
-        booking_id = row[0]
-        already_existed = False
+        cur.execute(
+            """
+            INSERT INTO booking_record
+                (mmg_id, player_id, session_date, session_time, day_type, status,
+                 gm1_user_id, gm1_confirmed, gm2_user_id, gm2_confirmed,
+                 gm3_user_id, gm3_confirmed, gm4_user_id, gm4_confirmed, request_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (request_id) DO NOTHING
+            RETURNING id
+            """,
+            (mmg_id, player_id, session_date, session_time, day_type, status,
+             gm_user_ids[0], gm_confirmed[0], gm_user_ids[1], gm_confirmed[1],
+             gm_user_ids[2], gm_confirmed[2], gm_user_ids[3], gm_confirmed[3],
+             request_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            # 保險：同一個 request_id 在上面那句 SELECT 與這句 INSERT 之間被別的
+            # 交易寫進去了。同一時段有 _lock_slot 序列化，照理不會發生——但
+            # 真的發生時要照樣回報成功（它就是一次重試），不是撞 UNIQUE 炸掉。
+            cur.execute("SELECT id FROM booking_record WHERE request_id = %s", (request_id,))
+            booking_id = cur.fetchone()[0]
+            already_existed = True
+        else:
+            booking_id = row[0]
+            already_existed = False
 
     position = get_position(cur, booking_id)
     # 任何預約寫入都清空 /slot 的快取。理由與粗粒度的取捨見 db/slot_cache.py：
