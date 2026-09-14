@@ -8,8 +8,9 @@
 
     def on_xxx(cur, ...) -> Message | list | None
 
-**只組信，不寄信。** 呼叫端在 commit 之後才呼叫 notifications.dispatch()。
-理由見 notifications.py 開頭——rollback 掉的預約不能留下一封「預約成功」。
+**只組，不送。** 預約相關的路一律呼叫 on_booking_change()（信＋LINE 推播），
+commit 之後才交給 send()。理由見 notifications.py 開頭——rollback 掉的預約
+不能留下一封「預約成功」，也不能已經有人收到「訂好了」的推播。
 
 ## 為什麼整支包在 try 裡
 
@@ -22,18 +23,24 @@ from __future__ import annotations
 
 import functools
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime
 
 import notifications as nf
-from db import functions
+from db import functions, line_template
+from line_utils import client as line_client
+from line_utils import handler as line_handler
 
 log = logging.getLogger(__name__)
 
 _WEEKDAY = "一二三四五六日"
 
 
-def safe(fn):
-    """組信失敗就當作沒有信要寄，**而且不能弄髒呼叫端的交易**。
+def _guarded(is_on):
+    """組通知失敗就當作沒有東西要發，**而且不能弄髒呼叫端的交易**。
+
+    is_on：這個管道有沒有開（信看 Brevo、LINE 看 LINE 的設定）。沒開就整支
+    不跑、連資料庫都不碰。
 
     ## 為什麼光是 try/except 不夠（2026-09-02 實測）
 
@@ -57,27 +64,40 @@ def safe(fn):
 
     ★ 第一個位置參數必須是 cursor——這裡的每一支都是這個形狀。
     """
-    @functools.wraps(fn)
-    def wrapper(cur, *args, **kwargs):
-        if not nf.enabled():
-            return None
-        try:
-            cur.execute("SAVEPOINT notify")
-        except Exception as exc:  # noqa: BLE001 - 連 savepoint 都下不了就別碰交易
-            log.warning("通知：無法建立 savepoint，略過 %s: %s", fn.__name__, exc)
-            return None
-        try:
-            result = fn(cur, *args, **kwargs)
-            cur.execute("RELEASE SAVEPOINT notify")
-            return result
-        except Exception as exc:  # noqa: BLE001
-            log.warning("組通知信失敗 %s: %s", fn.__name__, exc)
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(cur, *args, **kwargs):
+            if not is_on():
+                return None
             try:
-                cur.execute("ROLLBACK TO SAVEPOINT notify")
-            except Exception:  # noqa: BLE001 - 連線本身壞了，交易反正保不住
-                pass
-            return None
-    return wrapper
+                cur.execute("SAVEPOINT notify")
+            except Exception as exc:  # noqa: BLE001 - 連 savepoint 都下不了就別碰交易
+                log.warning("通知：無法建立 savepoint，略過 %s: %s", fn.__name__, exc)
+                return None
+            try:
+                result = fn(cur, *args, **kwargs)
+                cur.execute("RELEASE SAVEPOINT notify")
+                return result
+            except Exception as exc:  # noqa: BLE001
+                log.warning("組通知失敗 %s: %s", fn.__name__, exc)
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT notify")
+                except Exception:  # noqa: BLE001 - 連線本身壞了，交易反正保不住
+                    pass
+                return None
+        return wrapper
+    return decorate
+
+
+# 信：沒設定 Brevo 就不組。
+safe = _guarded(lambda: nf.enabled())
+
+# LINE：沒設定 LINE 就不組。
+#
+# ★ 這道開關還有一個作用：沒開 LINE 的店，資料庫裡根本沒有 line_user_id 與
+#   line_template（見 db/schema.py 的 ensure_schema）。檢查一定要在碰任何
+#   LINE 的表之前，否則那家店每成立一筆預約就會在這裡失敗一次、留一筆警告。
+safe_line = _guarded(lambda: line_client.enabled())
 
 
 # ── 格式化 ──────────────────────────────────────────────────────
@@ -261,6 +281,74 @@ def on_transition(cur, before: dict | None, after: dict | None) -> list:
             out.append(msg)
 
     return out
+
+
+# ── LINE 推播：預約成立 → 店家人員 ─────────────────────────────
+
+@dataclass
+class LinePush:
+    """一則要推的 LINE 私訊。跟 notifications.Message 一樣，組好之後不再需要
+    資料庫——commit 之後交給 send()。"""
+
+    to: list[str]   # LINE userId
+    text: str
+
+
+@safe_line
+def line_on_booked(cur, before: dict | None, after: dict | None, *,
+                   actor_id: int | None) -> LinePush | None:
+    """預約成立 → LINE 推播給店家人員，**排除讓它成立的那個人**（案主 2026-09-14）。
+
+    跟 ③⑥ 同一個條件（進 booked），網站訂場、主持人確認、後台建立或修改、
+    LINE 訂場都一樣。原本只有 LINE 訂的才推，網站上成立的場店家人員收不到。
+
+    ★ 排除的是**做這個動作的人**（actor_id），不是預約上的預定者：後台幫別人
+      建一筆時，做事的是管理員自己，他已經知道了；該被通知的是另一位。
+      網站上玩家自己訂的，actor 就是玩家——他沒綁 LINE，店家人員全部收到。
+
+    收件人規則（角色開關、綁定）見 line_handler.push_targets；文字用
+    line_template 的 booked，跟 LINE 訂場的回覆是同一句。
+    """
+    if not after or after["status"] != "booked":
+        return None
+    if before and before["status"] == "booked":
+        return None
+    to = line_handler.push_targets(cur, exclude_user_id=actor_id)
+    if not to:
+        return None
+    d = _as_date(after["session_date"])
+    text = line_template.render(
+        cur, "booked",
+        mmg_name=after["mmg_name"],
+        date=f"{d.year}/{d.month}/{d.day}" if d else str(after["session_date"]),
+        time=str(after["session_time"])[:5],
+    )
+    return LinePush(to=to, text=text)
+
+
+def on_booking_change(cur, before: dict | None, after: dict | None, *,
+                      actor_id: int | None) -> list:
+    """一筆預約變動之後要發的全部東西：信（on_transition）加上 LINE 推播。
+
+    **每一條會改動預約的路都呼叫這一支**，commit 之後把回傳值交給 send()。
+    信跟推播分開組、各自有開關：Brevo 沒設定不影響推播，LINE 沒設定也不
+    影響信。
+    """
+    out = list(on_transition(cur, before, after) or [])
+    push = line_on_booked(cur, before, after, actor_id=actor_id)
+    if push:
+        out.append(push)
+    return out
+
+
+def send(outbox) -> None:
+    """★ commit 之後呼叫。信交給 notifications，推播交給 line_client，兩邊都在
+    背景送出，失敗不會回頭影響請求。"""
+    items = [x for x in (outbox or []) if x is not None]
+    nf.dispatch([x for x in items if isinstance(x, nf.Message)])
+    for push in items:
+        if isinstance(push, LinePush):
+            line_client.push(push.to, push.text)
 
 
 # ── ④⑤ 異常記點與停權 ──────────────────────────────────────────

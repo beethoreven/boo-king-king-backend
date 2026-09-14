@@ -452,13 +452,11 @@ def _handle_line_event(event: dict) -> None:
                 reply_text, result = line_handler.handle_command(
                     cur, text, event["webhookEventId"], sender=sender
                 )
-                targets, outbox = _after_line_booking(cur, result, sender)
+                outbox = _after_line_booking(cur, result, sender)
             conn.commit()
         if reply_token:
             line_client.reply(reply_token, reply_text)
-        if targets:
-            line_client.push(targets, reply_text)
-        notifications.dispatch(outbox)
+        notify_events.send(outbox)
         return
 
     # ── 群組 ──
@@ -470,37 +468,33 @@ def _handle_line_event(event: dict) -> None:
     with pool.connection() as conn:
         with conn.cursor() as cur:
             text, result = line_handler.handle_group_message(cur, event)
-            targets, outbox = _after_line_booking(cur, result, source.get("userId"))
+            outbox = _after_line_booking(cur, result, source.get("userId"))
         conn.commit()
 
     if reply_token:
         line_client.reply(reply_token, text)
     # ★ commit 之後才推播、才寄信，跟網站那幾條路同一條規則：交易回捲時
     #   不該有人已經收到「訂好了」。
-    if targets:
-        line_client.push(targets, text)
-    notifications.dispatch(outbox)
+    notify_events.send(outbox)
 
 
-def _after_line_booking(cur, result, sender: str | None) -> tuple[list, list | None]:
-    """LINE 訂到場之後要發的東西：(推播收件人, 通知信)。在 commit 之前呼叫。
+def _after_line_booking(cur, result, sender: str | None) -> list:
+    """LINE 訂到場之後要發的東西（信與推播），交給 notify_events.send()。在 commit 之前呼叫。
 
     ★ 沒訂到（沒權限、格式錯、撞場…）什麼都不發。
 
     ★ LINE 重送同一個事件時 create_booking 回 already_existed——那一筆第一次
       就發過了，這次什麼都不重發，不然店家會收到兩次一樣的推播與信。
 
-    ★ 信跟網站走同一支 notify_events.on_transition（案主 2026-09-14：LINE 訂的
-      場也要寄）。要寄哪幾封、寄給誰，規則只有那一份；哪一封在這家店不寄，
-      是 notification_template.enabled 的事，不在這裡挑。
+    ★ 跟網站、後台走同一支 notify_events.on_booking_change：要發什麼、發給誰，
+      規則只有那一份。做這個動作的人是發訊者綁定的那個帳號，推播會排除他。
     """
     if result is None or result.already_existed:
-        return [], []
+        return []
     booking = bookings_db.get_booking(cur, result.id)
-    # 排除發訊的人，理由見 push_targets。
-    targets = line_handler.push_targets(cur, exclude=sender)
-    outbox = notify_events.on_transition(cur, None, booking)
-    return targets, outbox
+    return notify_events.on_booking_change(
+        cur, None, booking, actor_id=line_handler.user_id_for(cur, sender)
+    )
 
 
 @app.get("/internal/idle-gap-stats")
@@ -1130,11 +1124,12 @@ def create_booking_route():
             # ★ 組信在 commit 之前（要 cursor），送出在 commit 之後（見下）。
             #   重試打到既有的那筆時 before 給 booking 自己，兩邊一樣就沒有
             #   任何轉變，不會重寄——否則連點三次「預約」等於主持人收三封。
-            outbox = notify_events.on_transition(
-                cur, booking if result.already_existed else None, booking
+            outbox = notify_events.on_booking_change(
+                cur, booking if result.already_existed else None, booking,
+                actor_id=g.user["id"],
             )
             conn.commit()
-    notifications.dispatch(outbox)
+    notify_events.send(outbox)
 
     return jsonify({
         **booking,
@@ -1430,9 +1425,9 @@ def confirm_booking_route(booking_id: int):
             except BookingError as exc:
                 conn.rollback()
                 return jsonify({"error": str(exc)}), 409
-            outbox = notify_events.on_transition(cur, before, updated)
+            outbox = notify_events.on_booking_change(cur, before, updated, actor_id=g.user["id"])
             conn.commit()
-    notifications.dispatch(outbox)
+    notify_events.send(outbox)
     return jsonify(updated)
 
 
@@ -1443,7 +1438,7 @@ def confirm_booking_route(booking_id: int):
 
 def _admin_write(fn):
     """管理員寫入路由共用的殼：開連線、跑、成功就 commit、
-    BookingError 回 400 並 rollback，最後送出 g.outbox 裡的通知信。"""
+    BookingError 回 400 並 rollback，最後送出 g.outbox 裡的通知（信與 LINE 推播）。"""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         body = request.get_json(silent=True) or {}
@@ -1456,9 +1451,9 @@ def _admin_write(fn):
                     conn.rollback()
                     return jsonify({"error": str(exc)}), 400
                 conn.commit()
-        # ★ commit 成功才送信。被包住的路由把要寄的信放進 g.outbox，
-        #   由這裡統一在交易外送出——寄信不該有機會影響交易。
-        notifications.dispatch(g.outbox)
+        # ★ commit 成功才送。被包住的路由把要發的通知放進 g.outbox，
+        #   由這裡統一在交易外送出——寄信、推播都不該有機會影響交易。
+        notify_events.send(g.outbox)
         return result
     return wrapper
 
@@ -1703,7 +1698,7 @@ def admin_create_booking(cur, body):
     body = {**body, "session_date": d, "session_time": t}
     new_id = bookings_admin.create(cur, body)
     created = bookings_db.get_booking(cur, new_id)
-    g.outbox = notify_events.on_transition(cur, None, created)
+    g.outbox = notify_events.on_booking_change(cur, None, created, actor_id=g.user["id"])
     return jsonify(created), 201
 
 
@@ -1724,7 +1719,7 @@ def admin_update_booking(cur, body, booking_id: int):
     after = bookings_db.get_booking(cur, booking_id)
     # 後台可以直接把狀態改成 gm_reviewed 或 booked，也可以補指派主持人——
     # 前後比對讓這三種都跟正常流程走同一條通知規則（見 notify_events）。
-    g.outbox = notify_events.on_transition(cur, before, after)
+    g.outbox = notify_events.on_booking_change(cur, before, after, actor_id=g.user["id"])
     return jsonify({"changed": changed, "item": after})
 
 

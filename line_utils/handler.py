@@ -238,7 +238,16 @@ def is_staff(cur, line_user_id: str | None) -> bool:
     return cur.fetchone() is not None
 
 
-def push_targets(cur, *, exclude: str | None = None) -> list[str]:
+def user_id_for(cur, line_user_id: str | None) -> int | None:
+    """綁定了這個 LINE 帳號的使用者 id；沒綁就是 None。"""
+    if not line_user_id:
+        return None
+    cur.execute("SELECT id FROM users WHERE line_user_id = %s", (line_user_id,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def push_targets(cur, *, exclude_user_id: int | None = None) -> list[str]:
     """要收私訊通知的人的 LINE userId。
 
     ★ 兩個條件都要：角色的 line_notification 開著（roles 表，店家自己
@@ -247,20 +256,19 @@ def push_targets(cur, *, exclude: str | None = None) -> list[str]:
     """
     cur.execute(
         """
-        SELECT u.line_user_id
+        SELECT u.id, u.line_user_id
           FROM users u JOIN roles r ON r.id = u.role
          WHERE u.status = 'active'
            AND r.line_notification
            AND u.line_user_id IS NOT NULL
         """
     )
-    # exclude：發訊的那個人，私訊與群組兩條路都排除。
+    # exclude_user_id：讓這筆預約成立的那個人（網站、後台、LINE 都一樣）。
     #
-    # 推播的用途是「讓店家人員知道**別人**訂了場」。訂的人就是收件人時，那則
-    # 推播只是在告訴他一件他剛剛自己做的事，而且每一則都算進每月額度。
+    # 推播的用途是「讓店家人員知道**別人**訂了場」。做這件事的人就是收件人時，
+    # 那則推播只是在告訴他一件他剛剛自己做的事，而且每一則都算進每月額度。
     #
     # ★ 群組原本**不**排除（理由是群組回覆與私訊推播是不同頻道），案主
-    #   2026-09-14 改成排除：店主與店家人員都能叫 bot 訂場，應該是「只有另一方
-    #   收到通知」。會走到這裡的一定是店家人員——沒有訂場資格的人在
-    #   handle_command 就被擋掉了，不會訂成功、也就不會推播。
-    return [r[0] for r in cur.fetchall() if r[0] != exclude]
+    #   2026-09-14 改成排除，同一天再擴大到網站與後台：「不管是我或 eli 預約，
+    #   就排除」。用使用者 id 比對而不是 LINE userId，網站上的動作才比得到。
+    return [line_id for uid, line_id in cur.fetchall() if uid != exclude_user_id]
