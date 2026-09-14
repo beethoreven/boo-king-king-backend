@@ -47,6 +47,20 @@ _LINE_NS = uuid.uuid5(uuid.NAMESPACE_URL, "boo-king-king/line-webhook")
 STORE_ACCOUNT_ID = 1
 
 
+def _owner_name(cur) -> str:
+    """LINE 訂場掛名的那個帳號叫什麼——沒權限的人被告知「請聯繫誰」。
+
+    ★ 從 users 表讀，不寫在回覆文字的預設值裡。後端是每一家店共用的程式，
+      預設值寫「請聯繫eli」的話，這句話也會被種進其他店家的資料庫。店家
+      想寫死一個名字，直接 UPDATE line_template 那一列就好。
+    """
+    cur.execute("SELECT name FROM users WHERE id = %s", (STORE_ACCOUNT_ID,))
+    row = cur.fetchone()
+    name = (row[0] or "").strip() if row else ""
+    # 名字空著時不要送出「請聯繫。」或「請聯繫None。」
+    return name or "店家"
+
+
 def request_id_for(webhook_event_id: str) -> str:
     """LINE 事件 id → 可以放進 booking_record.request_id 的 UUID。"""
     return str(uuid.uuid5(_LINE_NS, webhook_event_id))
@@ -78,15 +92,17 @@ def handle_group_message(cur, event: dict) -> tuple[str, bool]:
     """群組裡 tag 我的那一則：先把 @mention 挖掉，剩下的交給 handle_command。"""
     msg = event["message"]
     text = commands.strip_mentions(msg.get("text") or "", mentionees_of(event))
-    return handle_command(cur, text, event["webhookEventId"])
+    sender = (event.get("source") or {}).get("userId")
+    return handle_command(cur, text, event["webhookEventId"], sender=sender)
 
 
-def handle_command(cur, text: str, webhook_event_id: str) -> tuple[str, bool]:
+def handle_command(cur, text: str, webhook_event_id: str, *,
+                   sender: str | None) -> tuple[str, bool]:
     """處理一段已經清乾淨的指令文字，回傳 (要回覆的字, 有沒有真的訂到)。
 
-    群組（tag 之後）與私訊（店家人員）共用這一段——兩條路的差別只在
-    「怎麼判斷是在跟 bot 講話」與「誰有資格」，指令本身的規則一模一樣。
-    分開寫的話，哪天改了錯誤訊息或格式，就會有一條路忘了改。
+    群組（tag 之後）與私訊共用這一段——兩條路的差別只在「怎麼判斷是在跟
+    bot 講話」，**誰有資格、指令規則、回覆文字全部一樣**。分開寫的話，哪天
+    改了其中一條，另一條就會忘了跟著改。
 
     ★ 第二個值不能靠看第一個值的內容推。回覆文字是店家自己在
       line_template 裡改的，用「開頭是不是 ✅」來判斷成不成功的話，她
@@ -101,6 +117,17 @@ def handle_command(cur, text: str, webhook_event_id: str) -> tuple[str, bool]:
 
     if kind == commands.UNKNOWN:
         return line_template.render(cur, "unknown"), False
+
+    # ★ 權限排在「是不是預訂」之後、**其他所有檢查之前**（案主 2026-09-14）。
+    #
+    #   只有店家人員能透過 bot 訂場，群組與私訊都一樣。排在最前面是刻意的：
+    #   沒權限的人不該先拿到「找不到這齣」「日期時間看不懂」「那個時間已經
+    #   有場」這些回覆——那些等於在告訴他劇本名單與場次狀況，而他本來就不能
+    #   訂。不是預訂的訊息（例如「哈囉」）照舊回「我不知道你在說什麼」，那句
+    #   對任何人都一樣。
+    if not is_staff(cur, sender):
+        return line_template.render(cur, "no_permission", owner_name=_owner_name(cur)), False
+
     if kind == commands.BAD_DATETIME:
         return line_template.render(cur, "bad_datetime"), False
 
@@ -171,17 +198,17 @@ def _failure_text(cur, exc: BookingError) -> str:
 
 
 def is_staff(cur, line_user_id: str | None) -> bool:
-    """這個 LINE 帳號能不能用私訊訂場。
+    """這個 LINE 帳號能不能透過 bot 訂場（群組與私訊都看這一支）。
 
     三個條件都要：LINE 帳號綁定到系統上某個使用者、那個人是管理員或主持人
     （role <= 2）、帳號是啟用中。
 
-    ## 為什麼私訊要限定身分，群組不用
+    ## 群組與私訊都限定身分
 
-    LINE 訂的場一律掛在店主名下（STORE_ACCOUNT_ID）。群組是店家自己的私人
-    群組，進得去的人本來就是她邀的；**私訊不是**——任何人加了 bot 好友都能
-    私訊它。不擋的話，一個陌生人加好友、傳一句「預訂 …」，就能用店主的名義
-    佔掉一個時段。
+    LINE 訂的場一律掛在店主名下（STORE_ACCOUNT_ID），所以能訂場的人必須是
+    店家自己人。私訊任何人加了好友都能傳；群組裡則是玩家也在——案主
+    2026-09-14 定：玩家在群組 tag 也不能訂，一律回 no_permission 那句。
+    （更早的版本群組是誰都能訂，理由是「群組是店家邀的私人群組」，已改掉。）
 
     ## 為什麼是「綁定＋角色」而不是把某個 id 寫在程式裡
 
@@ -190,7 +217,7 @@ def is_staff(cur, line_user_id: str | None) -> bool:
       用 users 表判斷，開放給誰就是一句 SQL。
 
     ★ 要知道的副作用：line_user_id 同時也是推播的收件人依據。所以「為了
-      收推播而綁定」的店家人員，**也會同時取得私訊訂場的資格**。兩件事目前
+      收推播而綁定」的店家人員，**也會同時取得透過 bot 訂場的資格**。兩件事目前
       是綁在一起的；哪天要分開，是另一個開關的事。
     """
     if not line_user_id:
@@ -219,7 +246,13 @@ def push_targets(cur, *, exclude: str | None = None) -> list[str]:
            AND u.line_user_id IS NOT NULL
         """
     )
-    # exclude：私訊訂場時的那個人。他剛在同一個私訊視窗收到回覆，再推一則
-    # 一模一樣的過去只是重複。群組那條路不排除——群組裡的回覆大家都看得到，
-    # 推播是另一個頻道（「有人訂了」的私人通知），不算重複。
+    # exclude：發訊的那個人，私訊與群組兩條路都排除。
+    #
+    # 推播的用途是「讓店家人員知道**別人**訂了場」。訂的人就是收件人時，那則
+    # 推播只是在告訴他一件他剛剛自己做的事，而且每一則都算進每月額度。
+    #
+    # ★ 群組原本**不**排除（理由是群組回覆與私訊推播是不同頻道），案主
+    #   2026-09-14 改成排除：店主與店家人員都能叫 bot 訂場，應該是「只有另一方
+    #   收到通知」。會走到這裡的一定是店家人員——沒有訂場資格的人在
+    #   handle_command 就被擋掉了，不會訂成功、也就不會推播。
     return [r[0] for r in cur.fetchall() if r[0] != exclude]

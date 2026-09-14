@@ -27,7 +27,6 @@ import jobs  # noqa: E402
 from db import bookings as bookings_db  # noqa: E402
 from db import idle_gap  # noqa: E402
 from db import mmg as mmg_db  # noqa: E402
-from db import line_template  # noqa: E402
 from db import listing  # noqa: E402
 from db import roles  # noqa: E402
 from db import schedule  # noqa: E402
@@ -417,10 +416,10 @@ def line_webhook():
 def _handle_line_event(event: dict) -> None:
     """一則事件。寫入與回覆分開：commit 之後才回，才不會回了卻沒存進去。
 
-    兩條路會訂場：
+    兩條路會訂場，**資格一樣**——只有綁定過 LINE 的店家人員（見 is_staff）：
 
-        群組  有人 tag 我    → 群組裡任何人都能用（店家自己的私人群組）
-        私訊  店家人員私訊我 → 只有綁定過的管理員／主持人（見 is_staff）
+        群組  tag 我    其他人傳「預訂」回 no_permission（沒有權限，請聯繫店主）
+        私訊  私訊我    同上
 
     ★ 私訊這條是因為 **LINE for Mac 的 @ 選單不列官方帳號**（2026-09-14
       實測，手機版可以），而店主就是用 Mac。私訊不需要 tag，Mac 上通。
@@ -447,17 +446,13 @@ def _handle_line_event(event: dict) -> None:
 
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                if not line_handler.is_staff(cur, sender):
-                    # ★ 不是店家人員就一律回「我不知道你在說什麼」，**不說
-                    #   「你沒有權限」**。後者等於告訴對方「這裡有一個你用不了
-                    #   的訂場功能」，只會引來嘗試。
-                    reply_text, booked = line_template.render(cur, "unknown"), False
-                    targets = []
-                else:
-                    reply_text, booked = line_handler.handle_command(
-                        cur, text, event["webhookEventId"]
-                    )
-                    targets = line_handler.push_targets(cur, exclude=sender) if booked else []
+                # 權限在 handle_command 裡判斷，群組那條也是同一段。
+                reply_text, booked = line_handler.handle_command(
+                    cur, text, event["webhookEventId"], sender=sender
+                )
+                # ★ 只有訂成功才找收件人：任何錯誤（沒權限、格式錯、撞場…）
+                #   都不推播。
+                targets = line_handler.push_targets(cur, exclude=sender) if booked else []
             conn.commit()
         if reply_token:
             line_client.reply(reply_token, reply_text)
@@ -474,7 +469,9 @@ def _handle_line_event(event: dict) -> None:
     with pool.connection() as conn:
         with conn.cursor() as cur:
             text, booked = line_handler.handle_group_message(cur, event)
-            targets = line_handler.push_targets(cur) if booked else []
+            # 排除發訊的人，理由見 push_targets。
+            targets = (line_handler.push_targets(cur, exclude=source.get("userId"))
+                       if booked else [])
         conn.commit()
 
     if reply_token:

@@ -20,7 +20,7 @@ import os
 import threading
 import time
 
-# 跟 roles / settings 同一個理由：這張表六列、幾乎不會變，而它被每一次
+# 跟 roles / settings 同一個理由：這張表只有幾列、幾乎不會變，而它被每一次
 # 回覆讀到。
 _CACHE_TTL_SECONDS = float(os.environ.get("LINE_TEMPLATE_CACHE_TTL_SECONDS", "600"))
 
