@@ -69,19 +69,28 @@ def mentionees_of(event: dict) -> list[dict]:
 
 
 def handle_group_message(cur, event: dict) -> tuple[str, bool]:
-    """處理一則「群組裡 tag 我」的訊息，回傳 (要回覆的字, 有沒有真的訂到)。
+    """群組裡 tag 我的那一則：先把 @mention 挖掉，剩下的交給 handle_command。"""
+    msg = event["message"]
+    text = commands.strip_mentions(msg.get("text") or "", mentionees_of(event))
+    return handle_command(cur, text, event["webhookEventId"])
+
+
+def handle_command(cur, text: str, webhook_event_id: str) -> tuple[str, bool]:
+    """處理一段已經清乾淨的指令文字，回傳 (要回覆的字, 有沒有真的訂到)。
+
+    群組（tag 之後）與私訊（店家人員）共用這一段——兩條路的差別只在
+    「怎麼判斷是在跟 bot 講話」與「誰有資格」，指令本身的規則一模一樣。
+    分開寫的話，哪天改了錯誤訊息或格式，就會有一條路忘了改。
 
     ★ 第二個值不能靠看第一個值的內容推。回覆文字是店家自己在
       line_template 裡改的，用「開頭是不是 ✅」來判斷成不成功的話，她
       哪天把那個 emoji 拿掉，推播就會安靜地停掉——而「通知沒發出去」
       這種事沒有人會回報。
 
-    ★ 不論成功或失敗都回傳一句話——群組裡 tag 了 bot 卻沒有任何反應，
-      使用者無從判斷是「格式錯」還是「bot 死了」。唯一不回的情況是
-      伺服器根本沒醒（那時候這支不會被呼叫到），那沒辦法。
+    ★ 不論成功或失敗都回傳一句話——tag 了 bot 卻沒有任何反應，使用者
+      無從判斷是「格式錯」還是「bot 死了」。唯一不回的情況是伺服器
+      根本沒醒（那時候這支不會被呼叫到），那沒辦法。
     """
-    msg = event["message"]
-    text = commands.strip_mentions(msg.get("text") or "", mentionees_of(event))
     kind, payload = commands.parse(text)
 
     if kind == commands.UNKNOWN:
@@ -99,6 +108,19 @@ def handle_group_message(cur, event: dict) -> tuple[str, bool]:
         return line_template.render(cur, "script_not_found", name=name), False
     mmg_id, mmg_name = row
 
+    # ★ 一定要包 SAVEPOINT，失敗時自己退回。
+    #
+    #   create_booking 的順序是**先 INSERT、再檢查容量**，超過才拋 BookingError
+    #   ——它把「退掉那一筆」交給呼叫端（網頁那條路是 conn.rollback()）。但這裡
+    #   把錯誤接住、翻成回覆文字、**不往外拋**，呼叫端接著就 commit 了。
+    #
+    #   沒有這一道的症狀：群組裡 bot 回「這個時間已經有場次了」，**資料庫裡
+    #   卻多了一筆**。在序位上限 1 的店就是超賣，而且回覆說的跟事實相反，
+    #   沒有任何人會發現（2026-09-14 私訊訂場的測試抓到）。
+    #
+    #   用 SAVEPOINT 而不是要求呼叫端 rollback：這支函式就應該保證「回傳 False
+    #   時什麼都沒留下」，不該讓每個呼叫點各自記得收拾。
+    cur.execute("SAVEPOINT line_booking")
     try:
         create_booking(
             cur,
@@ -108,12 +130,14 @@ def handle_group_message(cur, event: dict) -> tuple[str, bool]:
             session_time=payload["time"],
             # single 模式下後端自己填主持人，這裡不表達意見。
             gm_user_ids=[None, None, None, None],
-            request_id=request_id_for(event["webhookEventId"]),
+            request_id=request_id_for(webhook_event_id),
         )
     except BookingError as exc:
+        cur.execute("ROLLBACK TO SAVEPOINT line_booking")
         # 後端的訊息是寫給管理員看的（帶劇本名、主持人名）。群組裡有別的
         # 客人，所以這裡換成店家自己寫的那幾句，不把內部細節倒出去。
         return _failure_text(cur, str(exc)), False
+    cur.execute("RELEASE SAVEPOINT line_booking")
 
     return line_template.render(
         cur, "booked",
@@ -147,7 +171,40 @@ def _failure_text(cur, message: str) -> str:
     return line_template.render(cur, "conflict")
 
 
-def push_targets(cur) -> list[str]:
+def is_staff(cur, line_user_id: str | None) -> bool:
+    """這個 LINE 帳號能不能用私訊訂場。
+
+    三個條件都要：LINE 帳號綁定到系統上某個使用者、那個人是管理員或主持人
+    （role <= 2）、帳號是啟用中。
+
+    ## 為什麼私訊要限定身分，群組不用
+
+    LINE 訂的場一律掛在店主名下（STORE_ACCOUNT_ID）。群組是店家自己的私人
+    群組，進得去的人本來就是她邀的；**私訊不是**——任何人加了 bot 好友都能
+    私訊它。不擋的話，一個陌生人加好友、傳一句「預訂 …」，就能用店主的名義
+    佔掉一個時段。
+
+    ## 為什麼是「綁定＋角色」而不是把某個 id 寫在程式裡
+
+    ★ 誰能用是資料，不是程式。寫死 id 的話，每加一個人就要改 code、部署；
+      而且不同店家的 LINE userId 是各自獨立的空間，寫死的值換一家店就錯。
+      用 users 表判斷，開放給誰就是一句 SQL。
+
+    ★ 要知道的副作用：line_user_id 同時也是推播的收件人依據。所以「為了
+      收推播而綁定」的店家人員，**也會同時取得私訊訂場的資格**。兩件事目前
+      是綁在一起的；哪天要分開，是另一個開關的事。
+    """
+    if not line_user_id:
+        return False
+    cur.execute(
+        "SELECT 1 FROM users "
+        " WHERE line_user_id = %s AND status = 'active' AND role <= 2",
+        (line_user_id,),
+    )
+    return cur.fetchone() is not None
+
+
+def push_targets(cur, *, exclude: str | None = None) -> list[str]:
     """要收私訊通知的人的 LINE userId。
 
     ★ 兩個條件都要：角色的 line_notification 開著（roles 表，店家自己
@@ -163,4 +220,7 @@ def push_targets(cur) -> list[str]:
            AND u.line_user_id IS NOT NULL
         """
     )
-    return [r[0] for r in cur.fetchall()]
+    # exclude：私訊訂場時的那個人。他剛在同一個私訊視窗收到回覆，再推一則
+    # 一模一樣的過去只是重複。群組那條路不排除——群組裡的回覆大家都看得到，
+    # 推播是另一個頻道（「有人訂了」的私人通知），不算重複。
+    return [r[0] for r in cur.fetchall() if r[0] != exclude]

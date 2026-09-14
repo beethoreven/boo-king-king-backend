@@ -27,6 +27,7 @@ import jobs  # noqa: E402
 from db import bookings as bookings_db  # noqa: E402
 from db import idle_gap  # noqa: E402
 from db import mmg as mmg_db  # noqa: E402
+from db import line_template  # noqa: E402
 from db import listing  # noqa: E402
 from db import roles  # noqa: E402
 from db import schedule  # noqa: E402
@@ -414,27 +415,57 @@ def line_webhook():
 
 
 def _handle_line_event(event: dict) -> None:
-    """一則事件。寫入與回覆分開：commit 之後才回，才不會回了卻沒存進去。"""
+    """一則事件。寫入與回覆分開：commit 之後才回，才不會回了卻沒存進去。
+
+    兩條路會訂場：
+
+        群組  有人 tag 我    → 群組裡任何人都能用（店家自己的私人群組）
+        私訊  店家人員私訊我 → 只有綁定過的管理員／主持人（見 is_staff）
+
+    ★ 私訊這條是因為 **LINE for Mac 的 @ 選單不列官方帳號**（2026-09-14
+      實測，手機版可以），而店主就是用 Mac。私訊不需要 tag，Mac 上通。
+    """
     source = event.get("source") or {}
     msg = event.get("message") or {}
     reply_token = event.get("replyToken")
 
-    # ── 一對一：拿自己的 userId ──
-    #
-    # 推播要有收件人的 userId，而那只有在對方跟 bot 有互動之後才拿得到。
-    # 店主私訊一句「我的ID」，bot 把 id 回給她，再由人寫進 users
-    # .line_user_id。一次性，所以不做綁定流程。
-    #
-    # ★ 回的是「你自己的 id」，對任何人都一樣——不是誰的秘密，沒有洩漏。
-    if (
-        source.get("type") == "user"
-        and msg.get("type") == "text"
-        and (msg.get("text") or "").strip().replace(" ", "").upper() in ("我的ID", "MYID")
-    ):
-        if reply_token and source.get("userId"):
-            line_client.reply(reply_token, f"你的 LINE userId：\n{source['userId']}")
+    if event.get("type") != "message" or msg.get("type") != "text":
         return
 
+    # ── 私訊 ──
+    if source.get("type") == "user":
+        text = (msg.get("text") or "").strip()
+        sender = source.get("userId")
+
+        # 拿自己的 userId。推播與私訊訂場都要先綁定這個 id，而它只有在對方
+        # 跟 bot 有互動之後才拿得到。任何人都能問——回的是「你自己的 id」，
+        # 不是誰的秘密。
+        if text.replace(" ", "").upper() in ("我的ID", "MYID"):
+            if reply_token and sender:
+                line_client.reply(reply_token, f"你的 LINE userId：\n{sender}")
+            return
+
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                if not line_handler.is_staff(cur, sender):
+                    # ★ 不是店家人員就一律回「我不知道你在說什麼」，**不說
+                    #   「你沒有權限」**。後者等於告訴對方「這裡有一個你用不了
+                    #   的訂場功能」，只會引來嘗試。
+                    reply_text, booked = line_template.render(cur, "unknown"), False
+                    targets = []
+                else:
+                    reply_text, booked = line_handler.handle_command(
+                        cur, text, event["webhookEventId"]
+                    )
+                    targets = line_handler.push_targets(cur, exclude=sender) if booked else []
+            conn.commit()
+        if reply_token:
+            line_client.reply(reply_token, reply_text)
+        if targets:
+            line_client.push(targets, reply_text)
+        return
+
+    # ── 群組 ──
     if not line_handler.is_group_text_to_me(event):
         # 沒 tag 我就完全不反應——不回覆、不寫入、不記 log。群組裡大部分
         # 訊息都跟 bot 無關，每一則都留一筆 log 只會把真的錯誤淹掉。
