@@ -57,7 +57,7 @@ curl -s localhost:5001/api/health
 |---|---|---|---|
 | `gm_assigned` | 【指定通知】 | 某人**這次新被指定**為主持人 | 那位主持人（一人一封） |
 | `admin_reviewed` | 【場次確認通知】 | 狀態轉成 `gm_reviewed`（主持人全數確認） | 全部管理員 |
-| `player_booked` | 【預約成功】 | 狀態轉成 `booked` | 預定的玩家 |
+| `player_booked` | 【預約成功】 | 狀態轉成 `booked` | 預訂的玩家 |
 | `abuse_point` | 【異常行為通知】 | 有人被記點，但**還沒**到停權門檻 | 全部管理員 |
 | `abuse_banned` | 【停權通知】 | 有人因記點被自動停權 | 全部管理員 |
 

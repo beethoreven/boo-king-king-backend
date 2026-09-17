@@ -40,7 +40,7 @@ class BookingError(Exception):
 @dataclass
 class BookingResult:
     id: int
-    position: int          # 這一組在該時段的序位，1 是最先預定的
+    position: int          # 這一組在該時段的序位，1 是最先預訂的
     already_existed: bool  # True 代表這個 request_id 先前就成功過
 
     @property
@@ -772,7 +772,7 @@ def create_booking(
         cur.execute("SELECT name FROM users WHERE id = %s", (conflicting,))
         gm_name = cur.fetchone()[0]
         raise BookingError(
-            f"{gm_name}在這個時間有場次無法預定",
+            f"{gm_name}在這個時間有場次無法預訂",
             reason=_occupied_reason(cur, "gm", mmg_id, session_date, session_time,
                                     gm_ids=gm_ids),
         )
@@ -876,7 +876,7 @@ def create_booking(
 
 
 def get_position(cur, booking_id: int) -> int:
-    """算出某筆預約在它那個時段的序位。1 是最先預定的那一組。
+    """算出某筆預約在它那個時段的序位。1 是最先預訂的那一組。
 
     順位不存欄位、每次算——取消時只要把自己的 status 改掉，後面的人
     就自動遞補，沒有第二個地方需要同步（理由見 schema.py）。
@@ -1086,7 +1086,7 @@ def list_player_tab(
     因為前面的人取消而改變。存起來就得在每次取消時回頭更新所有後面的人，
     漏一次就永遠錯。
 
-    篩選只開放劇本名稱與日期時間。預定者一定是他自己，角色是主持人那邊
+    篩選只開放劇本名稱與日期時間。預訂者一定是他自己，角色是主持人那邊
     的概念，狀態則由頁籤決定——多給的選項只會讓人試出空集合。
     """
     if tab not in PLAYER_TABS:

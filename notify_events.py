@@ -174,7 +174,7 @@ def _booking_values(cur, booking: dict) -> dict:
 
 
 def _contact_text(cur, user_id: int) -> str:
-    """預定者的 LINE ID 與電話，跟使用者管理畫面同一個寫法（LINE xxx · 電話）。
+    """預訂者的 LINE ID 與電話，跟使用者管理畫面同一個寫法（LINE xxx · 電話）。
 
     兩個都沒填就回空字串——範本裡那一列會整列拿掉，不留一行空白的「聯絡」。
     """
@@ -302,7 +302,7 @@ def line_on_booked(cur, before: dict | None, after: dict | None, *,
     跟 ③⑥ 同一個條件（進 booked），網站訂場、主持人確認、後台建立或修改、
     LINE 訂場都一樣。原本只有 LINE 訂的才推，網站上成立的場店家人員收不到。
 
-    ★ 排除的是**做這個動作的人**（actor_id），不是預約上的預定者：後台幫別人
+    ★ 排除的是**做這個動作的人**（actor_id），不是預約上的預訂者：後台幫別人
       建一筆時，做事的是管理員自己，他已經知道了；該被通知的是另一位。
       網站上玩家自己訂的，actor 就是玩家——他沒綁 LINE，店家人員全部收到。
 

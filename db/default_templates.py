@@ -125,7 +125,7 @@ TEMPLATES: dict[str, tuple[str, str]] = {
 {_row("劇本", "<strong>{{mmg_name}}</strong>")}
 {_row("場次", "<strong>{{session}}</strong>")}
 {_row("角色", "{{gm_role}}")}
-{_row("預定者", "{{player_name}}")}
+{_row("預訂者", "{{player_name}}")}
 </div>
 <p style="margin:0 0 24px;">在您確認之前，這筆預約<strong>不會成立</strong>。</p>
 {_btn("前往確認")}
@@ -136,12 +136,12 @@ TEMPLATES: dict[str, tuple[str, str]] = {
     "admin_reviewed": (
         "【場次確認通知】《{{mmg_name}}》{{session_short}} 主持人已全數確認，待收訂金",
         f'''<div style="{_WRAP}">
-<p style="margin:0 0 20px;">有一筆預約的主持人已<strong>全部確認</strong>，請通知預定者支付訂金。</p>
+<p style="margin:0 0 20px;">有一筆預約的主持人已<strong>全部確認</strong>，請通知預訂者支付訂金。</p>
 <div style="{_BOX}">
 {_row("劇本", "<strong>{{mmg_name}}</strong>")}
 {_row("場次", "<strong>{{session}}</strong>")}
 {_row("主持", "{{gm_list}}")}
-{_row("預定者", "{{player_name}}")}
+{_row("預訂者", "{{player_name}}")}
 {_row("訂金", "<strong>{{deposit}}</strong>")}
 </div>
 {_btn("前往處理")}
@@ -205,7 +205,7 @@ TEMPLATES: dict[str, tuple[str, str]] = {
     #
     # 選填的四列跟著功能表與資料出現，值是空字串就整列拿掉：
     #   主持  gm_mode 是 single 時不給——那種店的主持人就是店主本人
-    #   聯絡  預定者沒填 LINE ID 也沒填電話時不給
+    #   聯絡  預訂者沒填 LINE ID 也沒填電話時不給
     #   訂金  deposit 關掉時不給
     #   備註  沒寫時不給；有換行就照原樣換行
     "admin_booked": (
@@ -216,7 +216,7 @@ TEMPLATES: dict[str, tuple[str, str]] = {
 {_hrow("劇本", "<strong>{{mmg_name}}</strong>")}
 {_hrow("場次", "<strong>{{session}}</strong>")}
 {_hrow("主持", "{{gm_list}}", only_if="gm_list")}
-{_hrow("預定者", "{{player_name}}")}
+{_hrow("預訂者", "{{player_name}}")}
 {_hrow("聯絡", "{{contact}}", only_if="contact")}
 {_hrow("訂金", "{{deposit_paid}}", only_if="deposit_paid")}
 {_hrow("備註", "{{note}}", only_if="note")}

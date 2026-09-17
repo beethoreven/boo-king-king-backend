@@ -4,7 +4,7 @@
 建立順序有相依性，不能隨便調換：
 1. users（帳號）——booking_record.player_id、gm{n}_user_id 會參照這裡
 2. mmg（可提供服務的劇本）——booking_record.mmg_id 會參照這裡
-3. booking_record（預定場次）
+3. booking_record（預訂場次）
 
 只支援 Postgres（Neon）。冪等操作（CREATE TABLE IF NOT EXISTS、補欄位前
 先檢查），但只需要在這個 process 生命週期裡成功跑過一次——第一次成功後
@@ -655,7 +655,7 @@ def _ensure_mmg(cur) -> None:
             -- ★ start_booking 不可為空，預設是建立的當下。
             --
             --   一齣連開放預約時間都掛不出來的劇本，代表它還沒有真的要賣，
-            --   那它就不該是可以被預定的。允許留空的話，「先把資料建進去，
+            --   那它就不該是可以被預訂的。允許留空的話，「先把資料建進去，
             --   哪天再說」的劇本會一直躺在玩家選得到的清單裡。
             --
             --   ★ 是 TIMESTAMP 不是 DATE：上架是一個明確的時刻。同一天
@@ -881,7 +881,7 @@ def _ensure_mmg_gm_constraints(cur) -> None:
 
 
 def _ensure_booking_record(cur) -> None:
-    """預定場次。
+    """預訂場次。
 
     時間欄位的型別選擇（這是刻意的，不要改成 TEXT）：
 
@@ -924,7 +924,7 @@ def _ensure_booking_record(cur) -> None:
         WHERE mmg_id = ? AND session_date = ? AND session_time = ?
           AND status <> 'cancelled'
 
-    position 就是序位：1 是最先預定的那一組，其餘依序往後。
+    position 就是序位：1 是最先預訂的那一組，其餘依序往後。
 
     為什麼不存一個 priority 欄位（或 waitlist_position 數字）：
     那會讓「誰是第一位」有兩個來源——created_at 的先後，和欄位裡的值——

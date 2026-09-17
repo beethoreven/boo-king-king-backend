@@ -149,7 +149,7 @@ def create(cur, data: dict) -> int:
 def update(cur, booking_id: int, data: dict) -> bool:
     """編輯一筆場次。回傳是否真的改到任何欄位。
 
-    可編輯：劇本、預定者、日期、時間、場次類型、狀態、訂金、備註，以及
+    可編輯：劇本、預訂者、日期、時間、場次類型、狀態、訂金、備註，以及
     各角色的主持人與「是否已確認」。
 
     訂金沿用 record_deposit() 的自動轉態（gm_reviewed + 金額足額 →

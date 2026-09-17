@@ -1032,7 +1032,7 @@ def check_gm_route():
             name_row = cur.fetchone()
             gm_name = name_row[0] if name_row else f"id={conflicting}"
 
-    return jsonify({"error": f"{gm_name}在這個時間有場次無法預定"}), 409
+    return jsonify({"error": f"{gm_name}在這個時間有場次無法預訂"}), 409
 
 
 @app.post("/api/bookings")
@@ -1046,7 +1046,7 @@ def create_booking_route():
     重送一次就可能佔到兩個名額，而名額是有限且被搶的。
 
     ★ 這支**只取它列出來的那幾個鍵**。請求裡多帶的東西一律不看：訂金是
-      店家收到錢才算數、備註是主持人／管理員的欄位、狀態與預定者更不是
+      店家收到錢才算數、備註是主持人／管理員的欄位、狀態與預訂者更不是
       玩家能決定的。這條規則要靠「後端只讀自己要的欄位」來守，不能靠
       「前端不會送」——任何人都能直接打這支 API。
     """
@@ -1098,7 +1098,7 @@ def create_booking_route():
             me = profile.get(cur, g.user["id"])
     if not profile.has_complete_contact(me):
         return jsonify({
-            "error": "你沒有填寫基本聯絡資料，無法預定場次",
+            "error": "你沒有填寫基本聯絡資料，無法預訂場次",
             "code": "incomplete_contact",
         }), 400
 
@@ -1192,7 +1192,7 @@ def _is_assigned_gm(booking: dict, user_id: int) -> bool:
 #     PATCH /api/bookings/<id>/status    管理員直接改狀態
 #
 #   兩支都出自 2026-08-26 的第一批 API，那時候還沒有管理員介面。後來長出來
-#   的畫面兩支都沒用到：玩家的「我預定的場次」刻意唯讀（取消要經過店家，
+#   的畫面兩支都沒用到：玩家的「我預訂的場次」刻意唯讀（取消要經過店家，
 #   那支路由自己的說明也是這樣寫的），管理員的取消與改狀態都走場次管理的
 #   編輯（PUT /api/admin/bookings/<id>）。
 #
@@ -1286,7 +1286,7 @@ def gm_tab_route(tab: str):
 @app.get("/api/bookings/<int:booking_id>/detail")
 @require_auth
 def booking_detail_route(booking_id: int):
-    """某一筆預約的細節：預定者的聯絡方式，以及這場所有角色與主持人。
+    """某一筆預約的細節：預訂者的聯絡方式，以及這場所有角色與主持人。
 
     兩個對話框的內容合成一支：分開做會變成點兩個地方各打一次 API，
     但兩者都是「這一筆預約的細節」，一次拿完比較合理。
@@ -1294,9 +1294,9 @@ def booking_detail_route(booking_id: int):
     誰讀得到（三種，缺一不可地各有理由）：
       管理員　　　　　　全部。經營者要處理任何一筆。
       被指定的主持人　　自己被指定的那幾場。
-      這筆預約的預定者　自己那一筆。
+      這筆預約的預訂者　自己那一筆。
 
-    ★ 最後一條是 2026-08-31 加的，讓玩家在「我預定的場次」能看到自己
+    ★ 最後一條是 2026-08-31 加的，讓玩家在「我預訂的場次」能看到自己
       這場的主持人是誰、確認了沒。安全上成立的理由是：這支回傳的個資
       就是**他自己的**姓名與聯絡方式，而主持人名單本來就是他預約時
       自己選的。他讀不到任何別人的東西。
@@ -1330,7 +1330,7 @@ def booking_detail_route(booking_id: int):
             allowed = (
                 g.user["role"] <= 1                    # 管理員
                 or g.user["id"] in gm_ids            # 被指定的主持人
-                or g.user["id"] == row[21]             # 這筆預約的預定者
+                or g.user["id"] == row[21]             # 這筆預約的預訂者
             )
             if not allowed:
                 return jsonify({"error": "只能查看自己的場次"}), 403

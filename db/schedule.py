@@ -70,7 +70,7 @@ def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None:
 
     ★ 沒有「還沒設定所以不限制」這種例外。start_booking 是 NOT NULL，
       每一齣劇本一定有上架日；沒有排定任何星期或特例的劇本就是全部關閉。
-      一齣連開放時段都沒設的戲，本來就不該被預定——這是刻意的，不是漏網。
+      一齣連開放時段都沒設的戲，本來就不該被預訂——這是刻意的，不是漏網。
 
     ★ None 與 [] 不同：[] 不會發生（兩張表都有 CHECK 擋掉空時段）。
       呼叫端用 `is None` 判斷，不要用真假值——空清單跟 None 在 if 裡

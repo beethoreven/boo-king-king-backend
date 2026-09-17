@@ -181,7 +181,7 @@ def handle_command(cur, text: str, webhook_event_id: str, *,
 # 被拒的原因代碼 → 回哪一句（line_template 的 key）。
 #
 # ★ 看的是 BookingError.reason，**不是錯誤訊息的文字**。原本這裡是拿
-#   「無法預定」「已經被預約」這些中文片語去比對，那樣後端哪天為了網頁改一
+#   「無法預訂」「已經被預約」這些中文片語去比對，那樣後端哪天為了網頁改一
 #   個字，這邊就會悄悄分錯類，而且不會報錯（2026-09-14 改掉）。
 #
 #   template key 的 conflict 沿用舊名：店家可能已經改過那一列的字，換成新
