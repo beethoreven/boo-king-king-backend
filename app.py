@@ -1791,6 +1791,46 @@ def admin_bookings_tab(tab: str):
         return jsonify({"error": str(exc)}), 400
 
 
+# ── 場次行事曆 ──────────────────────────────────────────────────
+#
+# 跟另外兩份行事曆同一個形狀（月份給點、日期給清單），這一份是全站視角：
+# 只要是非取消的場次都算，不分是誰訂的、誰主持。
+
+
+@app.get("/api/admin/bookings/month/<ym>")
+@require_role(1)
+def admin_bookings_month(ym: str):
+    """全站這個月每一天有哪些場次的狀態，依開始時間排序，不含已取消。"""
+    try:
+        first = date.fromisoformat(f"{ym}-01")
+    except ValueError:
+        return bad_request("月份格式錯誤，需要 YYYY-MM")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            days = bookings_admin.month_days(cur, first.year, first.month)
+    return jsonify({"month": ym, "days": days})
+
+
+@app.get("/api/admin/bookings/date/<d>")
+@require_role(1)
+def admin_bookings_date(d: str):
+    """全站那一天的場次，含已取消。形狀與子頁籤清單完全相同。"""
+    try:
+        session_date = date.fromisoformat(d)
+    except ValueError:
+        return bad_request("日期格式錯誤，需要 YYYY-MM-DD")
+    try:
+        start = int(request.args.get("start", 1))
+    except ValueError:
+        return bad_request("start 必須是數字")
+    if start < 1:
+        return bad_request("start 必須大於 0")
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            return jsonify(bookings_admin.list_date(cur, session_date, start=start))
+
+
 @app.post("/api/admin/bookings")
 @require_role(1)
 @_admin_write

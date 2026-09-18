@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 from db import functions, slot_cache
 from db.bookings import (
     AWAITING_DEPOSIT,
@@ -42,6 +44,47 @@ TABS = TAB_LABEL
 _DESC_TABS = ("ended", "cancelled")
 
 
+# 全站視角的一筆場次。場次管理的子頁籤清單與場次行事曆的某一天共用這一份
+# SELECT 與 _item()——兩個畫面顯示的是同一張卡片，各寫一份遲早會講不一樣多。
+#
+# {where} 由呼叫端填自己的條件（頁籤是狀態、行事曆是日期），{order} 填排序。
+# booking_cost 是這一筆該收的訂金，依場次類型取——見 DUE_SQL。
+_SELECT = f"""
+        SELECT b.id, b.mmg_id, m.name, m.url, b.player_id, u.name,
+               b.session_date, b.session_time, b.deposit, {DUE_SQL}, b.note,
+               b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id,
+               b.gm1_confirmed, b.gm2_confirmed, b.gm3_confirmed, b.gm4_confirmed,
+               m.gm1_name, m.gm2_name, m.gm3_name, m.gm4_name,
+               b.day_type, b.status
+          FROM booking_record b
+          JOIN mmg m   ON m.id = b.mmg_id
+          JOIN users u ON u.id = b.player_id
+         WHERE 1 = 1
+           {{where}}
+         ORDER BY {{order}}
+         LIMIT %(limit)s OFFSET %(offset)s
+"""
+
+
+def _item(r):
+    return {
+        "id": r[0], "mmg_id": r[1], "mmg_name": r[2], "mmg_url": r[3],
+        "player_id": r[4], "player_name": r[5],
+        "session_date": r[6].isoformat(), "session_time": r[7].strftime("%H:%M"),
+        "deposit": r[8], "booking_cost": r[9], "note": r[10],
+        "gm_user_ids": list(r[11:15]),
+        "gm_confirmed": list(r[15:19]),
+        "gm_names": list(r[19:23]),
+        "day_type": r[23],
+        # ★ status 是後來補的（2026-09-18）。子頁籤清單本來不需要它——頁籤
+        #   本身就是狀態——但場次行事曆的一天混著各種狀態，每一筆得自己講。
+        #   編輯畫面也該用這一欄判斷「狀態有沒有被改」，而不是拿當前頁籤比：
+        #   行事曆上沒有「當前頁籤」這個東西。
+        "status": r[24],
+        "status_label": TAB_LABEL.get(r[24], r[24]),
+    }
+
+
 def list_tab(cur, tab: str, *, start: int = 1, filters: dict | None = None) -> dict:
     if tab not in TABS:
         raise BookingError(f"未知的頁籤「{tab}」")
@@ -56,39 +99,57 @@ def list_tab(cur, tab: str, *, start: int = 1, filters: dict | None = None) -> d
         else "b.session_date, b.session_time"
     )
 
-    def item(r):
-        return {
-            "id": r[0], "mmg_id": r[1], "mmg_name": r[2], "mmg_url": r[3],
-            "player_id": r[4], "player_name": r[5],
-            "session_date": r[6].isoformat(), "session_time": r[7].strftime("%H:%M"),
-            "deposit": r[8], "booking_cost": r[9], "note": r[10],
-            "gm_user_ids": list(r[11:15]),
-            "gm_confirmed": list(r[15:19]),
-            "gm_names": list(r[19:23]),
-            "day_type": r[23],
-        }
-
-    # booking_cost 是這一筆該收的訂金，依場次類型取——見 DUE_SQL。
     return paged(
         cur,
-        f"""
-        SELECT b.id, b.mmg_id, m.name, m.url, b.player_id, u.name,
-               b.session_date, b.session_time, b.deposit, {DUE_SQL}, b.note,
-               b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id,
-               b.gm1_confirmed, b.gm2_confirmed, b.gm3_confirmed, b.gm4_confirmed,
-               m.gm1_name, m.gm2_name, m.gm3_name, m.gm4_name,
-               b.day_type
-          FROM booking_record b
-          JOIN mmg m   ON m.id = b.mmg_id
-          JOIN users u ON u.id = b.player_id
-         WHERE b.status = %(tab)s
-           {where}
-         ORDER BY {order}
-         LIMIT %(limit)s OFFSET %(offset)s
-        """,
+        _SELECT.format(where=f"AND b.status = %(tab)s\n           {where}", order=order),
         {"tab": tab, "offset": start - 1, **fp},
-        item,
+        _item,
     )
+
+
+def list_date(cur, session_date, *, start: int = 1) -> dict:
+    """場次行事曆點某一天：全店那天的場次，**不分狀態、已取消的也列**。
+
+    跟子頁籤清單共用同一份查詢與同一張卡片，差別只有條件是日期不是狀態。
+
+    ★ 點不畫已取消、清單全部列出——三份行事曆同一條規則（案主 2026-09-17）。
+    """
+    return paged(
+        cur,
+        _SELECT.format(where="AND b.session_date = %(date)s",
+                       order="b.session_time, b.created_at"),
+        {"date": session_date, "offset": start - 1},
+        _item,
+    )
+
+
+def month_days(cur, year: int, month: int) -> dict[str, list[str]]:
+    """場次行事曆上的點：全店這個月每一天有哪些場次的狀態，依開始時間排序。
+
+    回傳 {'2026-09-05': ['gm_confirm', 'booked']}——一場一個值，不是計數，
+    因為點要照開始時間由左往右畫，順序本身就是資料。
+
+    ★ 不含已取消（案主 2026-09-17：「只要有非取消的場次」才畫點）。
+
+    ★ 半開區間 [這個月 1 號, 下個月 1 號)：閏年與大小月不必自己判斷。
+    """
+    first = date(year, month, 1)
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    cur.execute(
+        """
+        SELECT session_date, status
+          FROM booking_record
+         WHERE status <> 'cancelled'
+           AND session_date >= %(first)s
+           AND session_date < %(next)s
+         ORDER BY session_date, session_time, created_at
+        """,
+        {"first": first, "next": nxt},
+    )
+    days: dict[str, list[str]] = {}
+    for d, status in cur.fetchall():
+        days.setdefault(d.isoformat(), []).append(status)
+    return days
 
 
 def overview(cur) -> dict:
