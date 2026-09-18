@@ -1,6 +1,14 @@
 """排期：某個劇本在某個日期、某個時間開不開放預約。
 
-## 四層，由高到低
+## 五層，由高到低
+
+    -1. 店家忙碌日（busy_day，busy_source='store'）
+       整家店那天不開，**比下面每一層都高**：上下架、特定日期例外、每週
+       常態全部翻不過來（案主 2026-09-17：「忙碌日變成第一優先，例外都在
+       他以下」）。
+       ★ 這一層只擋玩家那條路。管理員在場次管理新增／改期本來就不問排期
+         （補登已經發生的場），忙碌日跟著同一條規矩，只是要先過一個對話框。
+         那條路傳 allow_closed_slot=True，整段排期判斷都不會跑到。
 
     0. 上下架區間（mmg.start_booking / end_booking）
        絕對外框。區間外一律不開，下面三層都翻不過來。
@@ -51,7 +59,7 @@ from __future__ import annotations
 
 from datetime import date, time
 
-from db import functions, slot_cache
+from db import busy, functions, slot_cache
 
 # negative 模式下「全時段開放」到底是哪些時段：00:00 到 23:30，每半小時
 # 一格，共 48 格。
@@ -76,6 +84,10 @@ def open_times(cur, mmg_id: int, session_date: date) -> list[time] | None:
       呼叫端用 `is None` 判斷，不要用真假值——空清單跟 None 在 if 裡
       是一樣的，那會讓兩種不同的狀態悄悄合併。
     """
+    # 第 -1 層：店家忙碌日。放在最前面，它比誰都高。
+    if busy.store_busy(cur, session_date):
+        return None
+
     # 第 0 層。這支在開賣尖峰是最熱的讀取路徑之一，能少一次往返就少一次
     # 讓 Neon compute 保持清醒的理由（見 db/idle_gap.py）。
     #
@@ -251,9 +263,22 @@ def calendar(cur, mmg_id: int, start: date, end: date) -> tuple[dict, bool]:
     )
     exceptions = {r[0]: (r[1], list(r[2])) for r in cur.fetchall()}
 
+    # 第 -1 層：店家忙碌日。一次把整段查完，不要逐日問——這支存在的理由
+    # 就是「三個查詢就做完，不是一天一次」（見上面的說明）。
+    cur.execute(
+        "SELECT busy_date FROM busy_day "
+        " WHERE busy_source = 'store' AND busy_date BETWEEN %s AND %s",
+        (start, end),
+    )
+    busy_dates = {r[0] for r in cur.fetchall()}
+
     out: dict[str, list[str]] = {}
     day = start
     while day <= end:
+        if day in busy_dates:
+            # 忙碌日整天不開，下面每一層都不必看。
+            day = day.fromordinal(day.toordinal() + 1)
+            continue
         if day in exceptions:
             is_open_day, times = exceptions[day]
             times = times if is_open_day else None

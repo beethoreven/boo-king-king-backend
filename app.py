@@ -24,7 +24,8 @@ from auth_utils.decorators import admin_display_name, require_auth, require_role
 from auth_utils.google_auth import extract_bearer_token, verify_google_id_token  # noqa: E402
 from admin_utils import bookings_admin, mmg_admin, users_admin  # noqa: E402
 import jobs  # noqa: E402
-from db import bookings as bookings_db  # noqa: E402
+from db import bookings as bookings_db
+from db import busy as busy_db  # noqa: E402
 from db import idle_gap  # noqa: E402
 from db import mmg as mmg_db  # noqa: E402
 from db import listing  # noqa: E402
@@ -962,6 +963,10 @@ def get_slot(mmg_id: int):
             # 排期跟容量、撞期是三件不同的事，各自回一個旗標，訊息的
             # 優先序交給前端排（見 booking.js 的 slotMessage）。
             slot_open = schedule.is_open(cur, mmg_id, d, t)
+            # ★ 忙碌日單獨回一個旗標，不只靠 is_open。兩者都會讓人訂不成，
+            #   但說法完全不同：「此時間未開放」會讓玩家去試別的時間，而
+            #   那天不管幾點都不行。
+            store_busy = busy_db.store_busy(cur, d)
 
     capacity = item["waitlist_limit"]
     # 這個時段有沒有已經成立的那一組。玩家看到的說法差很多：已經有人
@@ -979,6 +984,8 @@ def get_slot(mmg_id: int):
         # 這個時段在不在店家設定的開放範圍內。不開放時前面那幾個數字
         # 就沒有意義了——沒開放的時段談「還有幾個位子」是空的。
         "is_open": slot_open,
+        # 這天是不是店家忙碌日。前端據此換一句話（見 booking.js 的 slotMessage）。
+        "store_busy": store_busy,
         # ★ 只回一個布林值，不回是哪一場撞到。
         #   玩家不需要知道包廂裡在演什麼、誰訂的、演到幾點——那是別的
         #   客人的預約。前端就算不顯示，送出去的東西打開開發者工具就
@@ -1022,6 +1029,16 @@ def check_gm_route():
             if cur.fetchone() is None:
                 return jsonify({"error": "找不到這個劇本"}), 404
 
+            # 忙碌日排在撞期前面：兩者都擋，但一句是「他那天有場次」、
+            # 一句是「他那天整天不接」，玩家要做的事不一樣。
+            if busy_db.busy_gm_ids(cur, [user_id], d):
+                cur.execute("SELECT name FROM users WHERE id = %s", (user_id,))
+                row = cur.fetchone()
+                who = (row[0] if row else None) or f"id={user_id}"
+                return jsonify({
+                    "error": f"{who}這天不開放指定任何劇本，請選擇其他主持人或改期。",
+                    "code": bookings_db.REASON_GM_BUSY,
+                }), 409
             conflicting = bookings_db.conflicting_gm(
                 cur, [user_id], mmg_id, d, t
             )
@@ -1384,6 +1401,130 @@ def gm_date_route(d: str):
             return jsonify(bookings_db.list_gm_date(
                 cur, g.user["id"], session_date, start=start,
             ))
+
+
+# ── 忙碌日 ──────────────────────────────────────────────────────
+#
+# 兩種來源、兩組端點，因為權限與對象不同：
+#   店家忙碌日  管理員設，對象是整家店（/api/admin/busy）
+#   主持人忙碌日 主持人設自己的（/api/gm/busy），管理員不能替他設
+#
+# 擋在哪、為什麼一個可以放行一個不行，見 db/busy.py 的開頭。
+
+
+def _parse_busy_date(raw: str):
+    try:
+        return date.fromisoformat(raw)
+    except (ValueError, TypeError):
+        raise BookingError(f"日期格式錯誤：{raw}（需要 YYYY-MM-DD）") from None
+
+
+@app.get("/api/admin/busy/<ym>")
+@require_role(1)
+def admin_busy_month(ym: str):
+    """這個月的店家忙碌日，給場次行事曆把格子塗灰。"""
+    try:
+        first = date.fromisoformat(f"{ym}-01")
+    except ValueError:
+        return bad_request("月份格式錯誤，需要 YYYY-MM")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            dates = busy_db.dates_in(cur, busy_db.STORE, None, first.year, first.month)
+    return jsonify({"month": ym, "dates": dates})
+
+
+@app.post("/api/admin/busy")
+@require_role(1)
+def admin_busy_set():
+    """把某一天設成店家忙碌日。
+
+    ★ 那天已經有場次也照設（案主 2026-09-17：跳警告，他堅持就讓他設）。
+      警告由畫面負責——它手上已經有那個月每天有幾場。後端負責的是**寄信**
+      通知所有管理員，那是店裡其他人唯一會知道這件事的管道。
+    """
+    try:
+        d = _parse_busy_date((request.get_json(silent=True) or {}).get("date"))
+    except BookingError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            added = busy_db.add(cur, busy_db.STORE, None, d)
+            outbox = []
+            if added:
+                sessions = busy_db.sessions_on(cur, d)
+                if sessions:
+                    outbox = [notify_events.on_busy_day_set(
+                        cur, d, sessions, actor_id=g.user["id"])]
+            conn.commit()
+    # 忙碌日會改變「哪些時段訂得到」，而 /slot 的回應有快取。
+    slot_cache.clear()
+    notify_events.send(outbox)
+    return jsonify({"date": d.isoformat(), "added": added})
+
+
+@app.delete("/api/admin/busy/<d>")
+@require_role(1)
+def admin_busy_clear(d: str):
+    try:
+        day = _parse_busy_date(d)
+    except BookingError as exc:
+        return jsonify({"error": str(exc)}), 400
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            removed = busy_db.remove(cur, busy_db.STORE, None, day)
+            conn.commit()
+    slot_cache.clear()
+    return jsonify({"date": day.isoformat(), "removed": removed})
+
+
+@app.get("/api/gm/busy/<ym>")
+@require_role(2)
+def gm_busy_month(ym: str):
+    """這個月**自己的**忙碌日。看不到別人的——那不是他的事。"""
+    try:
+        first = date.fromisoformat(f"{ym}-01")
+    except ValueError:
+        return bad_request("月份格式錯誤，需要 YYYY-MM")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            dates = busy_db.dates_in(
+                cur, busy_db.GM, g.user["id"], first.year, first.month)
+    return jsonify({"month": ym, "dates": dates})
+
+
+@app.post("/api/gm/busy")
+@require_role(2)
+def gm_busy_set():
+    """主持人把某一天標成自己的忙碌日。
+
+    ★ 只能設自己的：user_id 一律取 g.user，不收參數。管理員要替主持人設
+      是另一件事（目前不做）——那會讓「誰標的」變得不確定，而這個標記的
+      意義正是「這個人自己說那天不行」。
+    """
+    try:
+        d = _parse_busy_date((request.get_json(silent=True) or {}).get("date"))
+    except BookingError as exc:
+        return jsonify({"error": str(exc)}), 400
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            added = busy_db.add(cur, busy_db.GM, g.user["id"], d)
+            conn.commit()
+    return jsonify({"date": d.isoformat(), "added": added})
+
+
+@app.delete("/api/gm/busy/<d>")
+@require_role(2)
+def gm_busy_clear(d: str):
+    try:
+        day = _parse_busy_date(d)
+    except BookingError as exc:
+        return jsonify({"error": str(exc)}), 400
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            removed = busy_db.remove(cur, busy_db.GM, g.user["id"], day)
+            conn.commit()
+    return jsonify({"date": day.isoformat(), "removed": removed})
 
 
 @app.get("/api/bookings/<int:booking_id>/detail")
@@ -1842,6 +1983,10 @@ def admin_create_booking(cur, body):
     new_id = bookings_admin.create(cur, body)
     created = bookings_db.get_booking(cur, new_id)
     g.outbox = notify_events.on_booking_change(cur, None, created, actor_id=g.user["id"])
+    # 忙碌日被排進場次：⑧寄所有管理員、⑨寄被指定的主持人。這一支自己會問
+    # 「那天是不是忙碌日」，不是忙碌日就回空清單。
+    g.outbox += notify_events.on_busy_day_booking(
+        cur, None, created, actor_id=g.user["id"]) or []
     return jsonify(created), 201
 
 
@@ -1863,6 +2008,10 @@ def admin_update_booking(cur, body, booking_id: int):
     # 後台可以直接把狀態改成 gm_reviewed 或 booked，也可以補指派主持人——
     # 前後比對讓這三種都跟正常流程走同一條通知規則（見 notify_events）。
     g.outbox = notify_events.on_booking_change(cur, before, after, actor_id=g.user["id"])
+    # 改期到忙碌日也算「被排進去」（案主 2026-09-18）。只改備註、改訂金
+    # 不會觸發——判斷在 on_busy_day_booking 裡。
+    g.outbox += notify_events.on_busy_day_booking(
+        cur, before, after, actor_id=g.user["id"]) or []
     return jsonify({"changed": changed, "item": after})
 
 

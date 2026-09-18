@@ -12,9 +12,11 @@ import uuid
 
 from db import line_template
 from db.bookings import (
+    REASON_GM_BUSY,
     REASON_NOT_OPEN,
     REASON_OVERLAP,
     REASON_SAME_TIME,
+    REASON_STORE_BUSY,
     BookingError,
     BookingResult,
     create_booking,
@@ -187,10 +189,16 @@ def handle_command(cur, text: str, webhook_event_id: str, *,
 #   template key 的 conflict 沿用舊名：店家可能已經改過那一列的字，換成新
 #   key 的話她改過的內容會被晾在一列沒人讀的資料上。
 _REASON_TEMPLATE = {
-    REASON_SAME_TIME: "conflict",   # ❌ 這個時間已經有場次了
-    REASON_OVERLAP: "overlap",      # ❌ 與其他場次所需時間重疊
-    REASON_NOT_OPEN: "not_open",    # ❌ 這個時間沒有開放
+    REASON_SAME_TIME: "conflict",     # ❌ 這個時間已經有場次了
+    REASON_OVERLAP: "overlap",        # ❌ 與其他場次所需時間重疊
+    REASON_NOT_OPEN: "not_open",      # ❌ 這個時間沒有開放
+    REASON_STORE_BUSY: "store_busy",  # ❌ 當天有其他的排程，請換一個日期
+    REASON_GM_BUSY: "gm_busy",        # ❌ 當天沒有開放帶場
 }
+
+
+# 需要店主名字的那幾句。忙碌日兩句都是在說「那天那個人不接」，所以要帶名字。
+_NEEDS_OWNER = ("store_busy", "gm_busy")
 
 
 def _failure_text(cur, exc: BookingError) -> str:
@@ -201,6 +209,8 @@ def _failure_text(cur, exc: BookingError) -> str:
         #   「已經有場次了」的人不會想到那其實是別的原因。
         log.warning("LINE：沒有原因代碼的訂場失敗，回了 conflict。原訊息：%s", exc)
         key = "conflict"
+    if key in _NEEDS_OWNER:
+        return line_template.render(cur, key, owner_name=_owner_name(cur))
     return line_template.render(cur, key)
 
 

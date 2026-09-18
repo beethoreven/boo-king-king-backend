@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 import notifications as nf
-from db import functions, line_template
+from db import busy, functions, line_template
 from line_utils import client as line_client
 from line_utils import handler as line_handler
 
@@ -349,6 +349,109 @@ def send(outbox) -> None:
     for push in items:
         if isinstance(push, LinePush):
             line_client.push(push.to, push.text)
+
+
+# ── ⑦⑧⑨ 忙碌日 ──────────────────────────────────────────────
+#
+# 三封都寄給「不是按下按鈕的那個人」看：按的人畫面上已經被對話框問過一次，
+# 真正需要知道的是店裡其他管理員與被指定的主持人。
+#
+# ★ 收件人刻意**不排除操作者**（跟 LINE 推播的規則相反）。店家可能只有一位
+#   管理員，排除他等於這件事完全沒有紀錄；而這三封講的是「有人做了一個需要
+#   善後的操作」，操作者自己收到一份副本不會造成困擾。
+
+
+def _date_text(d) -> tuple[str, str]:
+    """(完整, 精簡)：('2026-09-20（日）', '2026/9/20')。"""
+    day = _as_date(d)
+    if day is None:
+        return str(d), str(d)
+    return (f"{day.isoformat()}（{_WEEKDAY[day.weekday()]}）",
+            f"{day.year}/{day.month}/{day.day}")
+
+
+def _actor_name(cur, actor_id: int | None) -> str:
+    if not actor_id:
+        return "管理員"
+    cur.execute("SELECT name FROM users WHERE id = %s", (actor_id,))
+    row = cur.fetchone()
+    return (row[0] if row else None) or "管理員"
+
+
+@safe
+def on_busy_day_set(cur, busy_date, sessions: list, *, actor_id: int | None):
+    """⑦ 把有場次的日子設成忙碌日 → 通知所有管理員。
+
+    sessions 是那天既存的非取消場次（含已結束，案主 2026-09-18）。空的就不寄
+    ——沒有東西要善後的忙碌日是常態，不需要通知任何人。
+    """
+    if not sessions:
+        return None
+    full, short = _date_text(busy_date)
+    listed = "、".join(
+        f"{s['session_time']}《{s['mmg_name']}》" for s in sessions
+    )
+    return nf.build(cur, "busy_day_set", nf.admins(cur), {
+        "admin_name": _actor_name(cur, actor_id),
+        "date": full,
+        "date_short": short,
+        "sessions": listed,
+    })
+
+
+@safe
+def on_busy_day_booking(cur, before: dict | None, after: dict | None, *,
+                        actor_id: int | None) -> list:
+    """⑧⑨ 忙碌日被排進場次 → 通知所有管理員，以及被指定的主持人。
+
+    什麼時候算「被排進去」：這一筆是新建的，或它被改到另一天（案主
+    2026-09-18：改期算）。只是改備註、改訂金不算——那不會讓忙碌日多出
+    一場戲，每次存檔都寄一輪只會讓這封信變成雜訊。
+
+    ★ 主持人那封（⑨）的收件人是「這次新被指定、或整筆搬過來時掛著的」
+      主持人。已經在這一筆上、而且日期沒動的，不重寄。
+
+    ★ single 模式不寄⑨：那種店的主持人就是店主本人，她已經收到⑧了。
+      規則與「你被指定為主持人」那封完全相同。
+    """
+    if not after:
+        return []
+    when = after["session_date"]
+    if not busy.store_busy(cur, when):
+        return []
+
+    moved = bool(before) and str(before["session_date"]) != str(when)
+    if before and not moved:
+        return []
+
+    full, short = _date_text(when)
+    session_full, _ = session_text(after["session_date"], after["session_time"])
+    base = {
+        "admin_name": _actor_name(cur, actor_id),
+        "date": full,
+        "date_short": short,
+        "mmg_name": after["mmg_name"],
+        "session": session_full,
+        "player_name": after["player_name"],
+    }
+
+    out = []
+    msg = nf.build(cur, "busy_day_booking", nf.admins(cur), base)
+    if msg:
+        out.append(msg)
+
+    if functions.gm_mode(cur) != "single":
+        old_gms = set(i for i in (before["gm_user_ids"] if before else []) if i)
+        # 搬過來的話，這一筆上的每一位主持人對「這一天」而言都是新的。
+        targets = [i for i in after["gm_user_ids"]
+                   if i and (moved or i not in old_gms)]
+        for gm in nf.users_by_id(cur, targets):
+            m = nf.build(cur, "busy_day_gm", [gm], {
+                **base, "gm_name": gm["name"] or "主持人",
+            })
+            if m:
+                out.append(m)
+    return out
 
 
 # ── ④⑤ 異常記點與停權 ──────────────────────────────────────────

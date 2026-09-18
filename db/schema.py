@@ -73,6 +73,8 @@ def ensure_schema(cur) -> None:
         # 排期兩張表都參照 mmg(id)，必須排在 _ensure_mmg 之後。
         _ensure_schedule(cur)
         _ensure_booking_record(cur)
+        # 忙碌日參照 users(id)，必須排在 _ensure_users 之後。
+        _ensure_busy_day(cur)
         _ensure_sessions(cur)
         _ensure_abuse_log(cur)
         _ensure_abuse_rule(cur)
@@ -163,9 +165,75 @@ def _ensure_line_template(cur) -> None:
             ('no_permission',
              '抱歉，你沒有權限透過我預訂，請聯繫{owner_name}。',
              '不是店家人員傳來的任何訊息（群組 tag 或私訊；私訊「我的ID」除外）。'
-             '變數：owner_name（LINE 訂場掛名的帳號的名字，即 users.id = 1）')
+             '變數：owner_name（LINE 訂場掛名的帳號的名字，即 users.id = 1）'),
+            -- ★ 預設文字**不寫死店主的名字**，用 owner_name 變數：後端是每一家
+            --    店共用的程式，寫死的話這句話會被種進其他店家的資料庫。在 eli
+            --    的資料庫裡它讀出來就是「eli」，顯示的結果跟案主要的一模一樣。
+            ('store_busy',
+             '❌ 當天{owner_name}有其他的排程，請換一個日期。',
+             '那天是店家忙碌日，整天不開放。硬要排就得走後台（管理員那條路不問排期）。'
+             '變數：owner_name'),
+            ('gm_busy',
+             '❌ 當天{owner_name}沒有開放帶場，請換一個日期。',
+             '被指定的主持人把那天標成忙碌日。一人店（single）時那個人就是店主，'
+             '所以用同一個變數。變數：owner_name')
         ON CONFLICT (key) DO NOTHING
         """
+    )
+
+
+def _ensure_busy_day(cur) -> None:
+    """忙碌日：店家的（整家店那天不開）與主持人的（那天不能被指定）。
+
+    規則與擋在哪，見 db/busy.py 的開頭。這裡只解釋 schema 的三個選擇：
+
+    ## user_id 為什麼可以是空的
+
+    店家忙碌日不屬於任何一位管理員——任何管理員設的都是「整家店那天不開」。
+    主持人忙碌日才有「是誰」。CHECK 把兩者綁死，不會出現標成 gm 卻沒有人、
+    或標成 store 卻掛了人這種對不起來的列。
+
+    ## 為什麼是兩條部分唯一索引，不是一條 UNIQUE
+
+    一條 UNIQUE (busy_source, user_id, busy_date) 擋不住店家那幾列重複：
+    它們的 user_id 是 NULL，而 Postgres 預設把兩個 NULL 當成不同的值。
+    拆成兩條之後，店家看日期、主持人看「人＋日期」，各自都真的唯一。
+    （PG15 起有 NULLS NOT DISTINCT，但部分索引在哪個版本都成立，而各店的
+    Neon 版本不必為了這件事對齊。）
+
+    ## 為什麼沒有 created_at／created_by
+
+    現在沒有任何地方讀它們。設忙碌日當下要寄的信在那一刻就知道是誰按的，
+    不需要回頭查。哪天真的要追「誰設的」再加——沒有人讀的欄位就是髒東西
+    （案主的原則：每家店的資料庫只放用得到的）。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS busy_day (
+            id SERIAL PRIMARY KEY,
+
+            -- 'store' 整家店；'gm' 某一位主持人
+            busy_source TEXT NOT NULL CHECK (busy_source IN ('store', 'gm')),
+
+            -- gm 才有；store 一定是空的（見下面的 CHECK）
+            user_id INTEGER REFERENCES users(id),
+
+            -- 台北時間的日期，跟 session_date 同一個約定
+            busy_date DATE NOT NULL,
+
+            CONSTRAINT busy_day_source_user CHECK (
+                (busy_source = 'gm') = (user_id IS NOT NULL)
+            )
+        )
+        """
+    )
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_busy_day_store "
+        "ON busy_day (busy_date) WHERE busy_source = 'store'"
+    )
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_busy_day_gm "
+        "ON busy_day (user_id, busy_date) WHERE busy_source = 'gm'"
     )
 
 

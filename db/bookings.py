@@ -12,13 +12,15 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from db import functions, listing, schedule, slot_cache
+from db import busy, functions, listing, schedule, slot_cache
 
 
 # 預約被拒的原因代碼。給程式分流用，見 BookingError.reason。
 REASON_SAME_TIME = "same_time"  # 那個開始時間已經有場（不管是哪一齣）
 REASON_OVERLAP = "overlap"      # 跟其他場次的佔用時間重疊，但開始時間不同
 REASON_NOT_OPEN = "not_open"    # 劇本沒上架、時段沒開放、或時間已經過了
+REASON_STORE_BUSY = "store_busy"  # 店家把那天標成忙碌日
+REASON_GM_BUSY = "gm_busy"        # 那位主持人把那天標成忙碌日
 
 
 class BookingError(Exception):
@@ -561,7 +563,28 @@ def find_conflicts(cur, booking_id: int) -> dict:
                 for r in cur.fetchall()
             ]
 
-    return {"room": room, "gms": gms}
+    # ── 忙碌日 ──
+    #
+    # 兩者的處置完全不同，所以分開回：
+    #   store_busy  店家自己標的。管理員可以放行（跳對話框確認），因為
+    #               場次管理那條路本來就不問排期。
+    #   busy_gms    主持人自己標的。**誰都不能放行**（案主 2026-09-18），
+    #               只能請他先解除忙碌日。
+    #
+    # ★ 跟上面兩種撞期不一樣，這兩個不看 status='booked'：忙碌日講的是
+    #   「那天這個人／這家店不接」，跟那天已經排了什麼無關。
+    cur.execute("SELECT id, name FROM users WHERE id = ANY(%s)", (gm_ids or [0],))
+    names = dict(cur.fetchall())
+    busy_gms = [
+        {"gm_id": i, "gm_name": names.get(i) or f"id={i}"}
+        for i in busy.busy_gm_ids(cur, gm_ids, session_date)
+    ]
+    return {
+        "room": room,
+        "gms": gms,
+        "store_busy": busy.store_busy(cur, session_date),
+        "busy_gms": busy_gms,
+    }
 
 
 def _validate_gm_choice(cur, mmg_id: int, gm_user_ids: list[int | None]) -> None:
@@ -681,6 +704,14 @@ def create_booking(
         # 閘門仍然是下面的 is_open（它經過 schedule._bookable，同一條規則）。
         # 會走到這裡的真實情境是：玩家把頁面開著，選了今天 19:00，拖到
         # 19:01 才按送出。回「此時間未開放」會讓他以為這個時段本來就沒開。
+        # 店家忙碌日排在最前面：它比排期的任何一層都高（見 db/schedule.py）。
+        #
+        # ★ 單獨問一次而不是靠 is_open 回 False，是為了講對話。兩者都會擋，
+        #   但「此時間未開放」會讓玩家以為這個時段本來就沒排，然後去試別的
+        #   時間——而那天不管幾點都不行。
+        if busy.store_busy(cur, session_date):
+            raise BookingError("店家這天不開放預約任何劇本，請選擇其他日期。",
+                               reason=REASON_STORE_BUSY)
         if datetime.combine(session_date, session_time) <= now:
             raise BookingError("這個時段已經過了，請重新選擇", reason=REASON_NOT_OPEN)
         if not schedule.is_open(cur, mmg_id, session_date, session_time):
@@ -765,6 +796,19 @@ def create_booking(
             f"（{other_d} {other_t:%H:%M} 起 {other_period:g} 小時"
             f"，另需 {other_reset:g} 小時還原場地），時段衝突",
             reason=reason,
+        )
+
+    # 主持人忙碌日。**硬擋，管理員也不能放行**（案主 2026-09-18）：它跟主持人
+    # 撞期同一級，差別只在撞期是系統算的、忙碌日是他自己標的。所以這一段刻意
+    # 放在 allow_closed_slot 的判斷之外——場次管理那條路不問排期，但這一條照擋。
+    busy_gms = busy.busy_gm_ids(cur, gm_ids, session_date)
+    if busy_gms:
+        cur.execute("SELECT name FROM users WHERE id = %s", (busy_gms[0],))
+        row = cur.fetchone()
+        gm_name = (row[0] if row else None) or f"id={busy_gms[0]}"
+        raise BookingError(
+            f"{gm_name}這天不開放指定任何劇本，請選擇其他主持人或改期。",
+            reason=REASON_GM_BUSY,
         )
 
     conflicting = conflicting_gm(cur, gm_ids, mmg_id, session_date, session_time)

@@ -142,6 +142,11 @@ _BUTTON_TARGET = {
     "abuse_point": "view=admin&tab=abuse",
     "abuse_banned": "view=admin&tab=users",
     "admin_booked": "view=admin&tab=bookings&sub=booked",
+    # 忙碌日那三封都指向行事曆——信裡講的是「哪一天」，而按狀態分的清單
+    # 回答不了「那一天怎麼了」。
+    "busy_day_set": "view=storecalendar",
+    "busy_day_booking": "view=storecalendar",
+    "busy_day_gm": "view=gmcalendar",
 }
 
 

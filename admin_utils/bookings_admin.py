@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from db import functions, slot_cache
+from db import busy, functions, slot_cache
 from db.bookings import (
     AWAITING_DEPOSIT,
     DAY_TYPES,
@@ -282,6 +282,24 @@ def update(cur, booking_id: int, data: dict) -> bool:
 
     if all(new[k] == current[k] for k in current):
         return False
+
+    # 主持人忙碌日：**硬擋，管理員也不能放行**（案主 2026-09-18）。
+    #
+    # ★ 只在「指定這件事真的變了」時擋：這一天新指定了誰，或整筆被搬到
+    #   另一天。既有的那些照樣可以改備註、改訂金——一位主持人事後把某天
+    #   標成忙碌，不該讓管理員連善後都做不了，而善後正是他這時候要做的事。
+    when = new["session_date"] or current["session_date"]
+    moved_day = new["session_date"] not in (None, current["session_date"])
+    added = [u for u in new["gm_user_ids"]
+             if u and (moved_day or u not in current["gm_user_ids"])]
+    blocked = busy.busy_gm_ids(cur, added, when)
+    if blocked:
+        cur.execute("SELECT name FROM users WHERE id = %s", (blocked[0],))
+        row2 = cur.fetchone()
+        who = (row2[0] if row2 else None) or f"id={blocked[0]}"
+        raise BookingError(
+            f"{who}這天不開放指定任何劇本，請選擇其他主持人或改期。"
+        )
 
     # 劇本、場次類型、狀態，這三樣決定「這一筆還要不要收訂金、收多少」。
     # 任何一樣改了、而且改完之後這筆還在等訂金，那個金額就必須有設定——
