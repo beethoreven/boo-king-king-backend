@@ -1433,6 +1433,46 @@ def admin_busy_month(ym: str):
     return jsonify({"month": ym, "dates": dates})
 
 
+@app.get("/api/admin/busy/check")
+@require_role(1)
+def admin_busy_check():
+    """某一天是不是忙碌日、指定的主持人裡有誰那天忙碌。
+
+    給場次管理的編輯畫面用：管理員選了日期與主持人的當下就要知道，而不是
+    按下儲存才被退回。兩種忙碌日的處置不同（見 db/busy.py）：
+      store_busy  可以放行，但要先跳對話框確認
+      busy_gms    **硬擋**，畫面上先紅字，硬按就跳對話框說明並且不讓存
+
+    ★ 這支是**提醒**，不是把關。真正擋下寫入的是 create_booking 與
+      bookings_admin.update——它們各自會再問一次。前端少問一次只會讓錯誤
+      晚一點出現，不會讓不該成立的東西成立。
+    """
+    raw = (request.args.get("date") or "").strip()
+    try:
+        d = _parse_busy_date(raw)
+    except BookingError as exc:
+        return jsonify({"error": str(exc)}), 400
+    gm_ids = []
+    for part in (request.args.get("gm") or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            gm_ids.append(int(part))
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            store = busy_db.store_busy(cur, d)
+            ids = busy_db.busy_gm_ids(cur, gm_ids, d)
+            names = {}
+            if ids:
+                cur.execute("SELECT id, name FROM users WHERE id = ANY(%s)", (ids,))
+                names = dict(cur.fetchall())
+    return jsonify({
+        "date": d.isoformat(),
+        "store_busy": store,
+        "busy_gms": [{"id": i, "name": names.get(i) or f"id={i}"} for i in ids],
+    })
+
+
 @app.post("/api/admin/busy")
 @require_role(1)
 def admin_busy_set():
