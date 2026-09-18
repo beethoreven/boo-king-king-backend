@@ -1181,6 +1181,65 @@ def my_bookings_tab(tab: str):
         return jsonify({"error": str(exc)}), 400
 
 
+# ── 預訂行事曆 ──────────────────────────────────────────────────
+#
+# 兩支唯讀端點，一支給日曆上的點、一支給點進某一天之後的清單。
+#
+# ★ 為什麼不是一支。點要畫在整個月上，所以需要「這個月每一天有什麼」；
+#   清單只需要一天。合成一支回傳整個月的完整內容的話，一次要背整月所有
+#   場次的卡片資料，而使用者一次只看得到一天。分成兩支之後，翻月份只花
+#   一包很小的狀態清單，點日期才去拿那一天的內容。
+#
+# ★ 為什麼不用現成的 /tab/<tab>?session_date=：那支一次只查一個狀態，
+#   而行事曆的某一天是五個狀態混在一起，得打五次。
+
+
+@app.get("/api/bookings/mine/month/<ym>")
+@require_auth
+def my_bookings_month(ym: str):
+    """行事曆上的點：這個月每一天有哪些場次的狀態，依開始時間排序。
+
+    回傳 {"days": {"2026-09-05": ["gm_confirm", "booked"]}}——一場一個值，
+    順序就是畫面上那排點由左往右的順序。
+
+    ★ 不含已取消的場次；點進某一天的清單則全部列出（案主定案）。
+    """
+    try:
+        first = date.fromisoformat(f"{ym}-01")
+    except ValueError:
+        return bad_request("月份格式錯誤，需要 YYYY-MM")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            days = bookings_db.player_month_days(cur, g.user["id"], first.year, first.month)
+    return jsonify({"month": ym, "days": days})
+
+
+@app.get("/api/bookings/mine/date/<d>")
+@require_auth
+def my_bookings_date(d: str):
+    """行事曆上點某一天：那天自己的全部預約，不分狀態、已取消的也列。
+
+    形狀跟 /tab/<tab> 完全一樣（同一份 SELECT、同一個 item），所以前端兩個
+    畫面用的是同一張卡片。
+    """
+    try:
+        session_date = date.fromisoformat(d)
+    except ValueError:
+        return bad_request("日期格式錯誤，需要 YYYY-MM-DD")
+    try:
+        start = int(request.args.get("start", 1))
+    except ValueError:
+        return bad_request("start 必須是數字")
+    if start < 1:
+        return bad_request("start 必須大於 0")
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            return jsonify(bookings_db.list_player_date(
+                cur, g.user["id"], session_date, start=start,
+            ))
+
+
 def _is_assigned_gm(booking: dict, user_id: int) -> bool:
     """這個人是不是這筆預約指定的主持人之一。"""
     return user_id in (booking.get("gm_user_ids") or [])

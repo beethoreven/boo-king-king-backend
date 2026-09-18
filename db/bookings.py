@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 from db import functions, listing, schedule, slot_cache
 
@@ -1077,6 +1077,54 @@ def reachable_tabs(cur) -> dict[str, str]:
 _PLAYER_DESC_TABS = ("ended", "cancelled")
 
 
+# 玩家視角的一筆預約。頁籤清單（我預訂的場次）與行事曆的某一天共用這一份
+# SELECT 與下面的 _player_item——那兩個畫面顯示的是同一張卡片，各寫一份的話
+# 只要有人加一個欄位，同一場戲在兩個地方就會講得不一樣多。
+#
+# {where} 由呼叫端填自己的條件（頁籤是狀態、行事曆是日期），{order} 填排序。
+# booking_cost 是這一筆該收的訂金，依場次類型取——見 DUE_SQL。
+_PLAYER_SELECT = f"""
+        SELECT b.id, m.name, m.url, b.session_date, b.session_time, b.status,
+               b.deposit, {DUE_SQL}, b.note,
+               CASE WHEN b.status = 'cancelled' THEN NULL ELSE (
+                   SELECT COUNT(*) + 1 FROM booking_record x
+                    WHERE x.mmg_id = b.mmg_id
+                      AND x.session_date = b.session_date
+                      AND x.session_time = b.session_time
+                      AND x.status <> 'cancelled'
+                      AND x.created_at < b.created_at
+               ) END AS position,
+               u1.name, u2.name, u3.name, u4.name,
+               m.waitlist_limit, b.day_type
+          FROM booking_record b
+          JOIN mmg m ON m.id = b.mmg_id
+          LEFT JOIN users u1 ON u1.id = b.gm1_user_id
+          LEFT JOIN users u2 ON u2.id = b.gm2_user_id
+          LEFT JOIN users u3 ON u3.id = b.gm3_user_id
+          LEFT JOIN users u4 ON u4.id = b.gm4_user_id
+         WHERE b.player_id = %(player)s
+           {{where}}
+         ORDER BY {{order}}
+         LIMIT %(limit)s OFFSET %(offset)s
+"""
+
+
+def _player_item(r):
+    return {
+        "id": r[0], "mmg_name": r[1], "mmg_url": r[2],
+        "session_date": r[3].isoformat(), "session_time": r[4].strftime("%H:%M"),
+        "status": r[5], "status_label": PLAYER_TABS.get(r[5], r[5]),
+        "deposit": r[6], "booking_cost": r[7], "note": r[8],
+        "position": r[9],
+        "gm_names": [n for n in r[10:14] if n],
+        # 前端決定要不要顯示「第 N 序位」用的：容量 1 的時段沒有排隊，
+        # 講序位只會讓人以為後面還有第 2、第 3。放在最後一欄，
+        # 不動任何既有欄位的位置索引。
+        "waitlist_limit": r[14],
+        "day_type": r[15],
+    }
+
+
 def list_player_tab(
     cur, player_id: int, tab: str, *, start: int = 1, filters: dict | None = None
 ) -> dict:
@@ -1098,52 +1146,68 @@ def list_player_tab(
     order = ("b.session_date DESC, b.session_time DESC"
              if tab in _PLAYER_DESC_TABS else "b.session_date, b.session_time")
 
-    def item(r):
-        return {
-            "id": r[0], "mmg_name": r[1], "mmg_url": r[2],
-            "session_date": r[3].isoformat(), "session_time": r[4].strftime("%H:%M"),
-            "status": r[5], "status_label": PLAYER_TABS.get(r[5], r[5]),
-            "deposit": r[6], "booking_cost": r[7], "note": r[8],
-            "position": r[9],
-            "gm_names": [n for n in r[10:14] if n],
-            # 前端決定要不要顯示「第 N 序位」用的：容量 1 的時段沒有排隊，
-            # 講序位只會讓人以為後面還有第 2、第 3。放在最後一欄，
-            # 不動任何既有欄位的位置索引。
-            "waitlist_limit": r[14],
-            "day_type": r[15],
-        }
-
-    # booking_cost 是這一筆該收的訂金，依場次類型取——見 DUE_SQL。
     return paged(
         cur,
-        f"""
-        SELECT b.id, m.name, m.url, b.session_date, b.session_time, b.status,
-               b.deposit, {DUE_SQL}, b.note,
-               CASE WHEN b.status = 'cancelled' THEN NULL ELSE (
-                   SELECT COUNT(*) + 1 FROM booking_record x
-                    WHERE x.mmg_id = b.mmg_id
-                      AND x.session_date = b.session_date
-                      AND x.session_time = b.session_time
-                      AND x.status <> 'cancelled'
-                      AND x.created_at < b.created_at
-               ) END AS position,
-               u1.name, u2.name, u3.name, u4.name,
-               m.waitlist_limit, b.day_type
-          FROM booking_record b
-          JOIN mmg m ON m.id = b.mmg_id
-          LEFT JOIN users u1 ON u1.id = b.gm1_user_id
-          LEFT JOIN users u2 ON u2.id = b.gm2_user_id
-          LEFT JOIN users u3 ON u3.id = b.gm3_user_id
-          LEFT JOIN users u4 ON u4.id = b.gm4_user_id
-         WHERE b.player_id = %(player)s
-           AND b.status = %(tab)s
-           {where}
-         ORDER BY {order}
-         LIMIT %(limit)s OFFSET %(offset)s
-        """,
+        _PLAYER_SELECT.format(where=f"AND b.status = %(tab)s\n           {where}",
+                              order=order),
         {"player": player_id, "tab": tab, "offset": start - 1, **fp},
-        item,
+        _player_item,
     )
+
+
+def list_player_date(cur, player_id: int, session_date, *, start: int = 1) -> dict:
+    """某位玩家某一天的預約，**不分狀態，已取消的也列**。
+
+    預訂行事曆點進某一天看到的就是這一包。跟頁籤那支共用同一份 SELECT 與
+    同一個 item()：兩邊是同一張卡片，欄位只要差一個，同一場戲在兩個畫面上
+    就會講不一樣的話。
+
+    ★ 跟行事曆上的點**刻意不一致**：點不畫已取消的（見 player_month_days），
+      這裡全部列出（案主 2026-09-17 定案）。兩者回答的問題不同——點回答
+      「那天我有沒有事」，列表回答「那天這筆後來怎麼了」。
+
+    排序只看時間，不像頁籤那樣分「最早／最近」：同一天之內由早到晚，就是
+    使用者當天會經歷的順序。
+    """
+    return paged(
+        cur,
+        _PLAYER_SELECT.format(where="AND b.session_date = %(date)s",
+                              order="b.session_time, b.created_at"),
+        {"player": player_id, "date": session_date, "offset": start - 1},
+        _player_item,
+    )
+
+
+def player_month_days(cur, player_id: int, year: int, month: int) -> dict[str, list[str]]:
+    """預訂行事曆上的點：這個月每一天有哪些場次的狀態，**依開始時間排序**。
+
+    回傳 {'2026-09-05': ['gm_confirm', 'booked']}——一場一個值，不是計數。
+    畫面上的點要照開始時間由左往右畫，所以順序本身就是資料的一部分；
+    改成回傳每種狀態幾場的話，那個順序就再也還原不回來了。
+
+    ★ 不含已取消（案主 2026-09-17 定案）。要看已取消的走 list_player_date()。
+
+    ★ 用半開區間 [這個月 1 號, 下個月 1 號) 而不是算出當月最後一天：閏年與
+      大小月不必自己判斷，少一個會算錯的地方。
+    """
+    first = date(year, month, 1)
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    cur.execute(
+        """
+        SELECT session_date, status
+          FROM booking_record
+         WHERE player_id = %(player)s
+           AND status <> 'cancelled'
+           AND session_date >= %(first)s
+           AND session_date < %(next)s
+         ORDER BY session_date, session_time, created_at
+        """,
+        {"player": player_id, "first": first, "next": nxt},
+    )
+    days: dict[str, list[str]] = {}
+    for d, status in cur.fetchall():
+        days.setdefault(d.isoformat(), []).append(status)
+    return days
 
 
 def record_deposit(cur, booking_id: int, amount: int) -> dict:
