@@ -1579,6 +1579,25 @@ def gm_tab(
     )
 
 
+# 主持人視角的「這一場對我而言算哪一類」。
+#
+# ★ 跟三個頁籤（_TABS）同一套判斷，而且理由相同：分界是**這個人自己**的
+#   gm{n}_confirmed，不是整筆的 status。一齣戲兩位主持人，我確認了、對方
+#   還沒確認時，整筆仍然是 gm_confirm，但對「我」而言它已經確認過了。
+#
+# ★ 指定行事曆不能直接拿 status_label 當說明：那一份是「整筆」的說法，
+#   一場還在等**我**確認的戲，它會寫成「等待其他主持確認」。所以這裡回
+#   category，畫面照它上色與標字。
+_GM_CATEGORY_SQL = f"""
+    CASE WHEN b.status = 'cancelled' THEN 'cancelled'
+         WHEN b.status = 'ended' THEN 'ended'
+         WHEN b.status = 'gm_confirm' AND NOT COALESCE({_GM_CONFIRMED}, false)
+              THEN 'pending'
+         ELSE 'confirmed'
+    END
+"""
+
+
 # 主持人「已確認場次」頁籤的狀態篩選選項，順序即畫面上的順序（跟著流程走）。
 #
 # ★ 由後端定義而不是前端寫死，因為**能篩出什麼是上面那條 WHERE 決定的**：
@@ -1592,6 +1611,69 @@ def gm_tab(
 #
 # 「全部」那一項不放這裡——它不是一個狀態，是「不要篩」，屬於前端的操作。
 GM_FILTER_STATUSES = ("gm_confirm", "gm_reviewed", "booked")
+
+
+def list_gm_date(cur, gm_id: int, session_date, *, start: int = 1) -> dict:
+    """指定行事曆點某一天：那天指定到這位主持人的全部場次，**含已取消**。
+
+    跟頁籤那三包的差別只有「條件是日期、不是頁籤」，欄位與排序規則沿用同一
+    份查詢；多回一個 category（見 _GM_CATEGORY_SQL），畫面靠它上色與標字。
+
+    ★ 點不畫已取消、清單全部列出——三份行事曆同一條規則（案主 2026-09-17）。
+    """
+    def item(r):
+        return {
+            "id": r[0], "mmg_name": r[1], "mmg_url": r[2], "player_name": r[3],
+            "session_date": r[4].isoformat(), "session_time": r[5].strftime("%H:%M"),
+            "status": r[6], "status_label": STATUS_LABEL[r[6]], "role_name": r[7],
+            "category": r[8],
+        }
+
+    return paged(
+        cur,
+        f"""
+        SELECT b.id, m.name, m.url, u.name, b.session_date, b.session_time, b.status,
+               {_GM_ROLE_NAME} AS role_name,
+               {_GM_CATEGORY_SQL} AS category
+          FROM booking_record b
+          JOIN mmg m   ON m.id = b.mmg_id
+          JOIN users u ON u.id = b.player_id
+         WHERE %(gm)s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
+           AND b.session_date = %(date)s
+         ORDER BY b.session_time, b.created_at
+         LIMIT %(limit)s OFFSET %(offset)s
+        """,
+        {"gm": gm_id, "date": session_date, "offset": start - 1},
+        item,
+    )
+
+
+def gm_month_days(cur, gm_id: int, year: int, month: int) -> dict[str, list[str]]:
+    """指定行事曆上的點：這個月每一天指定到這位主持人的場次分類，依開始時間排序。
+
+    回傳 {'2026-09-05': ['pending', 'confirmed']}。一場一個值，不是計數——
+    點要照開始時間由左往右畫，順序本身就是資料。
+
+    ★ 不含已取消（案主 2026-09-17 定案）；要看已取消的走 list_gm_date()。
+    """
+    first = date(year, month, 1)
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    cur.execute(
+        f"""
+        SELECT b.session_date, {_GM_CATEGORY_SQL} AS category
+          FROM booking_record b
+         WHERE %(gm)s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)
+           AND b.status <> 'cancelled'
+           AND b.session_date >= %(first)s
+           AND b.session_date < %(next)s
+         ORDER BY b.session_date, b.session_time, b.created_at
+        """,
+        {"gm": gm_id, "first": first, "next": nxt},
+    )
+    days: dict[str, list[str]] = {}
+    for d, category in cur.fetchall():
+        days.setdefault(d.isoformat(), []).append(category)
+    return days
 
 
 def gm_dashboard(cur, gm_id: int) -> dict:

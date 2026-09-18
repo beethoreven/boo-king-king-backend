@@ -1342,6 +1342,50 @@ def gm_tab_route(tab: str):
         return jsonify({"error": str(exc)}), 400
 
 
+# ── 指定行事曆 ──────────────────────────────────────────────────
+#
+# 形狀跟玩家的預訂行事曆一模一樣（月份給點、日期給清單），差別只有兩個：
+# 看的是「指定到我的場次」，而且分類用主持人視角的 category——一場還在等
+# **我**確認的戲，整筆的狀態文字會寫成「等待其他主持確認」，那句話在這裡
+# 是錯的（見 db/bookings.py 的 _GM_CATEGORY_SQL）。
+
+
+@app.get("/api/gm/month/<ym>")
+@require_role(2)
+def gm_month_route(ym: str):
+    """這個月每一天指定到我的場次分類，依開始時間排序，不含已取消。"""
+    try:
+        first = date.fromisoformat(f"{ym}-01")
+    except ValueError:
+        return bad_request("月份格式錯誤，需要 YYYY-MM")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            days = bookings_db.gm_month_days(cur, g.user["id"], first.year, first.month)
+    return jsonify({"month": ym, "days": days})
+
+
+@app.get("/api/gm/date/<d>")
+@require_role(2)
+def gm_date_route(d: str):
+    """那一天指定到我的場次，含已取消。"""
+    try:
+        session_date = date.fromisoformat(d)
+    except ValueError:
+        return bad_request("日期格式錯誤，需要 YYYY-MM-DD")
+    try:
+        start = int(request.args.get("start", 1))
+    except ValueError:
+        return bad_request("start 必須是數字")
+    if start < 1:
+        return bad_request("start 必須大於 0")
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            return jsonify(bookings_db.list_gm_date(
+                cur, g.user["id"], session_date, start=start,
+            ))
+
+
 @app.get("/api/bookings/<int:booking_id>/detail")
 @require_auth
 def booking_detail_route(booking_id: int):
