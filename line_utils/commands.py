@@ -6,16 +6,21 @@
     @bot 2026/8/30行事曆                   那天的場次（回一張圖）
     @bot 2026/8行事曆                      那個月的行事曆（回一張圖）
     @bot 2026行事曆                        那一年十二個月
-    @bot 2026/8~2026/12行事曆              這幾個月，最多 MAX_MONTHS 個
+    @bot 2026/8~2026/12行事曆              這幾個月，最多 MAX_MONTHS 個（~ 或 - 都可以）
 
-這幾種以外一律回「我不知道你在說什麼」。不做模糊比對、不猜意圖——
+有「行事曆」三個字、但哪一種都對不上的，回一段列出四種寫法的說明
+（line_template 的 bad_calendar，案主 2026-09-19 給的文字）。其餘一律回
+「我不知道你在說什麼」。不做模糊比對、不猜意圖——
 這支 bot 會真的寫入店家的營運資料，猜錯的代價是一筆不存在的預約，而
 猜對省下的只是使用者少打兩個字。查詢不寫入，但規則跟著同一套：查詢一律
 要有「行事曆」三個字，光打日期不算。
 
 查當天原本是「2026/8/30場次」，案主 2026-09-19 改成跟其他查詢統一用「行事曆」。
-四種查詢靠日期寫到哪一層分開——日、月、年、範圍（有 ~），每一種的樣子都不會
-被別的吃到，不需要第二個關鍵字。
+四種查詢靠日期寫到哪一層分開——日、月、年、範圍（中間有 ~ 或 -），每一種的
+樣子都不會被別的吃到，不需要第二個關鍵字。
+
+★ 範圍的 - 跟日期裡的 - 是同一個字元（2026-08-30 也收），但分得開：範圍的 -
+  後面一定接四位數的年份，日期裡的 - 後面是一到兩位數的月或日。
 
 ## 年份必填（案主指定）
 
@@ -44,6 +49,7 @@ DAY = "day"                    # 查某一天的場次
 CALENDAR = "calendar"          # 查一個或好幾個月的行事曆
 BAD_DATE = "bad_date"          # 是查詢的樣子，但沒有這一天／這個月（2026/2/30行事曆、2026/13行事曆）
 BAD_RANGE = "bad_range"        # 行事曆的範圍倒過來，或超過 MAX_MONTHS 個月
+BAD_CALENDAR = "bad_calendar"  # 有「行事曆」三個字，但哪一種格式都對不上
 
 # 一次最多幾個月。十二個月排成 3 × 4 已經要放大才看得清楚，再多只是更小。
 MAX_MONTHS = 12
@@ -52,9 +58,13 @@ MAX_MONTHS = 12
 _NORMALISE = str.maketrans({
     "／": "/", "：": ":", "－": "-", "　": " ",
     "（": "(", "）": ")",
-    # 範圍的波浪號。手機注音輸入打出來的多半是全形的那一個。
-    "～": "~", "〜": "~",
 })
+
+# 範圍的波浪號。手機注音輸入打出來的多半是全形的那一個。
+#
+# ★ 只在查詢裡換，不放進上面那張全域的表：那張表也會套到預訂指令的劇本名稱上，
+#   名稱裡的「～」被換成「~」之後就對不到資料庫裡的那一齣，回「找不到」。
+_TILDES = str.maketrans({"～": "~", "〜": "~"})
 
 
 def strip_mentions(text: str, mentionees: list[dict]) -> str:
@@ -131,12 +141,14 @@ def _parse_booking(rest: str) -> tuple[str, dict | None]:
 
 
 # 查詢的三種樣子。年份一樣必填（見開頭）。
+CALENDAR_WORD = "行事曆"
 _DAY = re.compile(r"(\d{4}[/-]\d{1,2}[/-]\d{1,2})\s*行事曆")
 _CALENDAR = re.compile(r"(\d{4})(?:[/-](\d{1,2}))?\s*行事曆")
-_RANGE = re.compile(r"(\d{4})[/-](\d{1,2})\s*~\s*(\d{4})[/-](\d{1,2})\s*行事曆")
+_RANGE = re.compile(r"(\d{4})[/-](\d{1,2})\s*[~-]\s*(\d{4})[/-](\d{1,2})\s*行事曆")
 
 
 def _parse_query(body: str) -> tuple[str, dict | None]:
+    body = body.translate(_TILDES)
     m = _DAY.fullmatch(body)
     if m:
         d = _parse_date(m.group(1))
@@ -149,7 +161,9 @@ def _parse_query(body: str) -> tuple[str, dict | None]:
     else:
         m = _CALENDAR.fullmatch(body)
         if not m:
-            return UNKNOWN, None
+            # 有叫到「行事曆」就是想查，只是寫法不對——回四種寫法，比「我不知道你在
+            # 說什麼」有用得多。沒叫到的才是真的不認得。
+            return (BAD_CALENDAR if CALENDAR_WORD in body else UNKNOWN), None
         if m.group(2) is None:                    # 2026行事曆：整年
             first, last = _month(m.group(1), "1"), _month(m.group(1), "12")
         else:

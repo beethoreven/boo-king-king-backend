@@ -147,6 +147,8 @@ def handle_command(cur, text: str, webhook_event_id: str, *,
         return line_template.render(cur, "bad_date"), None
     if kind == commands.BAD_RANGE:
         return line_template.render(cur, "bad_range", max_months=commands.MAX_MONTHS), None
+    if kind == commands.BAD_CALENDAR:
+        return line_template.render(cur, "bad_calendar"), None
 
     # 查詢：這裡只決定畫什麼，真的畫是在 LINE 來抓圖的時候（見 images.py）。
     # 資格已經在最前面查過了——沒權限的人連圖的網址都拿不到。
