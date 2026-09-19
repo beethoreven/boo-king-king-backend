@@ -1083,6 +1083,24 @@ TAB_LABEL = {
 PLAYER_TABS = TAB_LABEL
 
 
+def unreachable_statuses(cur) -> set[str]:
+    """這家店的設定下，**推導不出來**的狀態。
+
+    single 模式的待確認主持人數恆為 0，所以 gm_confirm 推導不出來；
+    不收訂金的店不會停在 gm_reviewed。
+
+    兩個地方用它，規則只寫這一份：
+      reachable_tabs         畫面上列哪些頁籤
+      bookings_admin.update  管理員能不能把一筆場次「改成」這個狀態
+    """
+    out = set()
+    if functions.gm_mode(cur) == "single":
+        out.add("gm_confirm")
+    if not functions.deposit_required(cur):
+        out.add("gm_reviewed")
+    return out
+
+
 def reachable_tabs(cur) -> dict[str, str]:
     """這家店的設定下，哪些狀態真的到得了。
 
@@ -1100,11 +1118,7 @@ def reachable_tabs(cur) -> dict[str, str]:
       救援路徑斷掉。
     """
     out = dict(TAB_LABEL)
-    unreachable = set()
-    if functions.gm_mode(cur) == "single":
-        unreachable.add("gm_confirm")
-    if not functions.deposit_required(cur):
-        unreachable.add("gm_reviewed")
+    unreachable = unreachable_statuses(cur)
     if not unreachable:
         return out
     cur.execute(

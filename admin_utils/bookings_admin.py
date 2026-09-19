@@ -29,6 +29,7 @@ from db.bookings import (
     pending_gm_count,
     reachable_tabs,
     record_deposit,
+    unreachable_statuses,
     require_deposit_set,
 )
 
@@ -247,6 +248,25 @@ def update(cur, booking_id: int, data: dict) -> bool:
     status = data.get("status")
     if status not in VALID_STATUSES:
         raise BookingError(f"未知的狀態「{status}」")
+    # 這家店的流程推導不出來的狀態，管理員也不能把場次「改成」它。
+    #
+    # ★ 2026-09-18 在 eli 的組態下抓到：新增場次的表單預設帶 gm_confirm（她的
+    #   下拉裡根本沒有這個選項，畫面顯示的是「已成立」），而新增是「先推導、
+    #   再用表單的狀態覆蓋」——於是每一筆都被存成一個她的店走不到、也沒有人會
+    #   去確認的狀態，沒有任何錯誤。前端的預設值已經修了，這裡是讓同一類錯誤
+    #   **在後端就看得見**：不是默默寫進去，而是回一句說得出原因的話。
+    #
+    # ★ 只擋「改成」，不擋「本來就是」：設定可能是後來才改的，改之前留下的
+    #   那些場次要能照常改備註、改日期——那是 reachable_tabs 保留頁籤的同一個
+    #   理由（救援路徑不能斷）。
+    #
+    # 新增也走這裡（create 建完會套一次 update），擋下時整個交易 rollback，
+    # 那一筆不會留下來。
+    if status != current["status"] and status in unreachable_statuses(cur):
+        raise BookingError(
+            f"這家店的流程沒有「{TABS.get(status, status)}」這個狀態，"
+            f"不能把場次改成它"
+        )
 
     gm_user_ids = data.get("gm_user_ids") or [None] * 4
     gm_confirmed = data.get("gm_confirmed") or [False] * 4
