@@ -23,6 +23,7 @@ from db.bookings import (
 )
 
 from line_utils import commands
+from line_utils.images import ImageReply
 
 log = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ def mentionees_of(event: dict) -> list[dict]:
     return ((msg.get("mention") or {}).get("mentionees")) or []
 
 
-def handle_group_message(cur, event: dict) -> tuple[str, BookingResult | None]:
+def handle_group_message(cur, event: dict) -> tuple[str | ImageReply, BookingResult | None]:
     """群組裡 tag 我的那一則：先把 @mention 挖掉，剩下的交給 handle_command。"""
     msg = event["message"]
     text = commands.strip_mentions(msg.get("text") or "", mentionees_of(event))
@@ -100,8 +101,11 @@ def handle_group_message(cur, event: dict) -> tuple[str, BookingResult | None]:
 
 
 def handle_command(cur, text: str, webhook_event_id: str, *,
-                   sender: str | None) -> tuple[str, BookingResult | None]:
-    """處理一段已經清乾淨的指令文字，回傳 (要回覆的字, 訂到的那一筆)。
+                   sender: str | None) -> tuple[str | ImageReply, BookingResult | None]:
+    """處理一段已經清乾淨的指令文字，回傳 (要回覆的東西, 訂到的那一筆)。
+
+    要回覆的東西多半是一句話；查詢指令（某一天、行事曆）回的是 ImageReply，
+    由 app.py 換成圖片訊息——網址要在請求裡才組得出來，這一層不碰 HTTP。
 
     第二個值沒訂到就是 None；訂到了是 create_booking 的結果——呼叫端要靠它的
     already_existed 分辨「這次新訂的」與「LINE 重送同一個事件、先前就訂好的」，
@@ -139,6 +143,17 @@ def handle_command(cur, text: str, webhook_event_id: str, *,
         return line_template.render(cur, "unknown"), None
     if kind == commands.BAD_DATETIME:
         return line_template.render(cur, "bad_datetime"), None
+    if kind == commands.BAD_DATE:
+        return line_template.render(cur, "bad_date"), None
+    if kind == commands.BAD_RANGE:
+        return line_template.render(cur, "bad_range", max_months=commands.MAX_MONTHS), None
+
+    # 查詢：這裡只決定畫什麼，真的畫是在 LINE 來抓圖的時候（見 images.py）。
+    # 資格已經在最前面查過了——沒權限的人連圖的網址都拿不到。
+    if kind == commands.DAY:
+        return ImageReply.day(payload["date"]), None
+    if kind == commands.CALENDAR:
+        return ImageReply.months(payload["months"]), None
 
     name = payload["name"]
     cur.execute(

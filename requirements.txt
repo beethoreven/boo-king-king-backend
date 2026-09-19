@@ -9,3 +9,8 @@ google-auth==2.32.0
 cachecontrol==0.14.3
 requests==2.32.5
 gunicorn==23.0.0
+# LINE 的查詢指令回一張圖（行事曆、某一天的場次），用它畫。見 line_utils/draw.py。
+# 11.3.0 是 11 系列的最後一版，Python 3.9（本機）到 3.14 都有現成的安裝包；
+# 12.0 起不支援 3.9。沒有現成安裝包時 pip 會改成從原始碼編譯，那要系統裝有
+# libjpeg、zlib 的開發檔——不要把部署押在那上面。
+Pillow==11.3.0

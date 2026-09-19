@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 # import 當下就會讀 DATABASE_URL，晚一步就是 KeyError。
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-from flask import Flask, g, jsonify, request  # noqa: E402
+from flask import Flask, g, jsonify, request, url_for  # noqa: E402
 from flask_cors import CORS  # noqa: E402
 
 from auth_utils import guard, profile, sessions, whitelist  # noqa: E402
@@ -37,6 +37,7 @@ from db.connection import pool  # noqa: E402
 from db.schema import ensure_schema  # noqa: E402
 from line_utils import client as line_client  # noqa: E402
 from line_utils import handler as line_handler  # noqa: E402
+from line_utils import images as line_images  # noqa: E402
 from line_utils import signature as line_signature  # noqa: E402
 import notifications  # noqa: E402
 import notify_events  # noqa: E402
@@ -233,7 +234,7 @@ else:
 # 同一個理由：LINE 沒設定時整包停用，而「停用」在外面看起來跟「正常」
 # 一模一樣——群組裡 tag bot 沒反應，沒有人會知道是憑證沒設。
 if line_client.enabled():
-    print("[info] LINE bot 已啟用（群組訂場 + 推播）", flush=True)
+    print("[info] LINE bot 已啟用（訂場、查詢 + 推播）", flush=True)
 else:
     print(
         "[warn] LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN 未設定，"
@@ -450,13 +451,13 @@ def _handle_line_event(event: dict) -> None:
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 # 權限在 handle_command 裡判斷，群組那條也是同一段。
-                reply_text, result = line_handler.handle_command(
+                reply, result = line_handler.handle_command(
                     cur, text, event["webhookEventId"], sender=sender
                 )
                 outbox = _after_line_booking(cur, result, sender)
             conn.commit()
         if reply_token:
-            line_client.reply(reply_token, reply_text)
+            line_client.reply(reply_token, _line_messages(reply))
         notify_events.send(outbox)
         return
 
@@ -468,15 +469,72 @@ def _handle_line_event(event: dict) -> None:
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            text, result = line_handler.handle_group_message(cur, event)
+            reply, result = line_handler.handle_group_message(cur, event)
             outbox = _after_line_booking(cur, result, source.get("userId"))
         conn.commit()
 
     if reply_token:
-        line_client.reply(reply_token, text)
+        line_client.reply(reply_token, _line_messages(reply))
     # ★ commit 之後才推播、才寄信，跟網站那幾條路同一條規則：交易回捲時
     #   不該有人已經收到「訂好了」。
     notify_events.send(outbox)
+
+
+def _line_messages(reply):
+    """handler 回的東西 → line_client.reply 收的東西。
+
+    多半是一句話，原樣交出去。查詢指令（某一天、行事曆）回的是 ImageReply：
+    這裡組出這個後端自己的圖片網址，LINE 再照網址來抓（見 line_image）。
+    webhook 這一趟只簽一個網址，不畫圖——畫圖是 LINE 來抓的那一趟的事，
+    不佔這裡 5 秒的預算。
+
+    ★ https 寫死：LINE 只收 https。TLS 在 Render 前端就解掉了，這個 process
+      看到的 request.scheme 可能是 http——照它組的話網址會是 http://，LINE 不收。
+    ★ 預覽圖與原圖用同一個網址：預覽上限 1MB，這裡的圖最大的（十二個月）
+      也才幾十 KB，不必另外畫一張小的。
+    """
+    if not isinstance(reply, line_images.ImageReply):
+        return reply
+    url = url_for(
+        "line_image",
+        token=line_images.sign(reply.spec, line_client.channel_secret()),
+        _external=True,
+        _scheme="https",
+    )
+    return [{"type": "image", "originalContentUrl": url, "previewImageUrl": url}]
+
+
+@app.get("/line/img/<token>.png")
+def line_image(token: str):
+    """LINE 照 _line_messages 發出去的網址來抓圖。
+
+    ## 沒有登入，簽名就是把關
+
+    來抓的是 LINE 的伺服器（或使用者的手機），不會帶任何登入資訊。能證明
+    「這張圖是發給店家人員的」只有網址上的簽名：發網址之前已經確認過發問的
+    人是店家人員，簽名確保網址上的日期沒被改過。驗不過一律 404。
+
+    ## 每次都照當下的資料現畫
+
+    理由與那一行 [line-img] log 見 line_utils/images.py 的開頭。
+    """
+    if not line_client.enabled():
+        return jsonify({"error": "LINE 未設定"}), 503
+    checked = line_images.verify(token, line_client.channel_secret())
+    if checked is None:
+        return jsonify({"error": "網址無效"}), 404
+    spec, issued = checked
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            png = line_images.render(
+                cur, spec, issued=issued, user_agent=request.headers.get("User-Agent", "")
+            )
+    resp = app.response_class(png, mimetype="image/png")
+    # 網址含發出時間，每一次查詢都是新的網址，所以快取住也不會把別次的圖給
+    # 錯人；被快取住的就是第一次抓到的那張，跟圖上的「截至幾點」一致。
+    # 快取留得愈久，LINE 愈不需要回來抓——也就愈少碰到這裡正在休眠的時候。
+    resp.headers["Cache-Control"] = "public, max-age=31536000"
+    return resp
 
 
 def _after_line_booking(cur, result, sender: str | None) -> list:

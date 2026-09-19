@@ -57,8 +57,11 @@ def _headers() -> dict:
     }
 
 
-def reply(reply_token: str, text: str) -> bool:
+def reply(reply_token: str, message: str | list[dict]) -> bool:
     """同步回覆。replyToken 只能用一次、而且有時效，所以不進佇列。
+
+    message 是一句話，或已經組好的 LINE 訊息物件清單（圖片訊息要用後者，
+    見 app.py 的 _line_messages）。
 
     回傳有沒有成功。**失敗只記 log 不拋**——webhook 已經處理完了（場次
     可能已經寫進去），這時候拋例外只會讓 LINE 收到 500 然後重送，而重送
@@ -66,10 +69,11 @@ def reply(reply_token: str, text: str) -> bool:
     """
     if not enabled():
         return False
+    messages = [{"type": "text", "text": message}] if isinstance(message, str) else message
     try:
         r = requests.post(
             _REPLY_URL,
-            json={"replyToken": reply_token, "messages": [{"type": "text", "text": text}]},
+            json={"replyToken": reply_token, "messages": messages},
             headers=_headers(),
             timeout=_TIMEOUT,
         )
