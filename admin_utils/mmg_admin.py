@@ -62,6 +62,22 @@ def _money(data: dict, key: str) -> int | None:
     return value
 
 
+def _capacity(data: dict, default: int | None = None) -> int:
+    """序位上限（waitlist_limit）：這個時段最多幾組，含已成立的那一組。
+
+    ★ 0 不合法。0 的意思是「任何時段都已額滿」——玩家看到的是每一個時間都
+      「本時段已額滿」，跟時間完全無關，而管理員那邊看不出任何異狀，只會以為
+      是別的 bug（2026-10-24 正式版實際發生：一人店把它填成 0，大概是以為
+      這一格是「候補幾組」）。要讓一齣戲不能訂，用狀態下架，不是把容量設 0。
+    ★ 資料庫的 CHECK 仍是 >= 0，沒有一起收緊：既有資料庫裡可能已經有 0，
+      收緊的話 ensure_schema 在啟動時就會失敗，整個服務起不來。
+    """
+    value = data.get("waitlist_limit", default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise BookingError("序位上限至少要 1（1＝一個時段只收一組，不排候補）")
+    return value
+
+
 # preparing＝尚未上架。玩家的清單只列上架中的，preparing 與 inactive
 # 都看不到（見 db/listing.py）。上架時刻到了會自動轉成 active，
 # 下架時刻到了會自動轉成 inactive。
@@ -309,7 +325,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
                                  if "booking_cost_holiday" in data
                                  else current["booking_cost_holiday"]),
         "players": data.get("players"),
-        "waitlist_limit": data.get("waitlist_limit"),
+        "waitlist_limit": _capacity(data),
         "status": data["status"],
         "room_id": _room_id(cur, data),
         # ★ 上架日期不可為空，見下方 _require_start 的說明。
@@ -422,7 +438,7 @@ def create(cur, data: dict) -> int:
             data.get("ready_time_cost", 0.5), data.get("reset_time_cost", 0.5),
             price, price_holiday, cost, cost_holiday,
             data.get("players"),
-            data.get("waitlist_limit", 3), data.get("status", "active"),
+            _capacity(data, default=3), data.get("status", "active"),
             _room_id(cur, data),
             start, end,
             names[0], user_ids[0],
