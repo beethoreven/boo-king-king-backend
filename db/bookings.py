@@ -44,6 +44,7 @@ class BookingResult:
     id: int
     position: int          # 這一組在該時段的序位，1 是最先預訂的
     already_existed: bool  # True 代表這個 request_id 先前就成功過
+    capacity: int          # 這個時段的容量（劇本的 waitlist_limit）。前端據此決定要不要講序位
 
     @property
     def is_first(self) -> bool:
@@ -916,7 +917,8 @@ def create_booking(
     #   呼叫路徑自動被涵蓋。代價是清空到 commit 之間有一個很短的窗口，
     #   由 slot_cache 的 TTL 收尾。
     slot_cache.clear()
-    return BookingResult(id=booking_id, position=position, already_existed=already_existed)
+    return BookingResult(id=booking_id, position=position, already_existed=already_existed,
+                         capacity=capacity)
 
 
 def get_position(cur, booking_id: int) -> int:

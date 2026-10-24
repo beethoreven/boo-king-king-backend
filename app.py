@@ -1212,6 +1212,9 @@ def create_booking_route():
         "position": result.position,
         "is_first": result.is_first,
         "label": result.label,
+        # 前端用 status 與這個值決定要不要講「第 N 序位」（見 web 的 ui.js
+        # positionLabel）。欄位名跟「我的預約」那支一致，兩邊共用同一條規則。
+        "waitlist_limit": result.capacity,
         # 重試時是 200 而不是 201——這一次沒有真的建立東西。
         "already_existed": result.already_existed,
     }), (200 if result.already_existed else 201)
