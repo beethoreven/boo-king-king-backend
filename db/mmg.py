@@ -18,7 +18,7 @@ def _row_to_dict(cur, row) -> dict:
     """
     single = functions.gm_mode(cur) == "single"
     (mid, name, url, period, price, cost, players, wl, status,
-     n1, u1, n2, u2, n3, u3, n4, u4, price_holiday, cost_holiday) = row
+     n1, u1, n2, u2, n3, u3, n4, u4, price_holiday, cost_holiday, extra_note) = row
 
     slots = []
     for idx, (gname, guids) in enumerate(((n1, u1), (n2, u2), (n3, u3), (n4, u4)), start=1):
@@ -50,6 +50,8 @@ def _row_to_dict(cur, row) -> dict:
         "booking_cost": cost,
         "booking_cost_holiday": cost_holiday,
         "players": players,
+        # 額外註記，沒有就是 None。前端放進那一排小標籤，None 就不顯示。
+        "extra_note": extra_note,
         "waitlist_limit": wl,
         "status": status,
         "gm_slots": slots,
@@ -59,7 +61,7 @@ def _row_to_dict(cur, row) -> dict:
 _COLUMNS = (
     "id, name, url, period, price, booking_cost, players, waitlist_limit, status, "
     "gm1_name, gm1_user, gm2_name, gm2_user, gm3_name, gm3_user, gm4_name, gm4_user, "
-    "price_holiday, booking_cost_holiday"
+    "price_holiday, booking_cost_holiday, extra_note"
 )
 
 

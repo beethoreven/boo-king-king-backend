@@ -34,7 +34,7 @@ def _now_taipei() -> str:
 EDITABLE = (
     "name", "url", "period", "ready_time_cost", "reset_time_cost",
     "price", "price_holiday", "booking_cost", "booking_cost_holiday", "players",
-    "waitlist_limit", "status", "room_id",
+    "extra_note", "waitlist_limit", "status", "room_id",
     # 上下架日期。排期判斷的第 0 層，絕對外框——見 db/schedule.py。
     "start_booking", "end_booking",
 )
@@ -78,6 +78,24 @@ def _capacity(data: dict, default: int | None = None) -> int:
     return value
 
 
+# 額外註記的長度上限。它跟時長、人數擠在同一排小標籤裡，手機上一個標籤
+# 太長會自己佔滿一整行，看起來像版面壞掉——要寫長的說明請放劇本簡介。
+EXTRA_NOTE_MAX = 30
+
+
+def _extra_note(data: dict) -> str | None:
+    """額外註記：空白一律存成 NULL，讓「沒有註記」只有一種表示法（同 url）。"""
+    value = data.get("extra_note")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise BookingError("額外註記必須是文字")
+    value = value.strip()
+    if len(value) > EXTRA_NOTE_MAX:
+        raise BookingError(f"額外註記最多 {EXTRA_NOTE_MAX} 個字（目前 {len(value)} 個）")
+    return value or None
+
+
 # preparing＝尚未上架。玩家的清單只列上架中的，preparing 與 inactive
 # 都看不到（見 db/listing.py）。上架時刻到了會自動轉成 active，
 # 下架時刻到了會自動轉成 inactive。
@@ -88,7 +106,7 @@ def _row_to_dict(row) -> dict:
     (mid, name, url, period, ready, reset, price, cost, players, wl, status, room_id,
      start_booking, end_booking,
      n1, u1, n2, u2, n3, u3, n4, u4,
-     price_holiday, cost_holiday) = row
+     price_holiday, cost_holiday, extra_note) = row
     return {
         "id": mid,
         "name": name,
@@ -107,6 +125,7 @@ def _row_to_dict(row) -> dict:
         "booking_cost": cost,
         "booking_cost_holiday": cost_holiday,
         "players": players,
+        "extra_note": extra_note,
         "waitlist_limit": wl,
         "status": status,
         # 場次衝突比對的是包廂被佔用，不是同一齣戲被排兩場——見
@@ -136,8 +155,8 @@ _COLUMNS = (
     "price, booking_cost, players, waitlist_limit, status, room_id, "
     "start_booking, end_booking, "
     "gm1_name, gm1_user, gm2_name, gm2_user, gm3_name, gm3_user, gm4_name, gm4_user, "
-    # 假日的兩個接在最後，不動既有欄位的位置。
-    "price_holiday, booking_cost_holiday"
+    # 假日的兩個與額外註記接在最後，不動既有欄位的位置。
+    "price_holiday, booking_cost_holiday, extra_note"
 )
 
 
@@ -325,6 +344,9 @@ def update(cur, mmg_id: int, data: dict) -> bool:
                                  if "booking_cost_holiday" in data
                                  else current["booking_cost_holiday"]),
         "players": data.get("players"),
+        # ★ 沒送就保留現值，理由同上面的假日價：還沒更新的舊前端不知道有這一欄，
+        #   照 data.get() 寫的話它每存一次檔就把註記清掉。
+        "extra_note": _extra_note(data) if "extra_note" in data else current["extra_note"],
         "waitlist_limit": _capacity(data),
         "status": data["status"],
         "room_id": _room_id(cur, data),
@@ -370,7 +392,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
         UPDATE mmg SET
             name = %s, url = %s, period = %s, ready_time_cost = %s, reset_time_cost = %s,
             price = %s, price_holiday = %s, booking_cost = %s, booking_cost_holiday = %s,
-            players = %s, waitlist_limit = %s, status = %s, room_id = %s,
+            players = %s, extra_note = %s, waitlist_limit = %s, status = %s, room_id = %s,
             start_booking = %s, end_booking = %s,
             gm1_name = %s, gm1_user = %s,
             gm2_name = %s, gm2_user = %s,
@@ -382,7 +404,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
             new["name"], new["url"], new["period"],
             new["ready_time_cost"], new["reset_time_cost"],
             new["price"], new["price_holiday"], new["booking_cost"], new["booking_cost_holiday"],
-            new["players"], new["waitlist_limit"], new["status"], new["room_id"],
+            new["players"], new["extra_note"], new["waitlist_limit"], new["status"], new["room_id"],
             new["start_booking"], new["end_booking"],
             names[0], user_ids[0],
             names[1], user_ids[1],
@@ -424,12 +446,12 @@ def create(cur, data: dict) -> int:
         INSERT INTO mmg
             (name, url, period, ready_time_cost, reset_time_cost,
              price, price_holiday, booking_cost, booking_cost_holiday,
-             players, waitlist_limit, status, room_id,
+             players, extra_note, waitlist_limit, status, room_id,
              start_booking, end_booking,
              gm1_name, gm1_user, gm2_name, gm2_user,
              gm3_name, gm3_user, gm4_name, gm4_user)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
@@ -437,7 +459,7 @@ def create(cur, data: dict) -> int:
             data.get("period"),
             data.get("ready_time_cost", 0.5), data.get("reset_time_cost", 0.5),
             price, price_holiday, cost, cost_holiday,
-            data.get("players"),
+            data.get("players"), _extra_note(data),
             _capacity(data, default=3), data.get("status", "active"),
             _room_id(cur, data),
             start, end,

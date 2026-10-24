@@ -724,6 +724,11 @@ def _ensure_mmg(cur) -> None:
             -- 不要改成數字型別——它不參與任何計算或比對。
             players TEXT,
 
+            -- 額外註記。跟時長、人數、售價排在同一排小標籤裡顯示，給店家
+            -- 寫一句這齣戲要先知道的事（例如「需自備服裝」）。純顯示用，
+            -- 空的存成 NULL，前端就不顯示那一個標籤。
+            extra_note TEXT,
+
             -- 每個場次時段總共可以排幾組。設 3 就是最多 3 組，第 4 組
             -- 會被擋下——不是「第 1 序位之外還能排 3 組」。
             --
@@ -825,6 +830,9 @@ def _ensure_mmg(cur) -> None:
             )
     if "url" not in existing:
         cur.execute("ALTER TABLE mmg ADD COLUMN url TEXT")
+    # 額外註記（2026-10-24）。既有劇本一律空著，畫面完全不變。
+    if "extra_note" not in existing:
+        cur.execute("ALTER TABLE mmg ADD COLUMN extra_note TEXT")
     for col in ("start_booking", "end_booking"):
         if col not in existing:
             cur.execute(f"ALTER TABLE mmg ADD COLUMN {col} DATE")
