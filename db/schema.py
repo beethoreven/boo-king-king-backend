@@ -363,7 +363,7 @@ def _ensure_settings(cur) -> None:
         """
         INSERT INTO settings (key, value) VALUES
             ('site_name',    '步經徑'),
-            ('site_url',     'https://tutor-arthur.boo-king-king.workers.dev'),
+            ('site_url',     'https://tutor-arthur-demo.boo-king-king.workers.dev'),
             ('sender_name',  '步經徑'),
             ('sender_email', 'beethoreven@gmail.com')
         ON CONFLICT (key) DO NOTHING
