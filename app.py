@@ -632,7 +632,16 @@ def idle_gap_stats():
 @app.get("/api/ready")
 def ready():
     """連資料庫一起檢查。部署後確認整條路徑通了用的，不要拿來當保活目標
-    （那會讓每次保活都把 Neon 喚醒，把免費的 CU-hours 額度燒掉）。"""
+    （那會讓每次保活都把 Neon 喚醒，把免費的 CU-hours 額度燒掉）。
+
+    ★ 要帶這家店的 X-Job-Token（2026-10-25，known-issue-check 第 33 條）。原本
+      誰都能打，而它每次都會連資料庫——任何人每 5 分鐘打一次，那家店的 Neon
+      就永遠不睡、月額度用完整家店停擺。改成跟 /internal/idle-gap-stats 同一組
+      通行證：它本來就是給維運的人看的，不是給使用者的。
+    """
+    error = _job_token_error()
+    if error:
+        return error
     # ★ 只回報「有沒有設定」，不回報值。設定錯誤最難查的地方在於它跟
     #   「憑證真的無效」回同一句 401——部署後光看錯誤訊息分不出是哪一種。
     #   這裡把「設定面」攤開，但不洩漏任何秘密。都是**這家店**的設定。
@@ -771,7 +780,8 @@ def logout():
     """登出。沒帶 token 或 token 不存在都視為成功——呼叫端要的結果
     （這張憑證不再有效）本來就已經成立。"""
     token = extract_bearer_token(request)
-    if token:
+    # 偽造的 token 不開連線（見 sessions.is_authentic）；對呼叫端而言結果一樣。
+    if sessions.is_authentic(token):
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 sessions.delete_session(cur, token)
@@ -792,6 +802,9 @@ def auth_status():
     token = extract_bearer_token(request)
     if not token:
         return jsonify({"error": "未提供登入憑證"}), 401
+    # 偽造的 token 不開連線（見 sessions.is_authentic）。
+    if not sessions.is_authentic(token):
+        return jsonify({"error": "登入憑證無效或已過期"}), 401
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -853,6 +866,9 @@ def register():
     token = extract_bearer_token(request)
     if not token:
         return jsonify({"error": "未提供登入憑證"}), 401
+    # 偽造的 token 不開連線（見 sessions.is_authentic）。
+    if not sessions.is_authentic(token):
+        return jsonify({"error": "登入憑證無效或已過期"}), 401
 
     body = request.get_json(silent=True) or {}
     with pool.connection() as conn:

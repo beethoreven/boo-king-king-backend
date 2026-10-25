@@ -152,18 +152,12 @@ def _configure(conn) -> None:
 
 
 class _Connections:
-    """跟原本連線池同介面的替代品，所以呼叫端一行都不用改。
+    """跟原本連線池同介面的替代品（pool.connection()），所以呼叫端一行都不用改。
 
-    保留 open() / close() / get_stats() 是為了讓既有的呼叫點（app.py 啟動
-    時、各支遷移腳本）不必動。open() 與 close() 現在沒有事情要做——沒有
-    需要預先建立、也沒有需要關閉的長駐資源，那正是這個做法的重點。
+    沒有 open() / close()：沒有需要預先建立、也沒有需要關閉的長駐資源，那正是
+    這個做法的重點。（2026-10-25 之前留著兩個空的 open/close 給舊呼叫點相容，
+    改多店家時一併拿掉了。）
     """
-
-    def open(self) -> None:
-        """相容既有呼叫。沒有長駐資源要準備。"""
-
-    def close(self) -> None:
-        """相容既有呼叫。沒有長駐資源要收。"""
 
     def get_stats(self) -> dict:
         """給 /api/ready 的診斷用。"""

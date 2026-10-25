@@ -36,6 +36,10 @@ def _authenticate() -> tuple[dict | None, tuple | None]:
     token = extract_bearer_token(request)
     if not token:
         return None, (jsonify({"error": "未提供登入憑證"}), 401)
+    # ★ 偽造的 token（包括別家店的）在這裡就擋掉，不開連線——開連線本身就會
+    #   把這家店的資料庫叫醒（見 auth_utils/sessions.py 的「token 的形狀與簽章」）。
+    if not sessions_mod.is_authentic(token):
+        return None, (jsonify({"error": "登入憑證無效或已過期"}), 401)
 
     # ★ 兩層快取都命中就完全不開連線。
     #

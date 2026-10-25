@@ -78,8 +78,9 @@ def test_single_store_service_still_boots(pg_cluster):
     code = (
         "import app\n"
         "c = app.app.test_client()\n"
-        "print(c.get('/api/health').status_code, c.get('/v/solo/api/ready').status_code,"
-        " c.get('/v/other/api/ready').status_code,"
+        "t = {'X-Job-Token': 'solo-token'}\n"
+        "print(c.get('/api/health').status_code, c.get('/v/solo/api/ready', headers=t).status_code,"
+        " c.get('/v/other/api/ready', headers=t).status_code,"
         " c.post('/v/solo/api/jobs/weekly', headers={'X-Job-Token': 'solo-token'}).status_code)\n"
     )
     r = subprocess.run([sys.executable, "-c", code], cwd=BACKEND, env=env,

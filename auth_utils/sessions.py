@@ -30,6 +30,8 @@ token 存在各店自己的資料庫裡，A 店的 token 在 B 店的資料庫�
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import re
 import secrets
@@ -88,13 +90,59 @@ _tokens = tenancy.PerTenant(_TokenState)
 _RESOLVE_TTL_SECONDS = float(os.environ.get("SESSION_CACHE_TTL_SECONDS", "3"))
 
 
+# ── token 的形狀與簽章 ───────────────────────────────────────
+#
+# token = 40 個十六進位亂數 + 24 個十六進位的 HMAC 標籤，共 64 個小寫十六進位
+# 字元（跟原本 secrets.token_hex(32) 一樣長，sessions 表不用改）。
+#
+# ★ 為什麼要簽章（2026-10-25，known-issue-check 第 33 條）：查驗 token 一定要
+#   連資料庫，而**連線本身**就會把那家店的 Neon 叫醒、至少醒 5 分鐘。原本只檢查
+#   形狀，任何人送 64 個十六進位字元就能讓伺服器開一條連線——每 5 分鐘一發，
+#   那家店的資料庫就永遠不睡，月額度（100 CU-hours）會在月底前用完、整家店停擺。
+#   而且原本的形狀檢查放在連線**之後**，連亂寫的字串都會開連線。
+#   有了標籤，偽造的 token 在記憶體裡就被擋下（is_authentic），連線根本不開。
+#
+# ★ 標籤只是一道門，不是憑證本身：token 有沒有效仍然以資料庫為準（登出、
+#   過期、停權都照舊）。所以金鑰外流的代價只是「能讓伺服器多查一次」。
+#
+# ★ 金鑰從**這家店**的 DATABASE_URL 導出（裡面有資料庫密碼，本來就是這家店
+#   的秘密），不用多設一個環境變數。附帶效果：A 店的 token 在 B 店連簽章都
+#   對不上，跨店的 token 也不會開連線。換資料庫密碼會讓所有人重新登入一次。
+#
+# ★ 2026-10-25 之前發的 token 沒有標籤，換上這一版之後全部失效，每個人要重新
+#   登入一次（當時沒有店家正式在用）。
+_RANDOM_HEX = 40
+_TAG_HEX = 24
+_TOKEN_SHAPE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _tag(random_part: str) -> str:
+    key = hmac.new(
+        tenancy.current().database_url.encode(), b"boo-king-king/session-token/v1", hashlib.sha256
+    ).digest()
+    return hmac.new(key, random_part.encode(), hashlib.sha256).hexdigest()[:_TAG_HEX]
+
+
+def is_authentic(token: str | None) -> bool:
+    """這張 token 是不是**這家店**簽發的。純記憶體運算，不碰資料庫。
+
+    ★ 每一條會為了查 token 而開連線的路（require_auth、/auth/status、
+      /auth/register、/auth/logout）都要在開連線**之前**先問這一支。
+    """
+    if not token or not _TOKEN_SHAPE.match(token):
+        return False
+    random_part, tag = token[:_RANDOM_HEX], token[_RANDOM_HEX:]
+    return hmac.compare_digest(tag, _tag(random_part))
+
+
 def create_session(cur, email: str) -> str:
     """簽發一張新的 session token。
 
     呼叫端（/auth/login）負責先驗證 Google ID Token 並確認授權，
     這裡不重複做那兩件事。
     """
-    token = secrets.token_hex(32)
+    random_part = secrets.token_hex(_RANDOM_HEX // 2)
+    token = random_part + _tag(random_part)
     cur.execute(
         "INSERT INTO sessions (token, email) VALUES (%s, %s)",
         (token, email.lower().strip()),
@@ -117,22 +165,6 @@ def resolve_cached(token: str | None) -> str | None:
         return hit[1] if hit is not None and hit[0] > now else None
 
 
-# create_session() 發出來的 token 一律是 secrets.token_hex(32)，也就是**恰好
-# 64 個小寫十六進位字元**。不是這個形狀的東西不可能存在於 sessions 表裡，
-# 所以可以在碰資料庫之前就拒絕。
-#
-# ★ 這是嚴格正確的，不是啟發式的猜測：全站只有 create_session 一個地方發
-#   token，而且這個格式從來沒換過（git log -S token_hex 只有一筆）。上線後
-#   實際查過正式庫：98 筆 session，98 筆都符合，長度全部是 64。
-#
-# ★ 為什麼值得做：/auth/status 是未登入也打得到的，而每一次假 token 都是一次
-#   完整的資料庫查詢。加上這一行之後，亂寫的字串連連線都不會開。
-#
-#   （注意 resolve_session 刻意不快取失敗的結果——理由見下面的 docstring。
-#     那個決定是對的，但它也代表每一發假 token 都真的會查一次資料庫。）
-_TOKEN_SHAPE = re.compile(r"^[0-9a-f]{64}$")
-
-
 def resolve_session(cur, token: str | None) -> str | None:
     """token 有效就回傳對應的 email，並視情況更新 last_seen_at；
     無效（不存在或閒置過久）回傳 None，過期的話順便把那筆刪掉。
@@ -141,10 +173,9 @@ def resolve_session(cur, token: str | None) -> str | None:
     ——無效 token 通常代表有人在亂試，快取那個結果只是幫他省事，而且會讓
     「剛登入的新 token」在窗口內被誤判成無效。
     """
-    if not token:
-        return None
-    # 形狀不對的不用查資料庫（見上方 _TOKEN_SHAPE）。
-    if not _TOKEN_SHAPE.match(token):
+    # 呼叫端應該已經在開連線前問過 is_authentic；這裡再擋一次，萬一有新的
+    # 呼叫點忘了，至少不會拿偽造的 token 去查資料庫。
+    if not is_authentic(token):
         return None
 
     # 有效性判斷交給資料庫做（欄位是 TIMESTAMPTZ），不要撈回 Python 再比對——
@@ -195,7 +226,7 @@ def _forget(token: str) -> None:
 def delete_session(cur, token: str | None) -> None:
     """登出。找不到 token 也視為成功——呼叫端要的結果（這張憑證不再有效）
     本來就已經成立，回報失敗只會讓前端多寫一段沒意義的錯誤處理。"""
-    if not token:
+    if not is_authentic(token):
         return
     cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
     _forget(token)

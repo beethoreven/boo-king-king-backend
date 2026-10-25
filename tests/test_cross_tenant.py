@@ -15,48 +15,58 @@ import pytest
 
 from tests.conftest import STORES
 
-# session token 一律是 64 個小寫十六進位字元（見 auth_utils/sessions._TOKEN_SHAPE）。
-TOKEN_A_ADMIN = "a1" * 32        # A 店：admin@shop.test，管理員
-TOKEN_A_PLAYER = "a2" * 32       # A 店：player@shop.test，一般玩家
-TOKEN_B_SAME_EMAIL = "b1" * 32   # B 店：admin@shop.test，在 B 店只是一般玩家
-TOKEN_B_OWNER = "b2" * 32        # B 店：owner@shop.test，管理員
+# 每家店的 session token 由 seeded 在那家店裡用 sessions.create_session 發
+# （token 帶著那家店的簽章，見 auth_utils/sessions.py），測試用 tokens 取。
+#   a_admin       A 店：admin@shop.test，管理員
+#   a_player      A 店：player@shop.test，一般玩家
+#   b_same_email  B 店：admin@shop.test，在 B 店只是一般玩家
+#   b_owner       B 店：owner@shop.test，管理員
 
 
-def _seed(url: str, *, users, sessions, mmg_name, site_name, gm_mode):
-    with psycopg.connect(url) as conn, conn.cursor() as cur:
+def _seed(store: str, url: str, *, users, sessions, mmg_name, site_name, gm_mode) -> dict:
+    import tenancy
+    from auth_utils import sessions as sessions_mod
+
+    tokens = {}
+    with tenancy.use(store), psycopg.connect(url) as conn, conn.cursor() as cur:
         for email, name, role in users:
             cur.execute(
                 "INSERT INTO users (email, name, role) VALUES (%s, %s, %s) "
                 "ON CONFLICT (email) DO NOTHING",
                 (email, name, role),
             )
-        for token, email in sessions:
-            cur.execute(
-                "INSERT INTO sessions (token, email) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                (token, email),
-            )
+        for label, email in sessions:
+            tokens[label] = sessions_mod.create_session(cur, email)
         cur.execute("SELECT count(*) FROM mmg")
         if cur.fetchone()[0] == 0:
             cur.execute("INSERT INTO mmg (name) VALUES (%s)", (mmg_name,))
         cur.execute("UPDATE settings SET value = %s WHERE key = 'site_name'", (site_name,))
         cur.execute("UPDATE functions SET value = %s WHERE key = 'gm_mode'", (gm_mode,))
         conn.commit()
+    return tokens
 
 
-@pytest.fixture(scope="module", autouse=True)
-def seeded(app_module, pg_cluster):
-    _seed(
-        pg_cluster["shop_a"],
-        users=[("admin@shop.test", "A管理員", 1), ("player@shop.test", "A玩家", 3)],
-        sessions=[(TOKEN_A_ADMIN, "admin@shop.test"), (TOKEN_A_PLAYER, "player@shop.test")],
-        mmg_name="A店的劇本", site_name="A店", gm_mode="single",
-    )
-    _seed(
-        pg_cluster["shop_b"],
-        users=[("owner@shop.test", "B管理員", 1), ("admin@shop.test", "在B只是玩家", 3)],
-        sessions=[(TOKEN_B_SAME_EMAIL, "admin@shop.test"), (TOKEN_B_OWNER, "owner@shop.test")],
-        mmg_name="B店的劇本", site_name="B店", gm_mode="assign",
-    )
+@pytest.fixture(scope="module")
+def tokens(app_module, pg_cluster):
+    return {
+        **_seed(
+            "shop-a", pg_cluster["shop_a"],
+            users=[("admin@shop.test", "A管理員", 1), ("player@shop.test", "A玩家", 3)],
+            sessions=[("a_admin", "admin@shop.test"), ("a_player", "player@shop.test")],
+            mmg_name="A店的劇本", site_name="A店", gm_mode="single",
+        ),
+        **_seed(
+            "shop-b", pg_cluster["shop_b"],
+            users=[("owner@shop.test", "B管理員", 1), ("admin@shop.test", "在B只是玩家", 3)],
+            sessions=[("b_same_email", "admin@shop.test"), ("b_owner", "owner@shop.test")],
+            mmg_name="B店的劇本", site_name="B店", gm_mode="assign",
+        ),
+    }
+
+
+@pytest.fixture(autouse=True)
+def _seeded(tokens):
+    """每個測試都要兩家店的資料先就位。"""
 
 
 def _auth(token: str) -> dict:
@@ -66,28 +76,28 @@ def _auth(token: str) -> dict:
 # ── 登入憑證與權限 ─────────────────────────────────────────────
 
 
-def test_token_from_one_store_is_rejected_by_the_other(client):
+def test_token_from_one_store_is_rejected_by_the_other(client, tokens):
     # B 店先有人用 admin@shop.test 登入過，B 店的權限快取裡就有這個 email。
-    assert client.get("/v/shop-b/api/me", headers=_auth(TOKEN_B_SAME_EMAIL)).status_code == 200
+    assert client.get("/v/shop-b/api/me", headers=_auth(tokens["b_same_email"])).status_code == 200
     # A 店用同一個 email 的 token，讓 token → email 的快取熱起來。
-    assert client.get("/v/shop-a/api/me", headers=_auth(TOKEN_A_ADMIN)).status_code == 200
+    assert client.get("/v/shop-a/api/me", headers=_auth(tokens["a_admin"])).status_code == 200
     # 馬上拿去 B 店：B 店的資料庫裡沒有這張 token。token 快取全行程共用的話，
     # 這裡會直接命中、再接上 B 店權限快取裡的那個人——完全不查 B 店的資料庫。
-    r = client.get("/v/shop-b/api/me", headers=_auth(TOKEN_A_ADMIN))
+    r = client.get("/v/shop-b/api/me", headers=_auth(tokens["a_admin"]))
     assert r.status_code == 401, r.get_json()
     # 反方向也一樣。
-    assert client.get("/v/shop-b/api/me", headers=_auth(TOKEN_B_OWNER)).status_code == 200
-    assert client.get("/v/shop-a/api/me", headers=_auth(TOKEN_B_OWNER)).status_code == 401
+    assert client.get("/v/shop-b/api/me", headers=_auth(tokens["b_owner"])).status_code == 200
+    assert client.get("/v/shop-a/api/me", headers=_auth(tokens["b_owner"])).status_code == 401
 
 
-def test_same_email_gets_each_stores_own_role(client):
+def test_same_email_gets_each_stores_own_role(client, tokens):
     # admin@shop.test 在 A 店是管理員：權限快取會記下「這個 email 是 role 1」。
-    r = client.get("/v/shop-a/api/admin/ping", headers=_auth(TOKEN_A_ADMIN))
+    r = client.get("/v/shop-a/api/admin/ping", headers=_auth(tokens["a_admin"]))
     assert r.status_code == 200
     # 同一個 email 在 B 店只是玩家。快取全行程共用的話，這裡會拿到 A 店的 role 1。
-    r = client.get("/v/shop-b/api/admin/ping", headers=_auth(TOKEN_B_SAME_EMAIL))
+    r = client.get("/v/shop-b/api/admin/ping", headers=_auth(tokens["b_same_email"]))
     assert r.status_code == 403, r.get_json()
-    me = client.get("/v/shop-b/api/me", headers=_auth(TOKEN_B_SAME_EMAIL)).get_json()
+    me = client.get("/v/shop-b/api/me", headers=_auth(tokens["b_same_email"])).get_json()
     assert me["role"] == 3 and me["name"] == "在B只是玩家"
 
 
@@ -140,15 +150,43 @@ def test_google_login_checks_the_stores_own_client_id(app_module, monkeypatch):
     assert seen == [STORES["shop-a"]["google_client_id"], STORES["shop-b"]["google_client_id"]]
 
 
+def test_forged_or_foreign_tokens_never_open_a_connection(client, tokens, monkeypatch):
+    """查 token 要連資料庫，而連線本身就會把那家店的 Neon 叫醒。偽造的 token
+    （包括別家店發的）要在記憶體裡就被擋下——連線一條都不能開。"""
+    from db.connection import pool
+
+    def boom(*_a, **_k):
+        raise AssertionError("不該為了這個 token 開連線")
+
+    monkeypatch.setattr(pool, "connection", boom)
+    forged = "f" * 64                       # 形狀對、簽章錯
+    foreign = tokens["b_owner"]             # B 店真的發過的，拿到 A 店
+    for token in (forged, foreign, "garbage"):
+        h = _auth(token)
+        assert client.get("/v/shop-a/api/me", headers=h).status_code == 401
+        assert client.get("/v/shop-a/auth/status", headers=h).status_code == 401
+        assert client.post("/v/shop-a/auth/register", headers=h, json={}).status_code == 401
+        assert client.post("/v/shop-a/auth/logout", headers=h).status_code == 200
+
+
+def test_ready_needs_the_stores_job_token(client):
+    assert client.get("/v/shop-a/api/ready").status_code == 401
+    wrong = {"X-Job-Token": STORES["shop-b"]["job_token"]}
+    assert client.get("/v/shop-a/api/ready", headers=wrong).status_code == 401
+    right = {"X-Job-Token": STORES["shop-a"]["job_token"]}
+    r = client.get("/v/shop-a/api/ready", headers=right)
+    assert r.status_code == 200 and r.get_json()["database"] == "ok"
+
+
 # ── 快取與設定 ─────────────────────────────────────────────────
 
 
-def test_slot_cache_does_not_mix_stores(client):
+def test_slot_cache_does_not_mix_stores(client, tokens):
     """兩家店的劇本編號都從 1 開始。時段快取的 key 是 (劇本, 日期, 時間)，
     全行程共用的話，B 店查 1 號劇本會拿到 A 店 1 號劇本的名稱。"""
     params = "session_date=2031-01-07&session_time=19:00"
-    a = client.get(f"/v/shop-a/api/mmg/1/slot?{params}", headers=_auth(TOKEN_A_PLAYER))
-    b = client.get(f"/v/shop-b/api/mmg/1/slot?{params}", headers=_auth(TOKEN_B_SAME_EMAIL))
+    a = client.get(f"/v/shop-a/api/mmg/1/slot?{params}", headers=_auth(tokens["a_player"]))
+    b = client.get(f"/v/shop-b/api/mmg/1/slot?{params}", headers=_auth(tokens["b_same_email"]))
     assert a.status_code == 200 and b.status_code == 200, (a.get_json(), b.get_json())
     assert a.get_json()["mmg_name"] == "A店的劇本"
     assert b.get_json()["mmg_name"] == "B店的劇本"
@@ -208,12 +246,12 @@ def test_missing_prefix_is_404_except_health(client):
     assert client.get("/api/mmg").status_code == 404
 
 
-def test_frontend_of_one_store_cannot_call_the_other(client):
+def test_frontend_of_one_store_cannot_call_the_other(client, tokens):
     other = STORES["shop-a"]["origin"]
-    r = client.get("/v/shop-b/api/me", headers={**_auth(TOKEN_B_OWNER), "Origin": other})
+    r = client.get("/v/shop-b/api/me", headers={**_auth(tokens["b_owner"]), "Origin": other})
     assert r.status_code == 403
     own = STORES["shop-b"]["origin"]
-    r = client.get("/v/shop-b/api/me", headers={**_auth(TOKEN_B_OWNER), "Origin": own})
+    r = client.get("/v/shop-b/api/me", headers={**_auth(tokens["b_owner"]), "Origin": own})
     assert r.status_code == 200
     assert r.headers.get("Access-Control-Allow-Origin") == own
     # 預檢（OPTIONS）也一樣要擋。
@@ -251,7 +289,8 @@ def test_line_webhook_checks_the_stores_own_secret(client):
 def test_store_is_cleared_after_each_request(client):
     import tenancy
 
-    client.get("/v/shop-a/api/ready")
+    client.get("/v/shop-a/api/health")
+    client.get("/v/shop-a/api/ready", headers={"X-Job-Token": STORES["shop-a"]["job_token"]})
     # Flask 的測試客戶端跟測試跑在同一條執行緒——請求結束後這條執行緒上
     # 不該還留著 A 店。gunicorn 的執行緒會被重複使用，留著就會漏給下一個請求。
     assert tenancy.current_or_none() is None

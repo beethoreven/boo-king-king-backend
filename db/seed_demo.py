@@ -185,19 +185,15 @@ def main() -> int:
     url = tenant.database_url
     print(f"店家：{tenant.id}　連線目標：{url.split('@')[-1].split('/')[0] if '@' in url else '(未設定)'}")
 
-    pool.open()
-    try:
-        with tenancy.use(tenant), pool.connection() as conn:
-            with conn.cursor() as cur:
-                ensure_schema(cur)
-                if not args.show:
-                    seed(cur)
-                conn.commit()
-                show(cur)
-        print()
-        return 0
-    finally:
-        pool.close()
+    with tenancy.use(tenant), pool.connection() as conn:
+        with conn.cursor() as cur:
+            ensure_schema(cur)
+            if not args.show:
+                seed(cur)
+            conn.commit()
+            show(cur)
+    print()
+    return 0
 
 
 if __name__ == "__main__":

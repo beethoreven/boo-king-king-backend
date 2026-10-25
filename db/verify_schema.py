@@ -287,38 +287,34 @@ def main() -> int:
     shown = host.split("@")[-1].split("/")[0] if "@" in host else "(未設定)"
     print(f"店家：{tenant.id}　連線目標：{shown}")
 
-    pool.open()
-    try:
-        with tenancy.use(tenant), pool.connection() as conn:
-            with conn.cursor() as cur:
-                ensure_schema(cur)
+    with tenancy.use(tenant), pool.connection() as conn:
+        with conn.cursor() as cur:
+            ensure_schema(cur)
+            conn.commit()
+
+            if args.clean:
+                clean(cur)
+                conn.commit()
+                return 0
+
+            structure_ok = show_structure(cur)
+
+            if args.seed:
+                seed(cur)
                 conn.commit()
 
-                if args.clean:
-                    clean(cur)
-                    conn.commit()
-                    return 0
+            show_counts(cur)
+            show_positions(cur)
+            constraint_ok = check_gm_constraint(cur)
+            sequences_ok = check_sequences(cur)
+            conn.commit()
 
-                structure_ok = show_structure(cur)
-
-                if args.seed:
-                    seed(cur)
-                    conn.commit()
-
-                show_counts(cur)
-                show_positions(cur)
-                constraint_ok = check_gm_constraint(cur)
-                sequences_ok = check_sequences(cur)
-                conn.commit()
-
-        print()
-        if structure_ok and sequences_ok and constraint_ok:
-            print("結果：通過")
-            return 0
-        print("結果：有問題，見上面標示 ✗ 的項目")
-        return 1
-    finally:
-        pool.close()
+    print()
+    if structure_ok and sequences_ok and constraint_ok:
+        print("結果：通過")
+        return 0
+    print("結果：有問題，見上面標示 ✗ 的項目")
+    return 1
 
 
 if __name__ == "__main__":
