@@ -150,9 +150,19 @@ def _parse_origins(raw: str, key: str) -> tuple[str, ...]:
 
 
 def _build(tenant_id: str, get: Callable[[str], str], *, prefix: str, multi: bool) -> Tenant:
+    # ★ 值前後有引號：在 Render 貼成 "postgresql://..."（照 .env 的習慣加了引號），
+    #   Render 不會拿掉，連線函式就把整串當成一個怪參數，而它的錯誤訊息會把**含密碼
+    #   的連線字串整串印進 log**（2026-10-25 實際發生）。在這裡擋下來，訊息只講鍵名。
+    for key in PER_TENANT_KEYS:
+        value = get(key)
+        if value[:1] in ("'", '"') or value[-1:] in ("'", '"'):
+            raise ConfigError(f"{prefix}{key} 的值前後有引號。Render 的環境變數不要加引號，拿掉再存。")
     database_url = get("DATABASE_URL")
     if not database_url:
         raise ConfigError(f"{prefix}DATABASE_URL 沒有設定（店家 {tenant_id}）。")
+    if not database_url.startswith(("postgresql://", "postgres://")):
+        # 不印出值：連線字串裡有密碼。
+        raise ConfigError(f"{prefix}DATABASE_URL 要以 postgresql:// 開頭（店家 {tenant_id}）。")
     origins = _parse_origins(get("ALLOWED_ORIGINS"), f"{prefix}ALLOWED_ORIGINS")
     # ★ 多店家時來源是必填。CORS 放行的是所有店家來源的聯集，「這家店沒設」
     #   沒有安全的解讀——當成全部放行，就是任何網站都能替這家店的使用者打 API。

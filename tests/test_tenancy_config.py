@@ -54,6 +54,10 @@ def test_single_store_format_keeps_the_old_behaviour():
     (_multi(TENANTS="Eli"), "格式不對"),
     (_multi(ELI__ALLOWED_ORIGINS="https://eli.example/booking"), "不是合法的來源"),
     ({"VARIANT": "x"}, "DATABASE_URL 沒有設定"),
+    # 照 .env 習慣加了引號：連線錯誤會把含密碼的字串印進 log，要在讀設定時擋
+    (_multi(ELI__DATABASE_URL=f'"{URL}"'), "ELI__DATABASE_URL 的值前後有引號"),
+    (_multi(ELI__GOOGLE_CLIENT_ID="'abc'"), "ELI__GOOGLE_CLIENT_ID 的值前後有引號"),
+    (_multi(ELI__DATABASE_URL="host=x dbname=y"), "要以 postgresql:// 開頭"),
     # 複製貼上貼錯格：兩家店會完全合併
     (_multi(TUTOR_ARTHUR__DATABASE_URL=URL), "ELI__DATABASE_URL 跟 TUTOR_ARTHUR__DATABASE_URL 是同一個值"),
     (_multi(ELI__LINE_CHANNEL_SECRET="s", ELI__LINE_CHANNEL_ACCESS_TOKEN="a1",
@@ -61,8 +65,9 @@ def test_single_store_format_keeps_the_old_behaviour():
      "LINE_CHANNEL_SECRET 是同一個值"),
 ])
 def test_bad_config_refuses_to_start(env, message):
-    with pytest.raises(tenancy.ConfigError, match=message):
+    with pytest.raises(tenancy.ConfigError, match=message) as err:
         tenancy.load(env)
+    assert "secret-password" not in str(err.value), "錯誤訊息不能帶出密碼"
 
 
 def test_secrets_never_show_up_in_repr():
