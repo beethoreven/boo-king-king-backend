@@ -21,16 +21,13 @@ schema 的 CHECK 約束、seed_demo 的印表、前端的下拉選項。改一�
 from __future__ import annotations
 
 import os
-import threading
-import time
+
+import tenancy
 
 # 角色設定活多久。10 分鐘：改名字或改通知開關是罕見的管理動作，等十分鐘
 # 生效完全可以接受，而換到的是「列使用者清單不必多查一次資料庫」。
 _CACHE_TTL_SECONDS = float(os.environ.get("ROLE_CACHE_TTL_SECONDS", "600"))
 
-_lock = threading.Lock()
-_cache: dict[int, dict] | None = None
-_expires_at = 0.0
 
 
 def _load(cur) -> dict[int, dict]:
@@ -43,23 +40,14 @@ def _load(cur) -> dict[int, dict]:
     }
 
 
+# 每家店一份。查詢放在鎖外面的理由（同 auth_utils/whitelist.get_user）
+# 寫在 tenancy.TableCache 裡。
+_cache = tenancy.TableCache(_CACHE_TTL_SECONDS, lambda cur: _load(cur))
+
+
 def all_roles(cur) -> dict[int, dict]:
     """全部角色，id -> {id, name, line, email}。帶快取。"""
-    global _cache, _expires_at
-    now = time.monotonic()
-    with _lock:
-        if _cache is not None and _expires_at > now:
-            return _cache
-
-    # ★ 刻意在鎖外面查資料庫。鎖只保護那個字典，不能包住網路操作——
-    #   一旦把查詢放進鎖裡，任何一次連線變慢都會讓所有等著讀角色的請求
-    #   一起卡住。同樣的理由見 auth_utils/whitelist.get_user。
-    loaded = _load(cur)
-
-    with _lock:
-        _cache = loaded
-        _expires_at = time.monotonic() + _CACHE_TTL_SECONDS
-    return loaded
+    return _cache.get(cur)
 
 
 def label(cur, role_id: int) -> str:
@@ -78,8 +66,5 @@ def wants(cur, role_id: int, channel: str) -> bool:
 
 
 def invalidate() -> None:
-    """清掉快取。用 SQL 改完 roles 之後想立刻生效就呼叫它。"""
-    global _cache, _expires_at
-    with _lock:
-        _cache = None
-        _expires_at = 0.0
+    """清掉快取（目前這家店的）。用 SQL 改完 roles 之後想立刻生效就呼叫它。"""
+    _cache.invalidate()

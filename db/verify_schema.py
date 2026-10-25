@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 # 讀 os.environ["DATABASE_URL"]，晚一步就會 KeyError。
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
+import tenancy  # noqa: E402
 from db.connection import pool  # noqa: E402
 from db.schema import ensure_schema  # noqa: E402
 
@@ -279,14 +280,16 @@ def main() -> int:
     parser.add_argument("--clean", action="store_true", help="清除範例資料後結束")
     args = parser.parse_args()
 
-    host = os.environ.get("DATABASE_URL", "")
+    # 有好幾家店時要用 TENANT=<店家> 指定（見 tenancy.for_cli）。
+    tenant = tenancy.for_cli()
+    host = tenant.database_url
     # 只印 host 段，不要把密碼印到終端機或 CI log 裡
     shown = host.split("@")[-1].split("/")[0] if "@" in host else "(未設定)"
-    print(f"連線目標：{shown}")
+    print(f"店家：{tenant.id}　連線目標：{shown}")
 
     pool.open()
     try:
-        with pool.connection() as conn:
+        with tenancy.use(tenant), pool.connection() as conn:
             with conn.cursor() as cur:
                 ensure_schema(cur)
                 conn.commit()

@@ -11,8 +11,15 @@
 就把旗標打開，之後直接跳過。理由與 zh-cn-to-tw 相同：Neon 這種每次連線
 都有實質延遲的服務，重跑整段檢查的成本不能忽略。
 
+★ 旗標是**每家店一個**。一個服務服務好幾家店時，每家都是自己的資料庫，
+  「建過了」只代表那一家建過了。只有一個旗標的話，第一家被連到的店建完
+  表就把它打開，其他店的資料庫永遠不會被補上新欄位。
+
+觸發點是 db/connection.py：每家店在這個行程裡第一次連線時呼叫 ensure_ready。
+所以不管哪一條路先碰到資料庫（請求、排程、腳本），表一定已經建好。
+
 補欄位那幾處是「先查 information_schema 再 ALTER TABLE ADD COLUMN」，
-中間有 TOCTOU 空隙，用 _schema_lock 保護。這把鎖只鎖「跑不跑這段初始化」
+中間有 TOCTOU 空隙，用每家店一把的鎖保護。這把鎖只鎖「跑不跑這段初始化」
 這個判斷本身，一次性、跑完就不會再進來，不是包住每次資料庫存取的那種鎖
 （那種鎖的問題見 db/connection.py 開頭的說明）。
 """
@@ -21,11 +28,20 @@ from __future__ import annotations
 
 import threading
 
+import tenancy
 from db import default_templates
 from line_utils import client as line_client
 
-_schema_ready = False
-_schema_lock = threading.Lock()
+
+class _Ready:
+    __slots__ = ("done",)
+
+    def __init__(self) -> None:
+        self.done = False
+
+
+_ready = tenancy.PerTenant(_Ready)
+_locks = tenancy.PerTenant(threading.Lock)
 
 
 def _existing_columns(cur, table: str) -> set[str]:
@@ -35,62 +51,75 @@ def _existing_columns(cur, table: str) -> set[str]:
     return {row[0] for row in cur.fetchall()}
 
 
-def ensure_schema(cur) -> None:
-    global _schema_ready
-    if _schema_ready:
-        return
+def ensure_ready(conn) -> None:
+    """目前這家店在這個行程裡還沒建過表的話，建一次並 commit。之後只看旗標。
 
-    with _schema_lock:
+    ★ 旗標在 commit **之後**才打開。先打開的話，commit 失敗（連線斷掉）會
+      留下「旗標說建好了、資料庫其實沒有」的狀態，直到行程重啟都不會再試。
+    """
+    state = _ready.get()
+    if state.done:
+        return
+    with _locks.get():
         # 鎖內重新檢查：等鎖的期間可能已經有另一個執行緒跑完了
         # （double-checked locking），不重檢會把補欄位那幾段再跑一次。
-        if _schema_ready:
+        if state.done:
             return
+        with conn.cursor() as cur:
+            ensure_schema(cur)
+        conn.commit()
+        state.done = True
 
-        # ★ 上面那把是 threading.Lock，只鎖得住「同一個 process 裡的執行緒」。
-        #   正式環境用 gunicorn 跑多個 worker，那是多個**行程**——它們會同時
-        #   進到這裡，同時對同一張表下 ALTER TABLE，互相搶 AccessExclusiveLock
-        #   而死結，兩個 worker 一起啟動失敗，服務根本起不來。
-        #
-        #   實測過：`gunicorn --workers 2` 直接噴
-        #   `psycopg.errors.DeadlockDetected` 然後 "Worker failed to boot"。
-        #   單一 process 的 Flask 開發伺服器永遠測不出這件事。
-        #
-        #   所以要再加一把**跨行程**的鎖。advisory lock 是交易層級的，會在
-        #   呼叫端 commit 時自動釋放；第二個 worker 會擋在這一行，等第一個
-        #   建完才進去，然後發現該有的都有了（這裡的每一段本來就是冪等的）。
-        cur.execute("SELECT pg_advisory_xact_lock(hashtext('boo-king-king:ensure_schema'))")
 
-        _ensure_settings(cur)
-        _ensure_functions(cur)
-        _ensure_notification_template(cur)
-        default_templates.ensure(cur)
-        # roles 要在 users 之前——users.role 有外鍵指過來。
-        _ensure_roles(cur)
-        _ensure_users(cur)
-        # rooms 要在 mmg 之前——mmg.room_id 參照它。
-        _ensure_rooms(cur)
-        _ensure_mmg(cur)
-        # 排期兩張表都參照 mmg(id)，必須排在 _ensure_mmg 之後。
-        _ensure_schedule(cur)
-        _ensure_booking_record(cur)
-        # 忙碌日參照 users(id)，必須排在 _ensure_users 之後。
-        _ensure_busy_day(cur)
-        _ensure_sessions(cur)
-        _ensure_abuse_log(cur)
-        _ensure_abuse_rule(cur)
+def ensure_schema(cur) -> None:
+    """建表、補欄位、塞預設值。全部冪等，重跑安全。呼叫端負責 commit。
 
-        # ★ LINE 是模組，不是每一家都有。沒設定 LINE 的店，資料庫裡就不建
-        #   它的表與欄位——那家店用不到的東西不該留在它的資料庫裡（案主
-        #   2026-09-14）。判斷用的是跟 webhook 同一支 enabled()，所以「服務
-        #   說 LINE 開著」跟「資料庫有 LINE 的表」不會兜不起來。
-        #
-        #   之後要開：設好兩個環境變數、重新部署，開機時就會建出來。
-        #   反過來把 LINE 關掉，已經建好的不會自己消失：移除是一次刻意的資料
-        #   庫操作（重建搬舊資料），不是開機時順手做的事。
-        if line_client.enabled():
-            _ensure_line(cur)
+    一般不必直接呼叫：db/connection.py 每家店第一次連線時會透過 ensure_ready
+    跑它。
+    """
+    # ★ 行程內的鎖（ensure_ready 那把）只鎖得住「同一個 process 裡的執行緒」。
+    #   正式環境用 gunicorn 跑多個 worker，那是多個**行程**——它們會同時
+    #   進到這裡，同時對同一張表下 ALTER TABLE，互相搶 AccessExclusiveLock
+    #   而死結，兩個 worker 一起啟動失敗，服務根本起不來。
+    #
+    #   實測過：`gunicorn --workers 2` 直接噴
+    #   `psycopg.errors.DeadlockDetected` 然後 "Worker failed to boot"。
+    #   單一 process 的 Flask 開發伺服器永遠測不出這件事。
+    #
+    #   所以要再加一把**跨行程**的鎖。advisory lock 是交易層級的，會在
+    #   呼叫端 commit 時自動釋放；第二個 worker 會擋在這一行，等第一個
+    #   建完才進去，然後發現該有的都有了（這裡的每一段本來就是冪等的）。
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext('boo-king-king:ensure_schema'))")
 
-        _schema_ready = True
+    _ensure_settings(cur)
+    _ensure_functions(cur)
+    _ensure_notification_template(cur)
+    default_templates.ensure(cur)
+    # roles 要在 users 之前——users.role 有外鍵指過來。
+    _ensure_roles(cur)
+    _ensure_users(cur)
+    # rooms 要在 mmg 之前——mmg.room_id 參照它。
+    _ensure_rooms(cur)
+    _ensure_mmg(cur)
+    # 排期兩張表都參照 mmg(id)，必須排在 _ensure_mmg 之後。
+    _ensure_schedule(cur)
+    _ensure_booking_record(cur)
+    # 忙碌日參照 users(id)，必須排在 _ensure_users 之後。
+    _ensure_busy_day(cur)
+    _ensure_sessions(cur)
+    _ensure_abuse_log(cur)
+    _ensure_abuse_rule(cur)
+
+    # ★ LINE 是模組，不是每一家都有。沒設定 LINE 的店，資料庫裡就不建
+    #   它的表與欄位——那家店用不到的東西不該留在它的資料庫裡（案主
+    #   2026-09-14）。判斷用的是跟 webhook 同一支 enabled()，所以「服務
+    #   說 LINE 開著」跟「資料庫有 LINE 的表」不會兜不起來。
+    #
+    #   之後要開：設好兩個環境變數、重新部署，開機時就會建出來。
+    #   反過來把 LINE 關掉，已經建好的不會自己消失：移除是一次刻意的資料
+    #   庫操作（重建搬舊資料），不是開機時順手做的事。
+    if line_client.enabled():
+        _ensure_line(cur)
 
 
 def _ensure_line(cur) -> None:
@@ -1034,8 +1063,9 @@ def _ensure_booking_record(cur) -> None:
     把自己的 status 改掉，順位自動遞補，沒有第二個地方需要同步。
 
     效能上也沒有取捨：每個 (劇本, 日期, 時間) 的分組最多只有
-    1 + waitlist_limit 列（預設 4 列），對 4 列做 ROW_NUMBER 的成本可以忽略，
-    而玩家瀏覽用的熱查詢本來就走 Redis 快取、不會打到這裡。
+    waitlist_limit 列（預設 3 列，含已成立的那一組），對幾列做 ROW_NUMBER 的
+    成本可以忽略，而玩家瀏覽用的熱查詢本來就走行程內的時段快取
+    （db/slot_cache.py）、不會打到這裡。
 
     容量上限的檢查（這是真正需要小心的地方）：
     「這個時段還沒滿」這件事無法用唯一約束表達——要擋的是「第 N+1 筆」，

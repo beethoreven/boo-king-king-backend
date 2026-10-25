@@ -19,6 +19,13 @@
 跟 zh-cn-to-tw 的差異：那邊每個函式各自開連線，導致一個已登入請求光是
 驗證身分就固定開兩條連線（resolve_session 一條、is_permitted_user 一條）。
 這裡改成由呼叫端傳入 cursor，require_auth 用同一條連線做完兩件事。
+
+## ★ 多店家：行程內的兩份字典是每家店一份
+
+token 存在各店自己的資料庫裡，A 店的 token 在 B 店的資料庫裡查不到——那是
+越權的防線。下面的解析快取（token → email）如果全行程共用，A 店的 token 在
+3 秒內拿去打 B 店會**直接命中**，根本不會去 B 店的資料庫查，等於用 A 店的
+身分進了 B 店。所以兩份字典都放在 tenancy.PerTenant 裡。
 """
 
 from __future__ import annotations
@@ -28,6 +35,8 @@ import re
 import secrets
 import threading
 import time
+
+import tenancy
 
 # 連續幾天完全沒有任何請求才讓 session 失效。90 天是針對「久久才來訂一次
 # 遊戲」的玩家：隔兩個月回來還能直接用。
@@ -42,7 +51,21 @@ SESSION_IDLE_DAYS = int(os.environ.get("SESSION_IDLE_DAYS", "90"))
 # 多個 worker 各有自己的字典，頂多讓寫入頻率比設定值高一些，不影響正確性。
 _TOUCH_MIN_INTERVAL_SECONDS = 60
 _touch_lock = threading.Lock()
-_last_touched: dict[str, float] = {}
+
+
+class _TokenState:
+    """一家店的兩份字典（理由見檔案開頭「多店家」）。"""
+
+    __slots__ = ("last_touched", "resolved")
+
+    def __init__(self) -> None:
+        # token → 上次真的寫 last_seen_at 的時間
+        self.last_touched: dict[str, float] = {}
+        # token → (到期時間, email)，見下方「token → email 的解析快取」
+        self.resolved: dict[str, tuple[float, str]] = {}
+
+
+_tokens = tenancy.PerTenant(_TokenState)
 
 # ── token → email 的解析快取 ────────────────────────────────
 #
@@ -63,7 +86,6 @@ _last_touched: dict[str, float] = {}
 # 既有的 30 秒權限窗口小一個數量級，所以它不會是撤銷延遲的瓶頸。
 # 設 0 就是停用這層快取。
 _RESOLVE_TTL_SECONDS = float(os.environ.get("SESSION_CACHE_TTL_SECONDS", "3"))
-_resolved: dict[str, tuple[float, str]] = {}
 
 
 def create_session(cur, email: str) -> str:
@@ -88,9 +110,10 @@ def resolve_cached(token: str | None) -> str | None:
     """
     if not token or _RESOLVE_TTL_SECONDS <= 0:
         return None
+    state = _tokens.get()
     now = time.monotonic()
     with _touch_lock:
-        hit = _resolved.get(token)
+        hit = state.resolved.get(token)
         return hit[1] if hit is not None and hit[0] > now else None
 
 
@@ -145,25 +168,28 @@ def resolve_session(cur, token: str | None) -> str | None:
 
     _maybe_touch(cur, token)
     if _RESOLVE_TTL_SECONDS > 0:
+        state = _tokens.get()
         with _touch_lock:
-            _resolved[token] = (time.monotonic() + _RESOLVE_TTL_SECONDS, email)
+            state.resolved[token] = (time.monotonic() + _RESOLVE_TTL_SECONDS, email)
     return email
 
 
 def _maybe_touch(cur, token: str) -> None:
+    state = _tokens.get()
     now = time.monotonic()
     with _touch_lock:
-        if now - _last_touched.get(token, 0.0) < _TOUCH_MIN_INTERVAL_SECONDS:
+        if now - state.last_touched.get(token, 0.0) < _TOUCH_MIN_INTERVAL_SECONDS:
             return
-        _last_touched[token] = now
+        state.last_touched[token] = now
     cur.execute("UPDATE sessions SET last_seen_at = NOW() WHERE token = %s", (token,))
 
 
 def _forget(token: str) -> None:
-    """忘掉這張 token 的所有行程內狀態。登出與過期都會走到這裡。"""
+    """忘掉這張 token 的所有行程內狀態（目前這家店的）。登出與過期都會走到這裡。"""
+    state = _tokens.get()
     with _touch_lock:
-        _last_touched.pop(token, None)
-        _resolved.pop(token, None)
+        state.last_touched.pop(token, None)
+        state.resolved.pop(token, None)
 
 
 def delete_session(cur, token: str | None) -> None:
@@ -183,10 +209,11 @@ def delete_sessions_for_email(cur, email: str) -> int:
     # 解析快取是 token → email，所以要掃過去找出屬於這個帳號的每一張。
     # 快取很小（只有近幾秒活躍過的 token），掃描的成本可以忽略；漏掉的
     # 代價則是被停用的人在 TTL 內還能通過查驗。
+    state = _tokens.get()
     with _touch_lock:
-        for tok in [t for t, (_exp, mail) in _resolved.items() if mail == target]:
-            _resolved.pop(tok, None)
-            _last_touched.pop(tok, None)
+        for tok in [t for t, (_exp, mail) in state.resolved.items() if mail == target]:
+            state.resolved.pop(tok, None)
+            state.last_touched.pop(tok, None)
     return cur.rowcount
 
 

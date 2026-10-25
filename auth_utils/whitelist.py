@@ -14,6 +14,10 @@
    session 自然過期為止（可能是好幾十天）；每次查則是快取 TTL 之內就失效。
    這正是我們敢讓 session token 活很久的原因——安全性由「當下的權限狀態」
    保證，不是靠 token 本身早點過期。
+
+★ 多店家：權限快取是每家店一份。同一個 email 在 A 店是管理員、在 B 店是
+   一般玩家（或根本沒註冊）是正常的；快取全行程共用的話，B 店的請求會讀到
+   A 店的角色與使用者編號。
 """
 
 from __future__ import annotations
@@ -21,6 +25,8 @@ from __future__ import annotations
 import os
 import threading
 import time
+
+import tenancy
 
 # 快取存活秒數。這個查詢會出現在每一個受保護的請求上，沒有快取的話
 # 每次請求都要多一次資料庫往返。30 秒是「撤銷權限多快生效」與
@@ -34,8 +40,8 @@ import time
 # 連線數與 CU 用量，不是為了省那 1.5 秒。要調 TTL 之前請先量現況。
 _CACHE_TTL_SECONDS = int(os.environ.get("AUTH_CACHE_TTL_SECONDS", "30"))
 
-# email -> (到期時間戳, 使用者資料 dict 或 None)
-_cache: dict[str, tuple[float, dict | None]] = {}
+# email -> (到期時間戳, 使用者資料 dict 或 None)，每家店一份
+_cache = tenancy.PerTenant(dict)
 _cache_lock = threading.Lock()
 
 
@@ -102,10 +108,11 @@ def get_user(cur, email: str, *, fresh: bool = False) -> dict | None:
     if not key:
         return None
 
+    cache = _cache.get()
     now = time.monotonic()
     if not fresh:
         with _cache_lock:
-            hit = _cache.get(key)
+            hit = cache.get(key)
             if hit and hit[0] > now:
                 return hit[1]
 
@@ -115,7 +122,7 @@ def get_user(cur, email: str, *, fresh: bool = False) -> dict | None:
     user = _fetch_user(cur, key)
 
     with _cache_lock:
-        _cache[key] = (now + _CACHE_TTL_SECONDS, user)
+        cache[key] = (now + _CACHE_TTL_SECONDS, user)
     return user
 
 
@@ -135,9 +142,10 @@ def peek(email: str):
     key = (email or "").lower().strip()
     if not key:
         return MISS
+    cache = _cache.get()
     now = time.monotonic()
     with _cache_lock:
-        hit = _cache.get(key)
+        hit = cache.get(key)
         if hit is not None and hit[0] > now:
             return hit[1]
     return MISS
@@ -153,12 +161,13 @@ def is_permitted_user(cur, email: str, *, fresh: bool = False) -> bool:
 
 
 def invalidate(email: str | None = None) -> None:
-    """清掉快取。改動使用者權限後呼叫，讓變更立即生效而不用等 TTL。"""
+    """清掉快取（目前這家店的）。改動使用者權限後呼叫，讓變更立即生效而不用等 TTL。"""
+    cache = _cache.get()
     with _cache_lock:
         if email is None:
-            _cache.clear()
+            cache.clear()
         else:
-            _cache.pop(email.lower().strip(), None)
+            cache.pop(email.lower().strip(), None)
 
 
 def register_self(cur, email: str, data: dict) -> dict:

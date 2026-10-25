@@ -5,6 +5,9 @@
         with conn.cursor() as cur:
             ...
 
+★ 連的是**目前這家店**的資料庫（tenancy.current()）。不在任何店家裡呼叫
+  會拋 tenancy.NoTenant——不退回某個預設的店，理由見 tenancy.py。
+
 ## 為什麼不是連線池（2026-08-31 實測後改的）
 
 原本用 psycopg3 的 ConnectionPool。它在本機完全正常，在 Render 的免費方案
@@ -45,6 +48,20 @@ with inactivity, which can delay requests by 50 seconds or more」）。行程
 換到的是結構性的保證：沒有任何跨請求的共用狀態，所以沒有東西會「壞掉之後
 一直壞著」。每一次請求自己開、自己關，前一次的失敗不會傳染給下一次。
 
+## 多店家：兩層上限
+
+一個服務同時服務好幾家店之後，上限分兩層：
+
+  - 整台機器：同時最多 _MAX_CONCURRENT 條（保護 Render 那台機器，跟原本一樣）
+  - 每一家店：同時最多 _MAX_PER_TENANT 條
+
+第二層存在的理由是開賣搶位：一家店的尖峰把整台機器的名額用光，其他店
+的玩家就連登入都卡住。每家店留不到全部，別家就永遠有名額可用。只有一家
+店時兩層一樣大，行為跟原本完全相同。
+
+★ 先拿店家那一層、再拿整台機器那一層。反過來的話，一家店塞車的請求會
+  佔著機器名額排隊等店家名額，又變回大家一起卡住。
+
 ## ★ 號誌不能省
 
 拿掉池子的同時也拿掉了「同時最多 5 條連線」這個上限——那是池子順便在做、
@@ -72,20 +89,33 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from contextlib import contextmanager
 
 import psycopg
 
-from db import idle_gap
+import tenancy
+from db import idle_gap, schema
 
-DATABASE_URL = os.environ["DATABASE_URL"]
-
-# 同時可以有幾條連線。這是反壓上限，不是效能旋鈕。
+# 整台機器同時可以有幾條連線。這是反壓上限，不是效能旋鈕。
 #
 # 實際量到的尖峰約 5-6 條併發，而且不是來自很多使用者，是「一次輪詢展開成
 # 好幾個帶授權的請求」。這個數字必須配合 Render 方案的實際 CPU/RAM 重新
-# 驗證，不要假設不變。
-_MAX_CONCURRENT = 5
+# 驗證，不要假設不變——升級成付費機器（0.5 CPU）之後可以實測再調高，
+# 用環境變數 DB_MAX_CONCURRENT 改，不用改程式。
+_MAX_CONCURRENT = int(os.environ.get("DB_MAX_CONCURRENT", "5"))
+
+# 每一家店同時可以有幾條（見上方「多店家：兩層上限」）。預設：只有一家店時
+# 跟整台一樣大；好幾家時是 3，留 2 條給其他店。
+_MAX_PER_TENANT = int(os.environ.get(
+    "DB_MAX_CONCURRENT_PER_TENANT",
+    str(_MAX_CONCURRENT if len(tenancy.all_tenants()) == 1 else min(3, _MAX_CONCURRENT)),
+))
+if not 1 <= _MAX_PER_TENANT <= _MAX_CONCURRENT:
+    raise tenancy.ConfigError(
+        f"DB_MAX_CONCURRENT_PER_TENANT={_MAX_PER_TENANT} 要介於 1 和 "
+        f"DB_MAX_CONCURRENT={_MAX_CONCURRENT} 之間。"
+    )
 
 # 等不到名額最多等多久。超過就明確失敗，不要無限期排隊。
 _SLOT_WAIT = 20
@@ -93,7 +123,9 @@ _SLOT_WAIT = 20
 # 單次連線的握手上限。同區正常是 0.2-0.6 秒，10 秒代表真的有問題。
 _CONNECT_TIMEOUT = 10
 
+# 整台機器那一層刻意是全行程共用的：它保護的是這台機器，不是某家店。
 _slots = threading.BoundedSemaphore(_MAX_CONCURRENT)
+_tenant_slots = tenancy.PerTenant(lambda: threading.BoundedSemaphore(_MAX_PER_TENANT))
 
 
 class DatabaseBusy(Exception):
@@ -138,6 +170,7 @@ class _Connections:
         return {
             "mode": "per-request",
             "max_concurrent": _MAX_CONCURRENT,
+            "max_concurrent_per_tenant": _MAX_PER_TENANT,
             "slot_wait_seconds": _SLOT_WAIT,
             "connect_timeout_seconds": _CONNECT_TIMEOUT,
         }
@@ -148,27 +181,43 @@ class _Connections:
 
         交易語意跟原本的連線池一致：正常離開就 commit，拋例外就 rollback
         （那是 `with conn:` 的行為）。差別只在最後會 close 而不是還回池子。
+
+        ★ 這家店在這個行程裡第一次連線時，會先確認資料表都建好了（見
+          db/schema.ensure_ready）。之後每次只是看一個旗標。
         """
+        tenant = tenancy.current()
+
         # 在取得名額之前記錄，理由跟原本一樣：等名額等了 20 秒也是「這段
         # 期間有人在用資料庫」，算成沒有存取會低估密集度（見 db/idle_gap.py）。
         idle_gap.mark()
 
         wait = _SLOT_WAIT if timeout is None else timeout
-        if not _slots.acquire(timeout=wait):
+        deadline = time.monotonic() + wait
+        tenant_slots = _tenant_slots.get()
+        if not tenant_slots.acquire(timeout=wait):
             raise DatabaseBusy(
-                f"資料庫同時連線已達上限（{_MAX_CONCURRENT}），"
+                f"{tenant.id} 的資料庫同時連線已達上限（{_MAX_PER_TENANT}），"
                 f"等待 {wait} 秒仍無法取得"
             )
         try:
-            conn = psycopg.connect(DATABASE_URL, connect_timeout=_CONNECT_TIMEOUT)
+            if not _slots.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                raise DatabaseBusy(
+                    f"資料庫同時連線已達上限（整台 {_MAX_CONCURRENT}），"
+                    f"等待 {wait} 秒仍無法取得"
+                )
             try:
-                _configure(conn)
-                with conn:
-                    yield conn
+                conn = psycopg.connect(tenant.database_url, connect_timeout=_CONNECT_TIMEOUT)
+                try:
+                    _configure(conn)
+                    schema.ensure_ready(conn)
+                    with conn:
+                        yield conn
+                finally:
+                    conn.close()
             finally:
-                conn.close()
+                _slots.release()
         finally:
-            _slots.release()
+            tenant_slots.release()
 
 
 pool = _Connections()

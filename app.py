@@ -2,22 +2,29 @@
 boo-king-king 後端。
 
 健康檢查、保活端點、Google 登入與 session 層，以及劇本查詢與預約路由。
+
+一個服務可以同時服務好幾家店：每個請求依網址前綴 /v/<店家> 決定是哪一家
+（見 _select_tenant），之後所有東西——資料庫、快取、設定——都是那一家的。
+隔離怎麼做、哪裡會漏，寫在 tenancy.py 的開頭。
 """
 
 from __future__ import annotations
 
+import hmac
 import os
 from datetime import date, time
 from functools import wraps
 
 from dotenv import load_dotenv
 
-# 一定要在 import 任何會讀 os.environ 的模組之前載入。db.connection 在
-# import 當下就會讀 DATABASE_URL，晚一步就是 KeyError。
+# 一定要在 import 任何會讀 os.environ 的模組之前載入。tenancy 在 import 當下
+# 就會讀店家設定（VARIANT / TENANTS 與各店的 DATABASE_URL），晚一步就起不來。
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 from flask import Flask, g, jsonify, request, url_for  # noqa: E402
 from flask_cors import CORS  # noqa: E402
+
+import tenancy  # noqa: E402
 
 from auth_utils import guard, profile, sessions, whitelist  # noqa: E402
 from auth_utils.decorators import admin_display_name, require_auth, require_role  # noqa: E402
@@ -34,7 +41,6 @@ from db import schedule  # noqa: E402
 from db import slot_cache  # noqa: E402
 from db.bookings import BookingError  # noqa: E402
 from db.connection import pool  # noqa: E402
-from db.schema import ensure_schema  # noqa: E402
 from line_utils import client as line_client  # noqa: E402
 from line_utils import handler as line_handler  # noqa: E402
 from line_utils import images as line_images  # noqa: E402
@@ -42,31 +48,31 @@ from line_utils import signature as line_signature  # noqa: E402
 import notifications  # noqa: E402
 import notify_events  # noqa: E402
 
-# ★ 把 psycopg_pool 的日誌接出來。
+# ── log：每一行都標上店家 ────────────────────────────────────────
 #
-#   連線池建立連線失敗時只會記在它自己的 logger（WARNING），預設不會出現
-#   在 gunicorn/Flask 的輸出裡——呼叫端看到的只有一句
-#   「couldn't get a connection after 20.00 sec」，那句話對「密碼錯」
-#   「主機不通」「SSL 交涉失敗」「資料庫冷啟動太久」是同一個樣子。
+# 好幾家店共用一份 log，出事時要分得出是哪一家。掛在根 logger 上，所以
+# 各模組的 log、Flask 的 app.logger、psycopg 的警告都會經過這裡。
 #
-#   實際上線時就是這樣：Render 每一次資料庫存取都逾時，而 log 裡沒有
-#   任何線索，因為真正的錯誤被吞在這個 logger 裡。
+# ★ 要在建立 Flask app **之前**掛：Flask 第一次用 app.logger 時，如果整條
+#   logger 鏈上找不到 handler，會自己加一個（不帶店家標記的）。
+# ★ 自己掛一個 handler 而不是用 basicConfig：basicConfig 在已經有 handler
+#   時是空操作，而 gunicorn 會先設定好自己的 logging——那會讓這一行看起來
+#   有生效、實際上什麼都沒做。
+# ★ WARNING 就夠了。INFO 會讓每一次連線都印一行，Render 免費方案的 log
+#   有保存上限，真正的錯誤會被洗掉。
+#
+# （這裡原本只把 psycopg_pool 的 logger 接出來。連線池已經在 2026-08-31 拿掉
+#   了——見 db/connection.py——那一段一直留著沒有作用，2026-10-25 換成這個。）
 import logging  # noqa: E402
 import sys as _sys  # noqa: E402
 
-_pool_log = logging.getLogger("psycopg.pool")
-# WARNING 就夠了：連線建立失敗是記在 WARNING（"error connecting in ..."），
-# 那正是我們要的。INFO 會把每一次取用與歸還連線都印一行，線上會把 log
-# 塞爆，而且 Render 的免費方案有保存上限。
-#
-# 自己掛一個 handler 而不是用 basicConfig：basicConfig 在已經有 handler
-# 時是空操作，而 gunicorn 會先設定好自己的 logging——那會讓這一行看起來
-# 有生效、實際上什麼都沒做。
-_pool_log.setLevel(logging.WARNING)
-if not _pool_log.handlers:
+_root_log = logging.getLogger()
+if not any(isinstance(f, tenancy.LogContext) for h in _root_log.handlers for f in h.filters):
     _h = logging.StreamHandler(_sys.stderr)
-    _h.setFormatter(logging.Formatter("[pool] %(levelname)s %(message)s"))
-    _pool_log.addHandler(_h)
+    _h.setFormatter(logging.Formatter("[%(tenant)s] %(levelname)s %(name)s: %(message)s"))
+    _h.addFilter(tenancy.LogContext())
+    _root_log.addHandler(_h)
+    _root_log.setLevel(logging.WARNING)
 
 app = Flask(__name__)
 
@@ -100,18 +106,20 @@ app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 # 瀏覽器對這個值有自己的上限（Chrome 2 小時、Safari 更短），設得再大也
 # 會被夾到上限，所以填 1 小時，不是愈大愈好。
 #
-# 來源限制：ALLOWED_ORIGINS 是逗號分隔的完整來源（含 scheme，不要結尾斜線），
-# 例如 https://booking.example.com,https://www.example.com
+# 來源限制：每家店的 ALLOWED_ORIGINS 是逗號分隔的完整來源（含 scheme，不要
+# 結尾斜線），例如 https://eli.boo-king-king.workers.dev
 #
-# ★ 沒設定時放行全部，而且會在啟動時印一行警告。這是刻意的取捨：
-#   設成「沒設定就全擋」的話，本機開發與案主現在的手動測試會在毫無提示
-#   的情況下整個壞掉，而症狀是瀏覽器主控台的 CORS 錯誤——那是最難從
-#   畫面上看出原因的一種失敗。
-#   正式環境一定要設；上線 SOP 把它列為必填。
-_origins_raw = os.environ.get("ALLOWED_ORIGINS", "").strip()
-_origins = [o.strip().rstrip("/") for o in _origins_raw.split(",") if o.strip()]
-if _origins:
-    CORS(app, origins=_origins, max_age=3600)
+# Flask-CORS 只能設一份全站名單，所以這裡給它**所有店家來源的聯集**；
+# 「這個來源只能打它自己那家店」由下面的 _select_tenant 在請求一開始擋。
+# 少了那一道，eli 的前端就能用瀏覽器裡的登入憑證去打 tutor-arthur 的 API。
+#
+# ★ 單店寫法沒設定時放行全部，而且會在啟動時印一行警告。這是刻意的取捨：
+#   設成「沒設定就全擋」的話，本機開發會在毫無提示的情況下整個壞掉，而
+#   症狀是瀏覽器主控台的 CORS 錯誤——那是最難從畫面上看出原因的一種失敗。
+#   多店家寫法則是必填，沒設起不來（理由見 tenancy._build）。
+_all_origins = sorted({o for t in tenancy.all_tenants() for o in t.allowed_origins})
+if all(t.allowed_origins for t in tenancy.all_tenants()):
+    CORS(app, origins=_all_origins, max_age=3600)
 else:
     print(
         "[warn] ALLOWED_ORIGINS 未設定，目前放行任何來源。正式環境請務必設定。",
@@ -119,29 +127,22 @@ else:
     )
     CORS(app, max_age=3600)
 
-# ── 每店部署的識別（variant）─────────────────────────────────
+# ── 店家識別（/v/<店家> 前綴）──────────────────────────────────
 #
-# 網址形狀是 /v/<variant>/api/...，前綴放在**所有路徑最前面**。理由是這個
+# 網址形狀是 /v/<店家>/api/...，前綴放在**所有路徑最前面**。理由是這個
 # 後端有 /api/... 與 /auth/... 兩種前綴，而前端的 API_BASE 只是主機位址——
 # 前綴放最前面，前端只要改 index.html 一行，四十幾個呼叫點零改動；放中間
-# （/api/<variant>/...）則要改每一個呼叫點，而且 /auth/... 那幾支塞不進去。
+# （/api/<店家>/...）則要改每一個呼叫點，而且 /auth/... 那幾支塞不進去。
 #
-# ★ 這一段**不是**用來決定連哪個資料庫。variant 從環境變數來，每個部署
-#   啟動時就知道自己是誰，手上只有一組 DATABASE_URL——它根本連不到別家店
-#   的資料庫。隔離來自「這個 process 沒有那把鑰匙」，不是來自路由寫對。
-#   網址裡那一段只做一件事：對不上就拒絕，防的是「前端網址填錯」這種設定
-#   錯誤。把它當斷言看，不要讓它承擔隔離責任。
+# ★ 這一段**決定這個請求連哪一家店的資料庫**（2026-10-25 起，一個服務
+#   服務好幾家店）。原本的設計是「每店一個服務、這一段只當斷言」，那樣的
+#   隔離是結構性的；現在改成路由決定，所以防線換成兩道：
+#     1. 登入憑證存在各店自己的資料庫——選錯店，憑證就查不到（401）。
+#     2. 行程內的快取一律按店家分開——tenancy.PerTenant，由測試強制。
+#   細節見 tenancy.py 開頭。
 #
-# ★ 沒設 VARIANT 就直接起不來，不給預設值。給了預設值的話，eli 的服務忘記
-#   設定就會安靜地變成「接受 /v/tutor-arthur、拒絕 /v/eli」——那正是那種
-#   只有某些情境才壞、上線前測不出來的失敗。起不來則是所有人一起壞，一眼
-#   就看得到；而且 Render 部署失敗會保留舊版本，現有服務不會中斷。
-VARIANT = os.environ.get("VARIANT", "").strip()
-if not VARIANT:
-    raise RuntimeError(
-        "VARIANT 未設定。這是每店部署的識別（例如 tutor-arthur、eli），"
-        "決定這個服務接受哪一個 /v/<variant> 前綴。設好環境變數再啟動。"
-    )
+# ★ 店家清單沒設好就起不來（tenancy.load 會拋），不給預設值。Render 部署
+#   失敗會保留舊版本，現有服務不會中斷。
 
 
 class _StripVariant:
@@ -174,48 +175,80 @@ app.wsgi_app = _StripVariant(app.wsgi_app)
 
 # 唯一不需要前綴的路徑，而且是**永久**的例外，不是過渡措施。
 #
-# /api/health 刻意不碰資料庫、不回任何店家資料——沒有一個欄位是 variant
-# 能區分的，所以「打錯服務」這件事在這支上不存在，斷言沒有東西可以保護。
+# /api/health 刻意不碰資料庫、不回任何店家資料——沒有一個欄位是店家能區分
+# 的，所以它不需要知道是哪一家店。
 #
 # ★ 真正的理由是它的呼叫者不歸我們管：Render 自己的健康檢查、外部的監控
 #   服務都可能打這一支，而那些地方不會帶前綴。把它一起擋掉的話，故障會是
 #   「服務被判定為不健康而反覆重啟」——跟店家隔離完全無關，卻很難聯想到
-#   是這個斷言造成的。
+#   是這個檢查造成的。
 _NO_PREFIX_OK = {"/api/health"}
 
 
 @app.before_request
-def _assert_variant():
-    """每個請求都要帶對的部署識別前綴。
+def _select_tenant():
+    """依前綴決定這個請求是哪一家店；之後這個請求碰到的一切都是那一家的。
 
-    兩種拒絕：**沒帶前綴**（多半是設定漏改）與**帶錯前綴**（打到別家店的
-    服務）。兩者都回 404 並說清楚正確的網址長什麼樣——這支斷言存在的意義
-    就是把設定錯誤變成看得見的失敗，訊息含糊就等於沒做。
+    三種拒絕，都說清楚網址該長什麼樣（設定錯誤要看得見）：
+      - **沒帶前綴**（多半是前端或排程的網址漏改）：404
+      - **前綴不是這個服務的任何一家店**：404
+      - **來源（Origin）不是這家店的前端**：403，見下面
 
-    ★ 這裡**不是**用來決定連哪個資料庫。variant 從環境變數來，這個 process
-      手上只有一組 DATABASE_URL，連不到別家店的資料庫。這裡擋的是「前端網址
-      填錯」，不是隔離。
+    ★ 錯誤訊息**不列出**這個服務有哪些店。路過的人亂猜前綴，不該拿到客戶名單。
+
+    ★ 每個請求一開始都會重設目前的店家（沒帶前綴就設成「沒有」）。gunicorn
+      的執行緒會被重複使用，不重設的話，上一個請求的店家會留給下一個。
     """
     got = request.environ.get("boo_king_king.variant")
+    tenant = tenancy.get(got) if got is not None else None
+    g.tenant_token = tenancy.activate(tenant)
 
     if got is None:
         if request.path in _NO_PREFIX_OK:
             return None
         return jsonify({
-            "error": "缺少部署識別前綴",
-            "detail": f"正確的網址是 /v/{VARIANT}{request.path}",
+            "error": "缺少店家識別前綴",
+            "detail": f"網址要以 /v/<店家識別>/ 開頭，例如 /v/<店家識別>{request.path}",
         }), 404
 
-    if got != VARIANT:
+    if tenant is None:
         return jsonify({
-            "error": "打錯服務了",
-            "detail": f"這個服務是 {VARIANT}，收到的前綴是 {got or '(空的)'}",
+            "error": "找不到這家店",
+            "detail": f"網址前綴 /v/{got or '(空的)'}/ 不是這個服務的店家。請檢查前端的 API 網址。",
         }), 404
+
+    # ★ 來源檢查。CORS 名單是所有店家的聯集（見上方），所以「eli 的前端打
+    #   tutor-arthur 的 API」在瀏覽器那一關會被放行——要在這裡擋。
+    #   只看有帶 Origin 的請求：瀏覽器的跨來源請求一定會帶；排程、LINE 的
+    #   webhook、LINE App 來抓圖都不帶，它們本來就不受 CORS 管。
+    #   這一道防的是「別家店的網頁替使用者打這家店的 API」，不是防直接打 API
+    #   的人——那種人本來就要有這家店的憑證才做得了任何事。
+    origin = request.headers.get("Origin")
+    if origin and tenant.allowed_origins and origin.rstrip("/") not in tenant.allowed_origins:
+        return jsonify({
+            "error": "這個網站不能呼叫這家店的 API",
+            "detail": f"來源 {origin} 不在 {tenant.id} 的 ALLOWED_ORIGINS 裡。",
+        }), 403
 
     return None
 
 
-print(f"[info] variant = {VARIANT}（接受 /v/{VARIANT}/... 前綴）", flush=True)
+@app.teardown_request
+def _release_tenant(_exc):
+    """請求結束，把目前的店家還原（見 _select_tenant 的說明）。"""
+    token = g.pop("tenant_token", None)
+    if token is not None:
+        tenancy.deactivate(token)
+
+
+for _t in tenancy.all_tenants():
+    print(
+        f"[info] 店家 {_t.id}：接受 /v/{_t.id}/... ｜"
+        f"Google client {'已設定' if _t.google_client_id else '未設定（登入會失敗）'} ｜"
+        f"排程 token {'已設定' if _t.job_token else '未設定（排程端點停用）'} ｜"
+        f"LINE {'啟用' if _t.line_enabled else '停用'}",
+        flush=True,
+    )
 
 # 啟動時說一聲通知信是開還是關。
 #
@@ -231,16 +264,9 @@ else:
         flush=True,
     )
 
-# 同一個理由：LINE 沒設定時整包停用，而「停用」在外面看起來跟「正常」
-# 一模一樣——群組裡 tag bot 沒反應，沒有人會知道是憑證沒設。
-if line_client.enabled():
-    print("[info] LINE bot 已啟用（訂場、查詢 + 推播）", flush=True)
-else:
-    print(
-        "[warn] LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN 未設定，"
-        "LINE bot 停用——webhook 會回 503。",
-        flush=True,
-    )
+# LINE 是每家店各自的（上面那一行有寫每家店的狀態）。沒設定時整包停用，
+# 而「停用」在外面看起來跟「正常」一模一樣——群組裡 tag bot 沒反應，沒有人
+# 會知道是憑證沒設，所以每次啟動都要印出來。
 
 # Flask 預設會把 JSON 物件的鍵照字母排序輸出。對大部分回應無所謂，但
 # 管理員場次管理的 tabs 是「照營運流程排的子頁籤順序」
@@ -249,20 +275,34 @@ else:
 # 定義的順序原樣傳到前端。
 app.json.sort_keys = False
 
-# 連線池建立時是 open=False（避免在 import 期就連線，那個時間點 .env 可能
-# 還沒載入）。到這裡環境變數已經就緒，可以打開了。
+# 啟動時把每家店的資料表建好（建表本身在 db/schema.ensure_ready，每家店第一次
+# 連線時跑）。
 #
 # 放在模組層而不是 __main__：正式環境用 gunicorn 之類的 WSGI 伺服器啟動時
-# 不會執行 __main__，只放那裡的話線上會是一個永遠沒打開的池子。
+# 不會執行 __main__。
 #
-# min_size=0，所以 open() 本身不會真的建立任何連線，只是把池子標成可用——
-# 這裡不會因為 Neon 正在冷啟動而卡住。
-pool.open()
+# ★ 兩種失敗分開處理：
+#   - **連不上**某家店的資料庫（Neon 暫時不通、正在冷啟動太久）：印警告、
+#     繼續啟動。那家店第一次被請求時會再試一次，其他店不受影響——一家店的
+#     資料庫出狀況，不該讓所有店一起起不來。
+#   - **連得上但建表失敗**（遷移寫錯）：讓服務起不來。那是程式錯誤，而且多半
+#     每家店都會中；起不來的話 Render 會保留舊版本，現有服務不中斷，而且
+#     一眼就看得到。
+import psycopg  # noqa: E402
 
-with pool.connection() as _conn:
-    with _conn.cursor() as _cur:
-        ensure_schema(_cur)
-        _conn.commit()
+for _t in tenancy.all_tenants():
+    with tenancy.use(_t):
+        try:
+            psycopg.connect(_t.database_url, connect_timeout=10).close()
+        except psycopg.OperationalError as _exc:
+            print(
+                f"[warn] 店家 {_t.id} 的資料庫現在連不上（{type(_exc).__name__}）。"
+                f"先略過，第一次有請求時再建表。",
+                flush=True,
+            )
+            continue
+        with pool.connection():
+            pass  # 第一次連線會跑 ensure_ready，建表失敗就在這裡拋出來
 
 
 def bad_request(message: str):
@@ -331,22 +371,37 @@ def health():
     return jsonify({"status": "ok"})
 
 
+def _job_token_error():
+    """排程與統計端點的通行證檢查。通過回 None，不通過回錯誤回應。
+
+    token 是**這家店**的 JOB_TOKEN。每家店一組：一家店的 token 外流，
+    只能觸發那一家的排程。沒設就一律拒絕——預設關閉，不是預設開放。
+
+    ★ 用 hmac.compare_digest 而不是 ==：字串比較在第一個不同的字元就回傳，
+      回應時間會洩漏「對了幾個字元」（同 line_utils/signature.py 的理由）。
+    """
+    expected = tenancy.current().job_token
+    if not expected:
+        return jsonify({"error": "JOB_TOKEN 未設定，此端點停用"}), 503
+    got = request.headers.get("X-Job-Token") or ""
+    if not hmac.compare_digest(got.encode(), expected.encode()):
+        return jsonify({"error": "未授權"}), 401
+    return None
+
+
 @app.post("/api/jobs/daily")
 def run_daily_jobs():
-    """每日排程的觸發點（cron-job.org 每天 00:00 打這一支）。
+    """每日排程的觸發點（cron-job.org 每天 00:00 打這一支，每家店一支）。
 
     用 JOB_TOKEN 保護，不掛 require_role：這支不是由人呼叫的，沒有登入
-    session 可用。token 從環境變數讀，沒設就一律拒絕——預設關閉，不是
-    預設開放。
+    session 可用。
 
     任何一段出錯就回 500，讓排程服務按它自己的設定重試。重跑是安全的
     （見 jobs.py），所以重試不會有副作用。
     """
-    expected = os.environ.get("JOB_TOKEN")
-    if not expected:
-        return jsonify({"error": "JOB_TOKEN 未設定，排程端點停用"}), 503
-    if request.headers.get("X-Job-Token") != expected:
-        return jsonify({"error": "未授權"}), 401
+    error = _job_token_error()
+    if error:
+        return error
 
     result = jobs.run_daily(pool)
     return jsonify(result), (500 if result.get("errors") else 200)
@@ -362,11 +417,9 @@ def run_weekly_jobs():
 
     保護方式與重跑安全性都跟每日排程相同（見 jobs.py）。
     """
-    expected = os.environ.get("JOB_TOKEN")
-    if not expected:
-        return jsonify({"error": "JOB_TOKEN 未設定，排程端點停用"}), 503
-    if request.headers.get("X-Job-Token") != expected:
-        return jsonify({"error": "未授權"}), 401
+    error = _job_token_error()
+    if error:
+        return error
 
     result = jobs.run_weekly(pool)
     return jsonify(result), (500 if result.get("errors") else 200)
@@ -567,12 +620,11 @@ def idle_gap_stats():
       所以改用跟每日排程同一組的 X-Job-Token，那只是比對一個環境變數。
 
     沒設 JOB_TOKEN 就整支關閉，跟 /api/jobs/daily 一樣預設關著。
+    數字都是**這家店**的（每家店是自己的 Neon 專案，各自休眠）。
     """
-    expected = os.environ.get("JOB_TOKEN")
-    if not expected:
-        return jsonify({"error": "未設定 JOB_TOKEN，此端點停用"}), 503
-    if request.headers.get("X-Job-Token") != expected:
-        return jsonify({"error": "未授權"}), 401
+    error = _job_token_error()
+    if error:
+        return error
     return jsonify({**idle_gap.stats(), "slot_cache": slot_cache.stats(),
         "notifications": notifications.stats()})
 
@@ -583,11 +635,13 @@ def ready():
     （那會讓每次保活都把 Neon 喚醒，把免費的 CU-hours 額度燒掉）。"""
     # ★ 只回報「有沒有設定」，不回報值。設定錯誤最難查的地方在於它跟
     #   「憑證真的無效」回同一句 401——部署後光看錯誤訊息分不出是哪一種。
-    #   這裡把「設定面」攤開，但不洩漏任何秘密。
+    #   這裡把「設定面」攤開，但不洩漏任何秘密。都是**這家店**的設定。
+    tenant = tenancy.current()
     config = {
-        "google_client_id": bool(os.environ.get("GOOGLE_CLIENT_ID")),
-        "allowed_origins": _origins or "（未設定，放行全部）",
-        "job_token": bool(os.environ.get("JOB_TOKEN")),
+        "google_client_id": bool(tenant.google_client_id),
+        "allowed_origins": list(tenant.allowed_origins) or "（未設定，放行全部）",
+        "job_token": bool(tenant.job_token),
+        "line": tenant.line_enabled,
     }
     try:
         with pool.connection() as conn:
@@ -610,10 +664,7 @@ def ready():
         stats = pool.get_stats()
         detail = None
         try:
-            import psycopg
-            with psycopg.connect(
-                os.environ.get("DATABASE_URL", ""), connect_timeout=10
-            ) as _c:
+            with psycopg.connect(tenant.database_url, connect_timeout=10) as _c:
                 with _c.cursor() as _cur:
                     _cur.execute("SELECT 1")
                     _cur.fetchone()

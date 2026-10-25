@@ -17,16 +17,13 @@
 from __future__ import annotations
 
 import os
-import threading
-import time
+
+import tenancy
 
 # 跟 roles / settings 同一個理由：這張表只有幾列、幾乎不會變，而它被每一次
 # 回覆讀到。
 _CACHE_TTL_SECONDS = float(os.environ.get("LINE_TEMPLATE_CACHE_TTL_SECONDS", "600"))
 
-_lock = threading.Lock()
-_cache: dict[str, str] | None = None
-_expires_at = 0.0
 
 
 class LineTemplateError(RuntimeError):
@@ -38,29 +35,17 @@ def _load(cur) -> dict[str, str]:
     return {k: v for k, v in cur.fetchall()}
 
 
+# 每家店一份（各家的回覆文字可以不同）。
+_cache = tenancy.TableCache(_CACHE_TTL_SECONDS, lambda cur: _load(cur))
+
+
 def all_templates(cur) -> dict[str, str]:
-    global _cache, _expires_at
-    now = time.monotonic()
-    with _lock:
-        if _cache is not None and _expires_at > now:
-            return _cache
-
-    # 查詢放在鎖外面，理由同 db/roles.py：鎖只保護那個字典，包住網路
-    # 操作的話，一次連線變慢會讓所有請求一起卡住。
-    loaded = _load(cur)
-
-    with _lock:
-        _cache = loaded
-        _expires_at = time.monotonic() + _CACHE_TTL_SECONDS
-    return loaded
+    return _cache.get(cur)
 
 
 def invalidate() -> None:
-    """用 SQL 改完之後叫這支，下一次讀取就會重新載入。"""
-    global _cache, _expires_at
-    with _lock:
-        _cache = None
-        _expires_at = 0.0
+    """用 SQL 改完之後叫這支，下一次讀取就會重新載入（只作廢目前這家店的）。"""
+    _cache.invalidate()
 
 
 def render(cur, key: str, **values) -> str:

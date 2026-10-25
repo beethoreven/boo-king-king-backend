@@ -11,13 +11,15 @@ Google ID Token 的驗證。
 
 正確做法是登入時用它換一張我們自己簽發的 session token（見
 auth_utils/sessions.py），之後一律用那張。
+
+★ 多店家：每家店有自己的 Google OAuth client（各自的同意畫面、各自的授權
+  來源），驗證時比對的 audience 是**這個請求那家店**的 client ID。
 """
 
 from __future__ import annotations
 
 import base64
 import json
-import os
 import re
 
 import cachecontrol
@@ -25,11 +27,14 @@ import requests as requests_lib
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+import tenancy
 
 # 在模組層建立一次就好。這個物件內部包著一個 HTTP session，重複使用可以
 # 沿用已經建立的連線去取 Google 的公開金鑰；每次驗證都 new 一個等於每次
 # 重新握手。
+#
+# ★ 它刻意是全行程共用的（不分店家）：裡面快取的是 Google 的公開金鑰，
+#   每家店都一樣，跟哪家店的使用者無關。
 #
 # ★ 這裡原本寫著「google-auth 會自己處理金鑰的取得與輪替，不用我們管」。
 #   **那是錯的。** 讀過套件原始碼（2.32.0 與最新的 2.50.0 完全一樣）：
@@ -117,14 +122,15 @@ def extract_bearer_token(request) -> str | None:
 def verify_google_id_token(token: str) -> str | None:
     """驗證 Google ID Token，回傳已驗證的 email；失敗回傳 None。
 
-    verify_oauth2_token 會一次檢查簽章、有效期限與 audience（必須是我們自己
+    verify_oauth2_token 會一次檢查簽章、有效期限與 audience（必須是**這家店**
     的 GOOGLE_CLIENT_ID——少了這項檢查，任何人拿其他 Google 應用簽發的
     token 都能通過）。
 
     另外要求 email_verified：Google 帳號可以綁一個未經驗證的 email，
     沒檢查這個等於接受任何人自稱的信箱。
     """
-    if not token or not GOOGLE_CLIENT_ID:
+    client_id = tenancy.current().google_client_id
+    if not token or not client_id:
         return None
     # 形狀不對的連 Google 都不用問（見上方 _JWT_SHAPE）。
     if len(token) > _MAX_ID_TOKEN_LENGTH or not _JWT_SHAPE.match(token):
@@ -133,7 +139,7 @@ def verify_google_id_token(token: str) -> str | None:
         return None
     try:
         payload = google_id_token.verify_oauth2_token(
-            token, _google_request, GOOGLE_CLIENT_ID
+            token, _google_request, client_id
         )
     except Exception:  # noqa: BLE001
         # 刻意不只攔 ValueError（google-auth 對格式錯誤／簽章不符／過期／

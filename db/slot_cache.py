@@ -93,6 +93,8 @@ import os
 import threading
 import time
 
+import tenancy
+
 # 一筆快取活多久。3 秒是在「省下多少查詢」與「最多錯多久」之間取的：
 #
 # 開賣那一分鐘值大約每 2 秒變一次，所以再長也沒有意義；而縮短的代價
@@ -110,15 +112,29 @@ import time
 #   一筆之後，有一半的讀取會看到半分鐘的舊答案。
 _TTL_SECONDS = float(os.environ.get("SLOT_CACHE_TTL_SECONDS", "3"))
 
-# (mmg_id, 日期 ISO, 時間 HH:MM) -> (到期的 monotonic 時間, 回應 dict)
-_cache: dict[tuple[int, str, str], tuple[float, dict]] = {}
-_lock = threading.Lock()
+class _State:
+    """一家店的那一份。
 
-# 診斷用的計數。命中率是「這件事到底值不值得做」的唯一答案，
-# 不量的話就只能繼續用猜的。
-_hits = 0
-_misses = 0
-_clears = 0
+    ★ 每家店一份，不是把店家塞進 key。兩家店的劇本編號各自從 1 開始，
+      key 只有 (劇本, 日期, 時間) 的話，A 店 1 號劇本的時段會被 B 店 1 號
+      劇本的查詢讀到（劇本名稱、容量都是 A 店的）。分開放還有一個好處：
+      clear() 只清這家店的，別家的快取不會因為這家店有人訂場就作廢。
+    """
+
+    __slots__ = ("entries", "hits", "misses", "clears")
+
+    def __init__(self) -> None:
+        # (mmg_id, 日期 ISO, 時間 HH:MM) -> (到期的 monotonic 時間, 回應 dict)
+        self.entries: dict[tuple[int, str, str], tuple[float, dict]] = {}
+        # 診斷用的計數。命中率是「這件事到底值不值得做」的唯一答案，
+        # 不量的話就只能繼續用猜的。
+        self.hits = 0
+        self.misses = 0
+        self.clears = 0
+
+
+_state = tenancy.PerTenant(_State)
+_lock = threading.Lock()
 
 
 def enabled() -> bool:
@@ -138,31 +154,32 @@ def key(mmg_id: int, session_date, session_time) -> tuple[int, str, str]:
 
 
 def get(k: tuple[int, str, str]) -> dict | None:
-    """取一筆還沒過期的快取。沒有就回 None。"""
-    global _hits, _misses
+    """取一筆還沒過期的快取（目前這家店的）。沒有就回 None。"""
     if _TTL_SECONDS <= 0:
         return None
+    state = _state.get()
     now = time.monotonic()
     with _lock:
-        hit = _cache.get(k)
+        hit = state.entries.get(k)
         if hit is not None and hit[0] > now:
-            _hits += 1
+            state.hits += 1
             # 回複本。呼叫端拿去改（例如補上欄位）不該污染快取裡那一份。
             return dict(hit[1])
-        _misses += 1
+        state.misses += 1
         return None
 
 
 def put(k: tuple[int, str, str], value: dict) -> None:
-    """放一筆進去。"""
+    """放一筆進去（目前這家店的）。"""
     if _TTL_SECONDS <= 0:
         return
+    state = _state.get()
     with _lock:
-        _cache[k] = (time.monotonic() + _TTL_SECONDS, dict(value))
+        state.entries[k] = (time.monotonic() + _TTL_SECONDS, dict(value))
 
 
 def clear() -> None:
-    """清空整份快取。任何預約寫入都要呼叫——理由見檔案開頭。
+    """清空目前這家店的整份快取。任何預約寫入都要呼叫——理由見檔案開頭。
 
     ★ 這支被呼叫的位置在寫入函式**裡面**，也就是在交易 commit 之前。
       清空到 commit 之間有一個很短的窗口，落在那裡的讀取會快取到寫入前
@@ -170,24 +187,25 @@ def clear() -> None:
       commit 之後可以縮小窗口，但代價是每個呼叫端都要記得補一行，
       而漏掉一個的後果比這個窗口嚴重得多。
     """
-    global _clears
+    state = _state.get()
     with _lock:
-        _cache.clear()
-        _clears += 1
+        state.entries.clear()
+        state.clears += 1
 
 
 def stats() -> dict:
-    """命中率等統計。★ 這支不可以碰資料庫（跟 idle_gap.stats 同理）。"""
+    """目前這家店的命中率等統計。★ 這支不可以碰資料庫（跟 idle_gap.stats 同理）。"""
+    state = _state.get()
     with _lock:
-        total = _hits + _misses
+        total = state.hits + state.misses
         return {
             "enabled": _TTL_SECONDS > 0,
             "ttl_seconds": _TTL_SECONDS,
-            "entries": len(_cache),
-            "hits": _hits,
-            "misses": _misses,
-            "hit_rate": round(_hits / total, 3) if total else None,
-            "clears": _clears,
+            "entries": len(state.entries),
+            "hits": state.hits,
+            "misses": state.misses,
+            "hit_rate": round(state.hits / total, 3) if total else None,
+            "clears": state.clears,
             "pid": os.getpid(),
             "note": (
                 "per-process：多 worker 時每個 worker 各有一份快取，"

@@ -28,8 +28,8 @@
 from __future__ import annotations
 
 import os
-import threading
-import time
+
+import tenancy
 
 # 這家店的功能設定活多久。10 分鐘，理由同 db/roles.py：這張表六列、
 # 幾乎不會變，而它被每一次預約寫入讀到。
@@ -70,11 +70,6 @@ ALLOWED = {
 #   主持人都變成同一個陌生人），不是那種查不出來的錯。
 SINGLE_GM_USER_ID = 1
 
-_lock = threading.Lock()
-_cache: dict[str, str] | None = None
-_expires_at = 0.0
-
-
 class FunctionError(RuntimeError):
     """功能表的值不合法。這是設定錯誤，不是使用者的錯。"""
 
@@ -95,30 +90,18 @@ def _load(cur) -> dict[str, str]:
     return got
 
 
+# 每家店一份（各家的功能組態本來就不同）。
+_cache = tenancy.TableCache(_CACHE_TTL_SECONDS, lambda cur: _load(cur))
+
+
 def all_functions(cur) -> dict[str, str]:
     """整張表，key -> value。帶快取。"""
-    global _cache, _expires_at
-    now = time.monotonic()
-    with _lock:
-        if _cache is not None and _expires_at > now:
-            return _cache
-
-    # ★ 查詢刻意放在鎖外面，理由同 db/roles.py：鎖只保護那個字典，
-    #   包住網路操作的話，一次連線變慢就會讓所有請求一起卡住。
-    loaded = _load(cur)
-
-    with _lock:
-        _cache = loaded
-        _expires_at = time.monotonic() + _CACHE_TTL_SECONDS
-    return loaded
+    return _cache.get(cur)
 
 
 def invalidate() -> None:
-    """用 SQL 改完之後叫這支，下一次讀取就會重新載入。"""
-    global _cache, _expires_at
-    with _lock:
-        _cache = None
-        _expires_at = 0.0
+    """用 SQL 改完之後叫這支，下一次讀取就會重新載入（只作廢目前這家店的）。"""
+    _cache.invalidate()
 
 
 def get(cur, key: str) -> str:

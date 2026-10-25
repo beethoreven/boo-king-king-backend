@@ -13,6 +13,7 @@ from functools import wraps
 
 from flask import g, jsonify, request
 
+import tenancy
 from auth_utils import guard, whitelist
 from auth_utils.google_auth import extract_bearer_token
 from auth_utils import sessions as sessions_mod
@@ -112,16 +113,29 @@ def _authenticate() -> tuple[dict | None, tuple | None]:
 # 停權畫面要顯示「本店管理員是誰」。這個值幾乎不變，但被停權的人可能一直
 # 重打——不快取的話，每一次被擋下來都要多一次資料庫查詢，等於把停權畫面
 # 變成一個放大器。
+#
+# ★ 每家店一份：「本店」的管理員。只存一份的話，B 店被停權的人會看到 A 店
+#   管理員的名字。
 _ADMIN_NAME_TTL_SECONDS = 600
-_admin_name_cache: tuple[float, str | None] = (0.0, None)
+
+
+class _AdminName:
+    __slots__ = ("expires_at", "name")
+
+    def __init__(self) -> None:
+        self.expires_at = 0.0
+        self.name: str | None = None
+
+
+_admin_name = tenancy.PerTenant(_AdminName)
 
 
 def admin_display_name() -> str | None:
     """role 1 的管理員叫什麼。查不到就回 None，讓前端自己決定怎麼講。"""
-    global _admin_name_cache
+    cached = _admin_name.get()
     now = time.monotonic()
-    if _admin_name_cache[0] > now:
-        return _admin_name_cache[1]
+    if cached.expires_at > now:
+        return cached.name
     name = None
     try:
         with pool.connection() as conn:
@@ -134,7 +148,7 @@ def admin_display_name() -> str | None:
                 name = row[0] if row else None
     except Exception:  # noqa: BLE001 - 顯示用的資訊，查不到不該讓請求失敗
         pass
-    _admin_name_cache = (now + _ADMIN_NAME_TTL_SECONDS, name)
+    cached.expires_at, cached.name = now + _ADMIN_NAME_TTL_SECONDS, name
     return name
 
 

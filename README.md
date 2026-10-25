@@ -4,21 +4,25 @@
 
 ## 本機開發
 
-第一次設定：
+第一次設定（Python 版本照 `.python-version`，跟正式環境同一個小版本；
+用 pyenv 的話它會自己挑對的）：
 
 ```bash
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # 填入實際 DATABASE_URL 與 GOOGLE_CLIENT_ID
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements-dev.txt
+cp .env.example .env   # 單店寫法：VARIANT、DATABASE_URL、GOOGLE_CLIENT_ID
 ```
+
+★ 本機 `.env` 指的是 **demo 的資料庫**（`boo-king-king-tutor-arthur-demo`）。不要
+  指到任何一家正式店家的資料庫——import app 就會對它跑建表。
 
 啟動（每次開發都是這一行）：
 
 ```bash
-./venv/bin/python app.py
+./.venv/bin/python app.py
 ```
 
-直接指向 venv 裡的直譯器，不需要先 `activate`。跑在 **5001**，不是 5000——
+直接指向 .venv 裡的直譯器，不需要先 `activate`。跑在 **5001**，不是 5000——
 macOS 的 AirPlay 接收器佔用 5000，而且是回 403 不是拒絕連線，症狀看起來會
 像應用程式自己壞了。
 
@@ -31,6 +35,14 @@ Google OAuth 的 authorized origins 是連 port 一起比對的。
 curl -s localhost:5001/api/health
 ```
 
+跑測試（不碰任何 Neon 專案——跨店測試會自己起一個臨時的本機 Postgres，跑完關掉刪掉）：
+
+```bash
+./.venv/bin/python -m pytest
+```
+
+（舊的 `venv/` 是 Python 3.9 時代留下的，已經不用了，可以刪。）
+
 前端在另一個 repo（boo-king-king-web），用 `python3 -m http.server 5173` 起，
 直接開 <http://localhost:5173> 就好——前端偵測到跑在 localhost 上會自動打
 `http://localhost:5001`，不用帶參數。要對別的後端測就帶 `?apiBase=`，
@@ -38,11 +50,17 @@ curl -s localhost:5001/api/health
 
 ## 已定案的架構決策
 
-- 連線層：`db/connection.py`，**每次請求各自開一條連線 + `BoundedSemaphore(5)` 當
-  反壓上限**。原本用 psycopg3 的 `ConnectionPool`，在 Render 免費方案上會永久卡死
+- **一個服務可以服務好幾家店（2026-10-25）**：每個請求依網址前綴 `/v/<店家>`
+  連那一家自己的資料庫。每家店仍是自己的 Neon 專案。越權的防線是「登入憑證存在
+  各店自己的資料庫」＋「行程內的快取一律按店家分開」。**新增任何快取、計數、旗標
+  都要用 `tenancy.PerTenant` / `tenancy.TableCache`**——`tests/test_tenant_state.py`
+  會掃整個後端，沒用的直接失敗；`tests/test_cross_tenant.py` 用兩家測試店驗證結果。
+  設定的兩種寫法（單店／多店家）見 `.env.example` 與 `tenancy.py` 開頭
+- 連線層：`db/connection.py`，**每次請求各自開一條連線 + 號誌當反壓上限**（整台
+  機器 5 條、每家店 3 條）。原本用 psycopg3 的 `ConnectionPool`，在 Render 免費方案上會永久卡死
   （容器凍結後池子的背景執行緒不恢復），2026-08-31 實測後換掉，完整理由見檔案內註解
 - 防超賣：per-slot advisory lock（鍵是「劇本+日期+時間」）鎖住該場次後才數容量，
-  容量 = `1 + mmg.waitlist_limit` 組；主持人撞期另有 per-GM advisory lock，
+  容量 = `mmg.waitlist_limit` 組（含已成立的那一組）；主持人撞期另有 per-GM advisory lock，
   多把鎖依排序取得避免死鎖。實作見 `db/bookings.py` 的 `_lock_slot` / `_lock_gms`
 - 冪等鍵：`UNIQUE (request_id)` + `ON CONFLICT DO NOTHING`，由前端在「按下送出」
   那一刻產生一組 UUID；日期/時間/主持人任一改變就換新的，否則改了日期會被當成同一筆

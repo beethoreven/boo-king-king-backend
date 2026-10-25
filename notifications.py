@@ -31,6 +31,13 @@ API key 過期——這些都不該讓玩家看到「預約失敗」。所以這
 兩層是不同的問題（「管理員收不收信」vs「記點通知要不要發」），所以沒有合併。
 
 沒有設定 BREVO_API_KEY 時整支靜默停用——本機開發不會誤寄信給真人。
+
+## 多店家
+
+所有店共用一個 Brevo 帳號（BREVO_API_KEY 不分店）。店家之間不同的是寄件人、
+店名、範本——那些都在各店自己的資料庫裡，快取也是每家店一份。
+背景執行緒與佇列是全行程共用的：每封 Message 在請求裡就組好、自帶店家
+識別，執行緒只負責送出，不讀任何店家狀態。
 """
 
 from __future__ import annotations
@@ -41,11 +48,11 @@ import os
 import queue
 import re
 import threading
-import time
 from dataclasses import dataclass
 
 import requests
 
+import tenancy
 from db import roles
 
 log = logging.getLogger(__name__)
@@ -71,52 +78,41 @@ def enabled() -> bool:
 
 # ── 設定與範本的快取 ────────────────────────────────────────────
 #
-# 做法與 db/roles.py 一模一樣：字典 + TTL + 鎖，查詢刻意放在鎖外面。
+# 做法與 db/roles.py 一模一樣（tenancy.TableCache，每家店一份）。
 # 這兩張表加起來不到十列、幾乎不會變，而每寄一封信就要讀一次。
 
-_lock = threading.Lock()
-_settings_cache: dict[str, str] | None = None
-_settings_expires = 0.0
-_tpl_cache: dict[str, dict] | None = None
-_tpl_expires = 0.0
+
+def _load_settings(cur) -> dict[str, str]:
+    cur.execute("SELECT key, value FROM settings")
+    return {k: (v or "") for k, v in cur.fetchall()}
+
+
+def _load_templates(cur) -> dict[str, dict]:
+    cur.execute("SELECT key, subject, body_html, enabled FROM notification_template")
+    return {
+        r[0]: {"subject": r[1], "body": r[2], "enabled": r[3]} for r in cur.fetchall()
+    }
+
+
+_settings_cache = tenancy.TableCache(_ROW_TTL_SECONDS, _load_settings)
+_tpl_cache = tenancy.TableCache(_ROW_TTL_SECONDS, _load_templates)
 
 
 def settings(cur) -> dict[str, str]:
     """站台設定，key -> value。帶快取。"""
-    global _settings_cache, _settings_expires
-    with _lock:
-        if _settings_cache is not None and _settings_expires > time.monotonic():
-            return _settings_cache
-    cur.execute("SELECT key, value FROM settings")
-    loaded = {k: (v or "") for k, v in cur.fetchall()}
-    with _lock:
-        _settings_cache = loaded
-        _settings_expires = time.monotonic() + _ROW_TTL_SECONDS
-    return loaded
+    return _settings_cache.get(cur)
 
 
 def templates(cur) -> dict[str, dict]:
     """全部範本，key -> {subject, body, enabled}。帶快取。"""
-    global _tpl_cache, _tpl_expires
-    with _lock:
-        if _tpl_cache is not None and _tpl_expires > time.monotonic():
-            return _tpl_cache
-    cur.execute("SELECT key, subject, body_html, enabled FROM notification_template")
-    loaded = {
-        r[0]: {"subject": r[1], "body": r[2], "enabled": r[3]} for r in cur.fetchall()
-    }
-    with _lock:
-        _tpl_cache = loaded
-        _tpl_expires = time.monotonic() + _ROW_TTL_SECONDS
-    return loaded
+    return _tpl_cache.get(cur)
 
 
 def invalidate() -> None:
-    """用 SQL 改完 settings 或 notification_template 之後想立刻生效就呼叫它。"""
-    global _settings_cache, _settings_expires, _tpl_cache, _tpl_expires
-    with _lock:
-        _settings_cache = _tpl_cache = None
-        _settings_expires = _tpl_expires = 0.0
+    """用 SQL 改完 settings 或 notification_template 之後想立刻生效就呼叫它
+    （只作廢目前這家店的）。"""
+    _settings_cache.invalidate()
+    _tpl_cache.invalidate()
 
 
 # ── 代入變數 ────────────────────────────────────────────────────
@@ -253,6 +249,9 @@ class Message:
     sender: dict        # {"email": ..., "name": ...}
     subject: str
     html_body: str
+    # 哪一家店的信。只給 log 與統計用——背景執行緒沒有請求情境，
+    # 要知道是哪家店的信寄失敗，只能靠信自己帶著。
+    tenant: str = ""
 
 
 def build(cur, key: str, recipients: list[dict], values: dict) -> Message | None:
@@ -278,6 +277,7 @@ def build(cur, key: str, recipients: list[dict], values: dict) -> Message | None
         },
         subject=render(tpl["subject"], values),
         html_body=render(tpl["body"], values, body=True),
+        tenant=tenancy.current().id,
     )
 
 
@@ -344,14 +344,28 @@ def users_by_id(cur, user_ids: list[int]) -> list[dict]:
 _outbox: queue.Queue | None = None
 _worker: threading.Thread | None = None
 _worker_lock = threading.Lock()
-_sent = 0
-_failed = 0
-_dropped = 0
+
+
+class _Counts:
+    __slots__ = ("sent", "failed", "dropped")
+
+    def __init__(self) -> None:
+        self.sent = self.failed = self.dropped = 0
+
+
+# 每家店一份。背景執行緒依信上的 tenant 記帳（for_tenant），請求裡用 get()。
+_counts = tenancy.PerTenant(_Counts)
+_counts_lock = threading.Lock()
+
+
+def _count(tenant_id: str, field: str) -> None:
+    counts = _counts.for_tenant(tenant_id)
+    with _counts_lock:
+        setattr(counts, field, getattr(counts, field) + 1)
 
 
 def _run() -> None:
     """背景執行緒。一封一封寄，永遠不讓例外逃出去終結自己。"""
-    global _sent, _failed
     while True:
         msg = _outbox.get()
         try:
@@ -371,15 +385,16 @@ def _run() -> None:
                 timeout=_TIMEOUT_SECONDS,
             )
             if resp.status_code // 100 == 2:
-                _sent += 1
+                _count(msg.tenant, "sent")
             else:
-                _failed += 1
+                _count(msg.tenant, "failed")
                 # 內容不進 log：主旨含劇本名與玩家暱稱。狀態碼與 Brevo 的
-                # 錯誤訊息才是排查要用的東西。
-                log.warning("brevo %s: %s", resp.status_code, resp.text[:300])
+                # 錯誤訊息才是排查要用的東西。店家要自己寫進去——這條執行緒
+                # 沒有請求情境，log 的店家標記會是「-」。
+                log.warning("brevo [%s] %s: %s", msg.tenant, resp.status_code, resp.text[:300])
         except Exception as exc:  # noqa: BLE001 - 寄信失敗只留紀錄
-            _failed += 1
-            log.warning("brevo 送出失敗: %s", exc)
+            _count(msg.tenant, "failed")
+            log.warning("brevo [%s] 送出失敗: %s", msg.tenant, exc)
         finally:
             _outbox.task_done()
 
@@ -402,7 +417,6 @@ def dispatch(*messages) -> None:
     參數可以是 Message、None，或它們的 list——這樣呼叫端不必先過濾，
     「這次沒有要寄的信」直接傳 None 就好。
     """
-    global _dropped
     flat: list[Message] = []
     for m in messages:
         if m is None:
@@ -416,17 +430,19 @@ def dispatch(*messages) -> None:
             try:
                 _outbox.put_nowait(msg)
             except queue.Full:
-                _dropped += 1
-                log.warning("通知佇列已滿，丟棄一封")
+                _count(msg.tenant, "dropped")
+                log.warning("通知佇列已滿，丟棄一封（%s）", msg.tenant)
     except Exception as exc:  # noqa: BLE001 - 寄信永遠不該拖垮呼叫端
         log.warning("通知排隊失敗: %s", exc)
 
 
 def stats() -> dict:
+    """目前這家店的寄信統計。queued 是全部店家共用的那一條佇列。"""
+    counts = _counts.get()
     return {
         "enabled": enabled(),
-        "sent": _sent,
-        "failed": _failed,
-        "dropped": _dropped,
+        "sent": counts.sent,
+        "failed": counts.failed,
+        "dropped": counts.dropped,
         "queued": _outbox.qsize() if _outbox else 0,
     }

@@ -32,6 +32,9 @@ Neon 免費方案閒置 5 分鐘就會讓 compute 休眠，每月額度 100 CU-h
 
 也就是說多 worker 時這是個上界，方向偏保守（傾向讓你以為會休眠）。
 單 worker 時才是精確值。輸出裡附上 worker 數就是為了不要被誤讀。
+
+★ 每家店一份。每家店是自己的 Neon 專案、各自休眠，間隔當然要分開量——
+  混在一起的話，A 店的流量會把 B 店的間隔壓短，看起來像 B 店從來不睡。
 """
 
 from __future__ import annotations
@@ -40,6 +43,8 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
+
+import tenancy
 
 # 分佈的分界（秒）。5 分鐘那一刀是 Neon 的休眠門檻，是這整份統計的重點：
 # 落在 5 分鐘以上的間隔，每一個都代表 compute 有機會睡掉。
@@ -50,11 +55,20 @@ _BUCKETS = [
     (">15m", float("inf")),
 ]
 
+class _Gaps:
+    """一家店的統計。"""
+
+    __slots__ = ("last", "max_gap", "count", "hist")
+
+    def __init__(self) -> None:
+        self.last: float | None = None
+        self.max_gap = 0.0
+        self.count = 0
+        self.hist = {name: 0 for name, _ in _BUCKETS}
+
+
+_gaps = tenancy.PerTenant(_Gaps)
 _lock = threading.Lock()
-_last: float | None = None
-_max_gap = 0.0
-_count = 0
-_hist = {name: 0 for name, _ in _BUCKETS}
 _started_at = datetime.now(timezone.utc)
 _started_mono = time.monotonic()
 
@@ -65,34 +79,35 @@ def mark() -> None:
     用 monotonic 而不是牆上時間：系統校時、日光節約、NTP 修正都會讓
     牆上時間往回跳，那會算出負的或荒謬的間隔。
     """
-    global _last, _max_gap, _count
+    gaps = _gaps.get()
     now = time.monotonic()
     with _lock:
-        if _last is not None:
-            gap = now - _last
-            if gap > _max_gap:
-                _max_gap = gap
+        if gaps.last is not None:
+            gap = now - gaps.last
+            if gap > gaps.max_gap:
+                gaps.max_gap = gap
             for name, upper in _BUCKETS:
                 if gap < upper:
-                    _hist[name] += 1
+                    gaps.hist[name] += 1
                     break
-        _last = now
-        _count += 1
+        gaps.last = now
+        gaps.count += 1
 
 
 def stats() -> dict:
-    """目前的統計。★ 這支不可以碰資料庫，也不可以呼叫 mark()。"""
+    """目前這家店的統計。★ 這支不可以碰資料庫，也不可以呼叫 mark()。"""
+    gaps = _gaps.get()
     now = time.monotonic()
     with _lock:
         # 「現在正在進行中的這段空檔」也要算進去，否則一段長空檔要等到
         # 它結束（下一個請求進來）才看得到——而店家打烊後最長的那一段，
         # 正好是永遠不會結束的那一段。
-        pending = (now - _last) if _last is not None else 0.0
+        pending = (now - gaps.last) if gaps.last is not None else 0.0
         return {
-            "max_gap_seconds": round(max(_max_gap, pending), 1),
+            "max_gap_seconds": round(max(gaps.max_gap, pending), 1),
             "current_gap_seconds": round(pending, 1),
-            "distribution": dict(_hist),
-            "sample_count": _count,
+            "distribution": dict(gaps.hist),
+            "sample_count": gaps.count,
             "process_started_at": _started_at.isoformat(),
             "uptime_seconds": round(now - _started_mono, 1),
             "pid": os.getpid(),

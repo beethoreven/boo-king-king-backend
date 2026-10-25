@@ -37,6 +37,8 @@ import threading
 import time
 from collections import deque
 
+import tenancy
+
 # ── 可調參數 ────────────────────────────────────────────────
 
 # 每個帳號每分鐘的請求上限。正常使用大約是這個的二十分之一——量過的
@@ -80,8 +82,11 @@ KIND_RATE_LIMIT = "rate_limit"
 # 刻意不進資料庫：這一層每個請求都會經過，為了省資源而每次寫一筆，
 # 是花更多資源。Render 休眠會讓計數歸零，但那對速率限制無所謂——
 # 重來一個窗口而已，不是安全漏洞。
+#
+# ★ 每家店一份。key 是使用者編號，而兩家店的編號各自從 1 開始——共用的話，
+#   A 店 5 號一直重整，B 店 5 號會跟著被限流。
 
-_hits: dict[int, deque] = {}
+_hits = tenancy.PerTenant(dict)  # user_id -> deque[時間]，每家店一份
 _hits_lock = threading.Lock()
 
 
@@ -92,9 +97,10 @@ def _prune(dq: deque, now: float) -> None:
 
 def check_rate(user_id: int) -> int | None:
     """記一次請求。超過上限時回傳建議的重試秒數，否則 None。"""
+    hits = _hits.get()
     now = time.monotonic()
     with _hits_lock:
-        dq = _hits.setdefault(user_id, deque())
+        dq = hits.setdefault(user_id, deque())
         _prune(dq, now)
         if len(dq) >= RATE_LIMIT_PER_MINUTE:
             # 最舊那一筆離開窗口就有額度了。
@@ -104,12 +110,13 @@ def check_rate(user_id: int) -> int | None:
 
 
 def reset_rate(user_id: int | None = None) -> None:
-    """清掉速率計數。測試與人工排除用。"""
+    """清掉速率計數（目前這家店的）。測試與人工排除用。"""
+    hits = _hits.get()
     with _hits_lock:
         if user_id is None:
-            _hits.clear()
+            hits.clear()
         else:
-            _hits.pop(user_id, None)
+            hits.pop(user_id, None)
 
 
 # ── 事件紀錄（資料庫）────────────────────────────────────────

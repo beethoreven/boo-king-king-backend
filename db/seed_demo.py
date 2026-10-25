@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
+import tenancy  # noqa: E402
 from db.connection import pool  # noqa: E402
 from db.schema import ensure_schema  # noqa: E402
 
@@ -179,12 +180,14 @@ def main() -> int:
     parser.add_argument("--show", action="store_true", help="只顯示現況，不寫入")
     args = parser.parse_args()
 
-    url = os.environ.get("DATABASE_URL", "")
-    print(f"連線目標：{url.split('@')[-1].split('/')[0] if '@' in url else '(未設定)'}")
+    # 有好幾家店時要用 TENANT=<店家> 指定（見 tenancy.for_cli）。
+    tenant = tenancy.for_cli()
+    url = tenant.database_url
+    print(f"店家：{tenant.id}　連線目標：{url.split('@')[-1].split('/')[0] if '@' in url else '(未設定)'}")
 
     pool.open()
     try:
-        with pool.connection() as conn:
+        with tenancy.use(tenant), pool.connection() as conn:
             with conn.cursor() as cur:
                 ensure_schema(cur)
                 if not args.show:

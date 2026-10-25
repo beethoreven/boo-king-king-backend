@@ -1,0 +1,10 @@
+# 開發與測試用，不進正式環境（Render 只裝 requirements.txt）。
+#
+#   ./.venv/bin/pip install -r requirements-dev.txt
+#   ./.venv/bin/python -m pytest
+#
+# 跨店測試需要本機有 Postgres 的伺服器程式（initdb、pg_ctl；macOS 用 Homebrew
+# 的 postgresql@18）。找不到時那一批會略過並說明原因，掃描型的測試照樣跑。
+-r requirements.txt
+pytest==9.1.1
+pyflakes==4.0.3

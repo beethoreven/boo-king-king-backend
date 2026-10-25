@@ -335,12 +335,15 @@ def reset(cur, *keys: str) -> list[str]:
 
     用法（在 backend 目錄）：
 
-        ./venv/bin/python -c "
+        ./.venv/bin/python -c "
         from dotenv import load_dotenv; load_dotenv('.env')
+        import tenancy
         from db.connection import pool
         from db import default_templates as dt
-        with pool.connection() as c, c.cursor() as cur:
+        with tenancy.use(tenancy.for_cli()), pool.connection() as c, c.cursor() as cur:
             print(dt.reset(cur)); c.commit()"
+
+    （有好幾家店時前面加 TENANT=<店家>。）
     """
     targets = keys or tuple(TEMPLATES)
     changed = []
