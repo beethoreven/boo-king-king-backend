@@ -74,21 +74,23 @@ def pg_cluster():
     # ★ macOS 上沒設 LC_ALL 的話，postmaster 啟動時會因為
     #   「became multithreaded during startup」直接結束（2026-10-25 實測）。
     env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
-    subprocess.run(
-        [initdb, "-D", str(data), "-U", "postgres", "-A", "trust", "--no-sync",
-         "-E", "UTF8", "--locale=C"],
-        check=True, capture_output=True, env=env,
-    )
-    started = subprocess.run(
-        [pg_ctl, "-D", str(data), "-l", str(root / "log"), "-w", "-o",
-         f"-p {port} -k {root} -c listen_addresses='' -c fsync=off", "start"],
-        capture_output=True, env=env,
-    )
-    if started.returncode != 0:
-        log = (root / "log").read_text(errors="replace") if (root / "log").exists() else ""
-        shutil.rmtree(root, ignore_errors=True)
-        raise RuntimeError(f"臨時 Postgres 起不來：\n{log[-2000:]}")
+    # ★ 從 mkdtemp 之後的每一步都在 try 裡：任何一步失敗（包括 initdb 本身），
+    #   finally 都會把叢集關掉、資料夾刪掉，不留東西在 /tmp。
     try:
+        subprocess.run(
+            [initdb, "-D", str(data), "-U", "postgres", "-A", "trust", "--no-sync",
+             "-E", "UTF8", "--locale=C"],
+            check=True, capture_output=True, env=env,
+        )
+        started = subprocess.run(
+            [pg_ctl, "-D", str(data), "-l", str(root / "log"), "-w", "-o",
+             f"-p {port} -k {root} -c listen_addresses='' -c fsync=off", "start"],
+            capture_output=True, env=env,
+        )
+        if started.returncode != 0:
+            log = (root / "log").read_text(errors="replace") if (root / "log").exists() else ""
+            raise RuntimeError(f"臨時 Postgres 起不來：\n{log[-2000:]}")
+
         import psycopg
 
         admin = f"postgresql://postgres@/postgres?host={root}&port={port}"
