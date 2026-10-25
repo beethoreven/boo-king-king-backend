@@ -109,6 +109,8 @@ def ensure_schema(cur) -> None:
     _ensure_sessions(cur)
     _ensure_abuse_log(cur)
     _ensure_abuse_rule(cur)
+    # 簡介頁的瀏覽紀錄參照 mmg(id)，必須排在 _ensure_mmg 之後。
+    _ensure_intro_view(cur)
 
     # ★ LINE 是模組，不是每一家都有。沒設定 LINE 的店，資料庫裡就不建
     #   它的表與欄位——那家店用不到的東西不該留在它的資料庫裡（案主
@@ -614,6 +616,37 @@ def _ensure_users(cur) -> None:
     )
 
 
+def _ensure_intro_view(cur) -> None:
+    """簡介頁的瀏覽紀錄：誰（IP）在什麼時候看了哪一齣。
+
+    簡介頁不用登入就看得到，這份紀錄是出事時追查用的（誰在大量打、從哪裡來），
+    不是統計報表。寫入方式與保留期限見 db/intro.py：
+
+    ★ 不是每看一次就寫一筆。每次寫入都會把這家店的 Neon 叫醒，公開頁面
+      讓任何人都能叫醒它的話，月額度會被燒光。先記在記憶體，累積一批或
+      每天的排程跑時才一次寫進來。
+    ★ 保留 90 天，每天的排程清掉更舊的（隱私權政策寫的就是這個天數）。
+    ★ forwarded_for 存的是原始的 X-Forwarded-For 整串：哪一段才是使用者真正的
+      IP 取決於 Render 的代理怎麼加這個標頭，判斷錯了的話，事後還能從原始值
+      重新判讀。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS intro_view (
+            id BIGSERIAL PRIMARY KEY,
+            mmg_id INTEGER NOT NULL REFERENCES mmg(id) ON DELETE CASCADE,
+            ip TEXT NOT NULL,
+            forwarded_for TEXT,
+            user_agent TEXT,
+            viewed_at TIMESTAMPTZ NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS intro_view_viewed_at ON intro_view (viewed_at)"
+    )
+
+
 def _ensure_abuse_rule(cur) -> None:
     """幾點停權多久。
 
@@ -758,6 +791,18 @@ def _ensure_mmg(cur) -> None:
             -- 空的存成 NULL，前端就不顯示那一個標籤。
             extra_note TEXT,
 
+            -- 簡介頁（/mmg/<id>，不用登入就看得到）。內容與規則見 db/intro.py。
+            -- 劇本簡介與角色簡介是純文字（保留換行），標籤最多 8 個。
+            intro_synopsis TEXT,
+            intro_characters TEXT,
+            intro_tags TEXT[] NOT NULL DEFAULT '{}',
+            -- 封面圖本體（一律轉成 WebP 存）。只有一張，換圖就覆蓋。
+            -- ★ 任何列劇本清單的查詢都逐欄列名，不要 SELECT * 把圖片一起撈出來。
+            cover_image BYTEA,
+            -- 每換一次圖（或刪掉）就加一。只給快取用：圖片網址帶著它，瀏覽器
+            -- 可以放心快取一年，換圖時網址跟著變，訪客一定拿到新圖。
+            cover_version INTEGER NOT NULL DEFAULT 0,
+
             -- 每個場次時段總共可以排幾組。設 3 就是最多 3 組，第 4 組
             -- 會被擋下——不是「第 1 序位之外還能排 3 組」。
             --
@@ -862,6 +907,17 @@ def _ensure_mmg(cur) -> None:
     # 額外註記（2026-10-24）。既有劇本一律空著，畫面完全不變。
     if "extra_note" not in existing:
         cur.execute("ALTER TABLE mmg ADD COLUMN extra_note TEXT")
+    # 簡介頁（2026-10-26）。既有劇本一律空著：簡介頁照樣打得開，只顯示
+    # 劇本本來就有的時長、售價等資料。
+    for col, ddl in (
+        ("intro_synopsis", "TEXT"),
+        ("intro_characters", "TEXT"),
+        ("intro_tags", "TEXT[] NOT NULL DEFAULT '{}'"),
+        ("cover_image", "BYTEA"),
+        ("cover_version", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if col not in existing:
+            cur.execute(f"ALTER TABLE mmg ADD COLUMN {col} {ddl}")
     for col in ("start_booking", "end_booking"):
         if col not in existing:
             cur.execute(f"ALTER TABLE mmg ADD COLUMN {col} DATE")

@@ -29,11 +29,12 @@ import tenancy  # noqa: E402
 from auth_utils import guard, profile, sessions, whitelist  # noqa: E402
 from auth_utils.decorators import admin_display_name, require_auth, require_role  # noqa: E402
 from auth_utils.google_auth import extract_bearer_token, verify_google_id_token  # noqa: E402
-from admin_utils import bookings_admin, mmg_admin, users_admin  # noqa: E402
+from admin_utils import bookings_admin, cover_image, mmg_admin, users_admin  # noqa: E402
 import jobs  # noqa: E402
 from db import bookings as bookings_db
 from db import busy as busy_db  # noqa: E402
 from db import idle_gap  # noqa: E402
+from db import intro as intro_db  # noqa: E402
 from db import mmg as mmg_db  # noqa: E402
 from db import listing  # noqa: E402
 from db import roles  # noqa: E402
@@ -47,6 +48,7 @@ from line_utils import images as line_images  # noqa: E402
 from line_utils import signature as line_signature  # noqa: E402
 import notifications  # noqa: E402
 import notify_events  # noqa: E402
+import intro_public  # noqa: E402
 
 # ── log：每一行都標上店家 ────────────────────────────────────────
 #
@@ -626,7 +628,7 @@ def idle_gap_stats():
     if error:
         return error
     return jsonify({**idle_gap.stats(), "slot_cache": slot_cache.stats(),
-        "notifications": notifications.stats()})
+        "notifications": notifications.stats(), "intro": intro_public.stats()})
 
 
 @app.get("/api/ready")
@@ -1978,6 +1980,8 @@ def admin_list_mmg():
 @require_role(1)
 @_admin_write
 def admin_update_mmg(cur, body, mmg_id: int):
+    # 名稱、價錢、上下架都會出現在公開的簡介頁上（見 intro_public.invalidate）。
+    intro_public.invalidate()
     changed = mmg_admin.update(cur, mmg_id, body)
     changed = _save_schedule(cur, mmg_id, body) or changed
     # ★ 一定排在兩個寫入都做完之後：價格與排期是同一次存檔，要看的是
@@ -1991,10 +1995,171 @@ def admin_update_mmg(cur, body, mmg_id: int):
 @require_role(1)
 @_admin_write
 def admin_create_mmg(cur, body):
+    intro_public.invalidate()   # 同上：簡介頁對「找不到這齣」的結果也有快取
     new_id = mmg_admin.create(cur, body)
     _save_schedule(cur, new_id, body)
     bookings_db.check_deposit_coverage(cur, new_id)  # 同上
     return jsonify(_mmg_with_schedule(cur, new_id)), 201
+
+
+# ── 劇本簡介頁（公開，不用登入）──────────────────────────────────
+#
+# 內容與規則見 db/intro.py，防攻擊見 intro_public.py。前端網址是
+# https://<店家前端>/mmg/<id>（Cloudflare 的 _redirects 把它導到首頁，由前端畫）。
+
+
+def _rate_limited(kind: str):
+    """公開簡介頁的限流。通過回 (None, ip, 原始標頭)，被擋回 (429 回應, ...)。"""
+    ip, chain = intro_public.client_ip(request)
+    retry = intro_public.check_rate(ip, kind)
+    if retry is None:
+        return None, ip, chain
+    resp = jsonify({"error": "請求過於頻繁，請稍候再試"})
+    resp.headers["Retry-After"] = str(retry)
+    return (resp, 429), ip, chain
+
+
+def _flush_intro_views() -> None:
+    """把暫存的瀏覽紀錄寫進資料庫。失敗就放回去，下一次再寫——紀錄不該讓
+    看簡介的人看到錯誤。"""
+    rows = intro_public.take_views()
+    if not rows:
+        return
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                intro_db.insert_views(cur, rows)
+                conn.commit()
+    except Exception as exc:  # noqa: BLE001 - 觀測用的旁支
+        intro_public.give_back(rows)
+        app.logger.warning("簡介頁瀏覽紀錄寫入失敗：%s", exc)
+
+
+@app.get("/api/public/mmg/<int:mmg_id>")
+def public_intro(mmg_id: int):
+    """簡介頁的內容。不用登入，只回上架中的劇本。
+
+    ★ 快取命中就完全不碰資料庫（見 intro_public.py 開頭：公開頁面最大的風險是
+      被拿來叫醒資料庫）。找不到的結果也快取，亂猜編號一樣打不到資料庫。
+    """
+    limited, ip, chain = _rate_limited("intro")
+    if limited:
+        return limited
+    payload = intro_public.cached_intro(mmg_id)
+    if payload is intro_public.MISS:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                payload = intro_db.get_public(cur, mmg_id)
+        intro_public.store_intro(mmg_id, payload)
+    if payload is None:
+        return jsonify({"error": "找不到這個劇本"}), 404
+    if intro_public.record_view(mmg_id, ip, chain, request.headers.get("User-Agent", "")):
+        _flush_intro_views()
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "public, max-age=60"
+    return resp
+
+
+@app.get("/api/public/mmg/<int:mmg_id>/cover/<int:version>.webp")
+def public_intro_cover(mmg_id: int, version: int):
+    """簡介頁的封面圖。網址帶版本號（換圖就換網址），所以可以快取一年。"""
+    limited, _ip, _chain = _rate_limited("cover")
+    if limited:
+        return limited
+    data = intro_public.cached_cover(mmg_id, version)
+    if data is intro_public.MISS:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                data = intro_db.get_cover(cur, mmg_id, version, public=True)
+        intro_public.store_cover(mmg_id, version, data)
+    if data is None:
+        return jsonify({"error": "找不到這張圖"}), 404
+    resp = app.response_class(data, mimetype="image/webp")
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
+
+
+@app.get("/api/admin/mmg/<int:mmg_id>/intro")
+@require_role(1)
+def admin_get_intro(mmg_id: int):
+    """編輯頁用：不管上不上架都給，另外附上 public（現在公開了沒有）。"""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            item = intro_db.get_for_admin(cur, mmg_id)
+    if item is None:
+        return jsonify({"error": "找不到這個劇本"}), 404
+    return jsonify(item)
+
+
+@app.put("/api/admin/mmg/<int:mmg_id>/intro")
+@require_role(1)
+def admin_update_intro(mmg_id: int):
+    """存劇本簡介、角色簡介、類型標籤（整份覆蓋）。"""
+    body = request.get_json(silent=True) or {}
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            try:
+                found = intro_db.update_text(cur, mmg_id, body)
+            except intro_db.IntroError as exc:
+                conn.rollback()
+                return jsonify({"error": str(exc)}), 400
+            if not found:
+                return jsonify({"error": "找不到這個劇本"}), 404
+            item = intro_db.get_for_admin(cur, mmg_id)
+            conn.commit()
+    intro_public.invalidate()
+    return jsonify(item)
+
+
+@app.put("/api/admin/mmg/<int:mmg_id>/cover")
+@require_role(1)
+def admin_upload_cover(mmg_id: int):
+    """上傳封面圖：請求本體就是圖片檔。轉成 WebP 存（見 admin_utils/cover_image.py）。
+
+    ★ 全站的請求大小上限是 64KB（見檔案開頭的 MAX_CONTENT_LENGTH），只有這一支
+      放寬。放寬要在讀本體**之前**設，讀了就來不及了。
+    """
+    request.max_content_length = cover_image.MAX_UPLOAD_BYTES
+    try:
+        webp = cover_image.to_webp(request.get_data())
+    except cover_image.CoverError as exc:
+        return jsonify({"error": str(exc)}), 400
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            version = intro_db.set_cover(cur, mmg_id, webp)
+            if version is None:
+                return jsonify({"error": "找不到這個劇本"}), 404
+            item = intro_db.get_for_admin(cur, mmg_id)
+            conn.commit()
+    intro_public.invalidate()
+    return jsonify(item)
+
+
+@app.delete("/api/admin/mmg/<int:mmg_id>/cover")
+@require_role(1)
+def admin_delete_cover(mmg_id: int):
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if intro_db.set_cover(cur, mmg_id, None) is None:
+                return jsonify({"error": "找不到這個劇本"}), 404
+            item = intro_db.get_for_admin(cur, mmg_id)
+            conn.commit()
+    intro_public.invalidate()
+    return jsonify(item)
+
+
+@app.get("/api/admin/mmg/<int:mmg_id>/cover/<int:version>.webp")
+@require_role(1)
+def admin_intro_cover(mmg_id: int, version: int):
+    """編輯頁預覽用：不管上不上架都給。前端用帶登入憑證的 fetch 拿，不是 <img src>。"""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            data = intro_db.get_cover(cur, mmg_id, version, public=False)
+    if data is None:
+        return jsonify({"error": "找不到這張圖"}), 404
+    resp = app.response_class(data, mimetype="image/webp")
+    resp.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+    return resp
 
 
 def _save_schedule(cur, mmg_id: int, body: dict) -> bool:

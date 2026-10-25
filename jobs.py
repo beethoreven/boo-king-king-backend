@@ -27,7 +27,9 @@ from __future__ import annotations
 
 from auth_utils import guard, sessions
 from db import bookings as bookings_db
+from db import intro as intro_db
 from db import listing
+import intro_public
 
 
 def _count_listing(cur) -> int:
@@ -79,6 +81,20 @@ def run_batch(pool, *, lookback_days) -> dict:
     except Exception as exc:  # noqa: BLE001
         result["stale_booked"] = None
         errors.append(f"stale_booked: {exc}")
+
+    # 簡介頁的瀏覽紀錄：把記憶體裡暫存的寫進去，再清掉超過保留期限的
+    # （為什麼不是每看一次就寫，見 intro_public.py 開頭）。
+    rows = intro_public.take_views()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                result["intro_views_saved"] = intro_db.insert_views(cur, rows)
+                result["intro_views_purged"] = intro_db.purge_views(cur)
+                conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        intro_public.give_back(rows)
+        result["intro_views_saved"] = None
+        errors.append(f"intro_views: {exc}")
 
     if errors:
         result["errors"] = errors

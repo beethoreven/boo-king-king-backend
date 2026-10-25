@@ -15,58 +15,9 @@ import pytest
 
 from tests.conftest import STORES
 
-# 每家店的 session token 由 seeded 在那家店裡用 sessions.create_session 發
-# （token 帶著那家店的簽章，見 auth_utils/sessions.py），測試用 tokens 取。
-#   a_admin       A 店：admin@shop.test，管理員
-#   a_player      A 店：player@shop.test，一般玩家
-#   b_same_email  B 店：admin@shop.test，在 B 店只是一般玩家
-#   b_owner       B 店：owner@shop.test，管理員
-
-
-def _seed(store: str, url: str, *, users, sessions, mmg_name, site_name, gm_mode) -> dict:
-    import tenancy
-    from auth_utils import sessions as sessions_mod
-
-    tokens = {}
-    with tenancy.use(store), psycopg.connect(url) as conn, conn.cursor() as cur:
-        for email, name, role in users:
-            cur.execute(
-                "INSERT INTO users (email, name, role) VALUES (%s, %s, %s) "
-                "ON CONFLICT (email) DO NOTHING",
-                (email, name, role),
-            )
-        for label, email in sessions:
-            tokens[label] = sessions_mod.create_session(cur, email)
-        cur.execute("SELECT count(*) FROM mmg")
-        if cur.fetchone()[0] == 0:
-            cur.execute("INSERT INTO mmg (name) VALUES (%s)", (mmg_name,))
-        cur.execute("UPDATE settings SET value = %s WHERE key = 'site_name'", (site_name,))
-        cur.execute("UPDATE functions SET value = %s WHERE key = 'gm_mode'", (gm_mode,))
-        conn.commit()
-    return tokens
-
-
-@pytest.fixture(scope="module")
-def tokens(app_module, pg_cluster):
-    return {
-        **_seed(
-            "shop-a", pg_cluster["shop_a"],
-            users=[("admin@shop.test", "A管理員", 1), ("player@shop.test", "A玩家", 3)],
-            sessions=[("a_admin", "admin@shop.test"), ("a_player", "player@shop.test")],
-            mmg_name="A店的劇本", site_name="A店", gm_mode="single",
-        ),
-        **_seed(
-            "shop-b", pg_cluster["shop_b"],
-            users=[("owner@shop.test", "B管理員", 1), ("admin@shop.test", "在B只是玩家", 3)],
-            sessions=[("b_same_email", "admin@shop.test"), ("b_owner", "owner@shop.test")],
-            mmg_name="B店的劇本", site_name="B店", gm_mode="assign",
-        ),
-    }
-
-
 @pytest.fixture(autouse=True)
 def _seeded(tokens):
-    """每個測試都要兩家店的資料先就位。"""
+    """每個測試都要兩家店的資料先就位（tokens 在 conftest.py）。"""
 
 
 def _auth(token: str) -> dict:
