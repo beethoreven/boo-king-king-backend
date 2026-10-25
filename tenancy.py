@@ -214,6 +214,24 @@ def load(environ: Mapping[str, str]) -> dict[str, Tenant]:
                 prefix=prefix, multi=True,
             )
 
+        # 兩家店填了同一個資料庫或同一個 LINE channel——在 Render 一格一格貼環境
+        # 變數時，複製貼上錯一格最容易出這種錯。同一個 DATABASE_URL 等於兩家店
+        # 完全合併：同一份資料、同一把 session 簽章金鑰（見 auth_utils/sessions.py）；
+        # 同一個 LINE channel 等於一個官方帳號掛在兩家店。都沒有正確的解讀。
+        # ★ 只抓字面完全相同的；兩個寫法不同、其實指向同一個資料庫的網址
+        #   （例如一個有 -pooler 一個沒有）這裡看不出來。
+        for attr, key in (("database_url", "DATABASE_URL"),
+                          ("line_channel_secret", "LINE_CHANNEL_SECRET")):
+            seen: dict[str, str] = {}
+            for tid, tenant in tenants.items():
+                value = getattr(tenant, attr)
+                if value and value in seen:
+                    raise ConfigError(
+                        f"{env_prefix(seen[value])}{key} 跟 {env_prefix(tid)}{key} 是同一個值。"
+                        f"每家店要是自己的，八成是複製貼上貼錯格了。"
+                    )
+                seen[value] = tid
+
         # 拼錯的鍵名（ELI__DATABSE_URL）或漏加進 TENANTS 的店家，都會變成一個
         # 沒人讀的環境變數——設定看起來有填，服務卻當作沒有。在這裡講出來。
         for key in environ:
