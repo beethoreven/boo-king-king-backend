@@ -272,3 +272,27 @@ def test_uploaded_photo_loses_its_gps_location(client, tokens):
     served = Image.open(io.BytesIO(client.get(f"/v/shop-a{path}", headers=IP).data))
     assert not dict(served.getexif()), "EXIF（含 GPS）要全部清掉"
     assert served.size == (300, 400), "照 EXIF 的方向轉正之後才丟掉 EXIF"
+
+
+
+def test_client_ip_ignores_what_the_visitor_wrote_in_front(client, monkeypatch):
+    """2026-10-26 在 demo 實測：Render 前面的代理把使用者自己送的 X-Forwarded-For
+    留在最前面，再接上真正的 IP、Cloudflare、Render 內部。第一段不能信。"""
+    import intro_public
+
+    real = "36.227.139.114"
+    def header(fake):
+        return {"X-Forwarded-For": f"{fake},{real}, 172.71.81.179, 10.29.8.12"}
+
+    # 每次換一個假的「第一段」，限流照樣算在同一個真 IP 上。
+    for i in range(intro_public.INTRO_PER_MINUTE):
+        assert client.get("/v/shop-a/api/public/mmg/1", headers=header(f"1.2.3.{i}")).status_code == 200
+    assert client.get("/v/shop-a/api/public/mmg/1", headers=header("9.9.9.9")).status_code == 429
+
+    # 塞一長串假值也擠不掉右邊可信的那一段。
+    long_fake = ", ".join(f"5.5.5.{i % 250}" for i in range(400))
+    from flask import Request
+    from werkzeug.test import EnvironBuilder
+    req = Request(EnvironBuilder(headers={"X-Forwarded-For": f"{long_fake},{real}, 172.71.81.179, 10.29.8.12"}).get_environ())
+    ip, stored = intro_public.client_ip(req)
+    assert ip == real and stored.endswith("10.29.8.12") and len(stored) <= 300

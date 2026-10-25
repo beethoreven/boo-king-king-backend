@@ -24,16 +24,28 @@
   兩個 worker 時，實際的限流門檻是設定值的兩倍。這跟 db/slot_cache.py 的取捨
   一樣——要精準就得多一個 Redis，不划算。
 
-## 使用者的 IP 怎麼拿
+## 使用者的 IP 怎麼拿（2026-10-26 在 demo 實測過）
 
-見 client_ip()。Render 的代理會在 X-Forwarded-For 加上它看到的來源 IP，但使用者
-自己也可以先塞一個假的進去，所以**哪一段可信**取決於 Render 的代理怎麼加——
-這件事要實測，不能照猜的寫（2026-10-26：文件沒寫清楚，社群說法互相矛盾）。
-瀏覽紀錄一律另外存原始的整串，判斷規則改了也能回頭重新判讀。
+Render 前面有兩層代理：Cloudflare（172.71.x.x 這類）與 Render 自己的負載平衡
+（10.x）。它們會把**使用者自己送來的 X-Forwarded-For 原封不動留在最前面**，
+再接上真正的來源 IP。實測：
+
+    沒帶標頭          36.227.139.114, 172.71.81.179, 10.29.8.12
+    偽造 1.2.3.4      1.2.3.4,36.227.139.114, 172.71.81.179, 10.29.8.12
+
+所以**第一段是使用者愛寫什麼就寫什麼**——拿它來限流，攻擊者每次換一個假 IP
+就繞過了。正確的讀法是從右邊往左，跳過 Cloudflare 與私有網段的位址，遇到的
+第一個就是真正的使用者（client_ip）。
+
+★ 要是哪天 Cloudflare 多了新的網段而這裡沒更新，錯的方向是「把 Cloudflare 的
+  位址當成使用者」——很多人會擠在同一個 IP 下一起被限流（看得見的 429），
+  而不是讓攻擊者繞過。網段清單來自 https://www.cloudflare.com/ips/。
+★ 瀏覽紀錄另外存原始的整串（保留右邊可信的那一段），規則要改也能回頭重新判讀。
 """
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import threading
 import time
@@ -104,16 +116,45 @@ _views = tenancy.PerTenant(_Views)
 # ── IP ───────────────────────────────────────────────────────────
 
 
-def client_ip(request) -> tuple[str, str]:
-    """(拿來限流與記錄的 IP, 原始的 X-Forwarded-For 整串)。
+# 代理自己的位址：Cloudflare 公布的網段（https://www.cloudflare.com/ips/，2026-10-26）
+# 加上私有網段（Render 內部的負載平衡是 10.x）。從右往左讀 X-Forwarded-For 時跳過這些。
+_PROXY_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+    "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+))
 
-    ★ 規則見檔案開頭「使用者的 IP 怎麼拿」。目前取 X-Forwarded-For 的第一段，
-      沒有就用連線的來源位址。
+
+def _is_proxy(value: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if addr.is_private or addr.is_loopback or addr.is_link_local:
+        return True
+    return any(addr in net for net in _PROXY_NETS)
+
+
+def client_ip(request) -> tuple[str, str]:
+    """(拿來限流與記錄的 IP, 存進紀錄用的 X-Forwarded-For)。規則見檔案開頭。
+
+    ★ 先完整解析、存的時候才截短，而且保留**右邊**：先截短再解析的話，攻擊者
+      塞一長串假值就能把右邊可信的那一段擠掉。
     """
-    chain = (request.headers.get("X-Forwarded-For") or "")[:_MAX_HEADER_CHARS]
-    parts = [p.strip() for p in chain.split(",") if p.strip()]
-    ip = parts[0] if parts else (request.remote_addr or "unknown")
-    return ip[:64], chain
+    header = request.headers.get("X-Forwarded-For") or ""
+    parts = [p.strip() for p in header.split(",") if p.strip()]
+    ip = None
+    for candidate in reversed(parts):
+        if not _is_proxy(candidate):
+            ip = candidate
+            break
+    if ip is None:
+        # 整串都是代理（或根本沒帶）：用連線的來源位址。本機開發與測試走這裡。
+        ip = parts[0] if parts else (request.remote_addr or "unknown")
+    return ip[:64], header[-_MAX_HEADER_CHARS:]
 
 
 # ── 限流 ─────────────────────────────────────────────────────────
