@@ -38,7 +38,7 @@ def _fresh(tokens, pg_cluster):
 
     for db in ("shop_a", "shop_b"):
         _sql(pg_cluster[db], "UPDATE mmg SET status = 'active', intro_synopsis = NULL, "
-             "intro_characters = NULL, intro_tags = '{}', cover_image = NULL, period = NULL, "
+             "intro_characters = NULL, intro_owner_note = NULL, intro_tags = '{}', cover_image = NULL, period = NULL, "
              "players = NULL, price = NULL, price_holiday = NULL, booking_cost = NULL, "
              "booking_cost_holiday = NULL, extra_note = NULL WHERE id = 1")
         _sql(pg_cluster[db], "UPDATE functions SET value = 'on' WHERE key = 'deposit'")
@@ -63,10 +63,11 @@ def test_public_intro_shows_what_the_store_wrote_and_what_the_script_has(client,
          "price_holiday = 650, booking_cost = 200, booking_cost_holiday = 200, "
          "extra_note = '需自備服裝' WHERE id = 1")
     r = _put_intro(client, tokens["a_admin"], synopsis=" 一場\r\n夢 ", characters="甲\n乙",
-                   tags=["懸疑", " 懸疑 ", "", "情感"])
+                   owner_note=" 歡迎\r\n光臨 ", tags=["懸疑", " 懸疑 ", "", "情感"])
     assert r.status_code == 200, r.get_json()
     body = client.get("/v/shop-a/api/public/mmg/1", headers=IP).get_json()
     assert body["synopsis"] == "一場\n夢" and body["characters"] == "甲\n乙"
+    assert body["owner_note"] == "歡迎\n光臨"
     assert body["tags"] == ["懸疑", "情感"], "空白與重複的標籤要略過"
     assert (body["period"], body["players"], body["price"], body["price_holiday"]) == (4.0, "4男4女", 500, 650)
     assert body["booking_cost"] == 200 and body["extra_note"] == "需自備服裝"
@@ -77,7 +78,7 @@ def test_missing_fields_are_absent_and_deposit_hidden_when_the_store_takes_none(
     _sql(pg_cluster["shop_b"], "UPDATE mmg SET booking_cost = 300 WHERE id = 1")
     _sql(pg_cluster["shop_b"], "UPDATE functions SET value = 'off' WHERE key = 'deposit'")
     body = client.get("/v/shop-b/api/public/mmg/1", headers=IP).get_json()
-    for key in ("period", "players", "price", "extra_note", "synopsis", "characters"):
+    for key in ("period", "players", "price", "extra_note", "synopsis", "characters", "owner_note"):
         assert body[key] is None, key
     assert body["booking_cost"] is None, "不收訂金的店，簡介頁不該出現訂金"
 
@@ -88,6 +89,7 @@ def test_missing_fields_are_absent_and_deposit_hidden_when_the_store_takes_none(
     ({"tags": "懸疑"}, "文字清單"),
     ({"synopsis": "字" * 3001}, "劇本簡介最多 3000 字"),
     ({"characters": 123}, "角色簡介必須是文字"),
+    ({"owner_note": "字" * 3001}, "老闆的話最多 3000 字"),
 ])
 def test_bad_intro_is_rejected_with_a_reason(client, tokens, body, message):
     r = _put_intro(client, tokens["a_admin"], **body)

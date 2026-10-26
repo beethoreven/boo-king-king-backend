@@ -2116,7 +2116,7 @@ def admin_get_intro(mmg_id: int):
 @app.put("/api/admin/mmg/<int:mmg_id>/intro")
 @require_role(1)
 def admin_update_intro(mmg_id: int):
-    """存劇本簡介、角色簡介、類型標籤（整份覆蓋）。"""
+    """存劇本簡介、角色簡介、老闆的話、類型標籤（整份覆蓋）。"""
     body = request.get_json(silent=True) or {}
     with pool.connection() as conn:
         with conn.cursor() as cur:

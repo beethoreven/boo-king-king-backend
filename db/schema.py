@@ -795,6 +795,8 @@ def _ensure_mmg(cur) -> None:
             -- 劇本簡介與角色簡介是純文字（保留換行），標籤最多 8 個。
             intro_synopsis TEXT,
             intro_characters TEXT,
+            -- 老闆的話（2026-10-26）：排在角色簡介下面，一樣是保留換行的純文字。
+            intro_owner_note TEXT,
             intro_tags TEXT[] NOT NULL DEFAULT '{}',
             -- 封面圖本體（一律轉成 WebP 存）。只有一張，換圖就覆蓋。
             -- ★ 任何列劇本清單的查詢都逐欄列名，不要 SELECT * 把圖片一起撈出來。
@@ -915,6 +917,7 @@ def _ensure_mmg(cur) -> None:
         ("intro_tags", "TEXT[] NOT NULL DEFAULT '{}'"),
         ("cover_image", "BYTEA"),
         ("cover_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("intro_owner_note", "TEXT"),
     ):
         if col not in existing:
             cur.execute(f"ALTER TABLE mmg ADD COLUMN {col} {ddl}")

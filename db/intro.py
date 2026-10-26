@@ -4,7 +4,7 @@
 
 不用登入就看得到，網址可以貼到 LINE 群組或社群。內容分兩種：
 
-  店家編輯的   封面圖、劇本簡介、角色簡介、類型標籤（最多 8 個）
+  店家編輯的   封面圖、劇本簡介、角色簡介、老闆的話、類型標籤（最多 8 個）
   自動帶入的   名稱、時長、人數、售價（平日／假日）、訂金、額外註記
                ——都是劇本本來就有的欄位，沒有值就不回（前端就不顯示）
 
@@ -30,6 +30,7 @@ from db import functions, listing
 # 店家貼了一大段、存檔成功，簡介頁卻少了後半段，他不會知道為什麼。
 SYNOPSIS_MAX = 3000
 CHARACTERS_MAX = 5000
+OWNER_NOTE_MAX = 3000
 TAGS_MAX = 8
 TAG_MAX_CHARS = 12
 
@@ -40,7 +41,7 @@ ON_SHELF_SQL = (
 
 _FIELDS = (
     "id, name, period, players, price, price_holiday, booking_cost, booking_cost_holiday, "
-    "extra_note, intro_synopsis, intro_characters, intro_tags, cover_version, "
+    "extra_note, intro_synopsis, intro_characters, intro_owner_note, intro_tags, cover_version, "
     "cover_image IS NOT NULL"
 )
 
@@ -51,7 +52,7 @@ class IntroError(ValueError):
 
 def _payload(cur, row) -> dict:
     (mid, name, period, players, price, price_holiday, cost, cost_holiday,
-     extra_note, synopsis, characters, tags, cover_version, has_cover) = row
+     extra_note, synopsis, characters, owner_note, tags, cover_version, has_cover) = row
     deposit = functions.deposit_required(cur)
     out = {
         "id": mid,
@@ -66,6 +67,7 @@ def _payload(cur, row) -> dict:
         "extra_note": extra_note,
         "synopsis": synopsis,
         "characters": characters,
+        "owner_note": owner_note,
         "tags": list(tags or []),
         # 圖片的網址只給相對路徑，前端自己接上後端主機與店家前綴。
         # 版本號在網址裡，換圖時網址就不同（見 schema 的 cover_version 說明）。
@@ -134,17 +136,19 @@ def _tags(data: dict) -> list[str]:
 
 
 def update_text(cur, mmg_id: int, data: dict) -> bool:
-    """存劇本簡介、角色簡介、類型標籤。劇本不存在回 False。
+    """存劇本簡介、角色簡介、老闆的話、類型標籤。劇本不存在回 False。
 
-    三個欄位一起存（整份覆蓋）。編輯頁一次送全部，沒有「只改其中一個」的情境。
+    四個欄位一起存（整份覆蓋）。編輯頁一次送全部，沒有「只改其中一個」的情境。
     """
     synopsis = _text(data, "synopsis", SYNOPSIS_MAX, "劇本簡介")
     characters = _text(data, "characters", CHARACTERS_MAX, "角色簡介")
+    owner_note = _text(data, "owner_note", OWNER_NOTE_MAX, "老闆的話")
     tags = _tags(data)
     cur.execute(
-        "UPDATE mmg SET intro_synopsis = %s, intro_characters = %s, intro_tags = %s "
+        "UPDATE mmg SET intro_synopsis = %s, intro_characters = %s, intro_owner_note = %s, "
+        "intro_tags = %s "
         "WHERE id = %s",
-        (synopsis, characters, tags, mmg_id),
+        (synopsis, characters, owner_note, tags, mmg_id),
     )
     return cur.rowcount == 1
 
