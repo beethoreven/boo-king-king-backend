@@ -101,6 +101,8 @@ def ensure_schema(cur) -> None:
     # rooms 要在 mmg 之前——mmg.room_id 參照它。
     _ensure_rooms(cur)
     _ensure_mmg(cur)
+    # 角色參照 mmg(id)；而且要接手 mmg.intro_characters 的舊資料（見函式說明）。
+    _ensure_mmg_character(cur)
     # 排期兩張表都參照 mmg(id)，必須排在 _ensure_mmg 之後。
     _ensure_schedule(cur)
     _ensure_booking_record(cur)
@@ -616,6 +618,69 @@ def _ensure_users(cur) -> None:
     )
 
 
+def _split_legacy_characters(text: str) -> list[tuple[str, str | None]]:
+    """舊的「角色簡介」是一整段文字，拆成 (角色名稱, 角色介紹)。
+
+    店家原本的寫法是一行一個角色：「陳大偉（David）：男性，曾經的班長…」。
+    第一個冒號前面當名稱、後面當介紹；沒有冒號的那一行整行當名稱；名稱太長
+    （多半是一整段說明）就整行放進介紹、名稱寫「角色 N」，讓店家自己改。
+    """
+    from db import intro
+
+    out: list[tuple[str, str | None]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        cut = min((i for i in (line.find("："), line.find(":")) if i > 0), default=-1)
+        if 0 < cut <= intro.CHARACTER_NAME_MAX:
+            out.append((line[:cut].strip(), line[cut + 1:].strip() or None))
+        elif len(line) <= intro.CHARACTER_NAME_MAX:
+            out.append((line, None))
+        else:
+            out.append((f"角色 {len(out) + 1}", line))
+    return out
+
+
+def _ensure_mmg_character(cur) -> None:
+    """簡介頁的角色：一個角色一列，名稱必填，介紹與圖片可以沒有。
+
+    ★ 2026-10-26 以前，角色簡介是 mmg.intro_characters 一整段文字。這裡第一次
+      跑的時候把它拆成一列一列搬過來（_split_legacy_characters），然後把那個
+      欄位拿掉——兩份資料並存的話，總有一天會有人改了其中一份。搬移跟建表在
+      同一個交易裡，中途失敗什麼都不會動。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mmg_character (
+            id SERIAL PRIMARY KEY,
+            mmg_id INTEGER NOT NULL REFERENCES mmg(id) ON DELETE CASCADE,
+            -- 顯示順序，從 0 開始。
+            position SMALLINT NOT NULL,
+            -- ★ 沒有名稱就不能有介紹或圖片（案主 2026-10-26）：名稱 NOT NULL 且不能是空白。
+            name TEXT NOT NULL CHECK (btrim(name) <> ''),
+            description TEXT,
+            -- 角色圖（一律轉成 WebP）。版本號的用途同 mmg.cover_version：換圖就換網址。
+            image BYTEA,
+            image_version INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS mmg_character_mmg ON mmg_character (mmg_id, position)"
+    )
+    if "intro_characters" in _existing_columns(cur, "mmg"):
+        cur.execute("SELECT id, intro_characters FROM mmg WHERE intro_characters IS NOT NULL")
+        for mmg_id, text in cur.fetchall():
+            for pos, (name, description) in enumerate(_split_legacy_characters(text)):
+                cur.execute(
+                    "INSERT INTO mmg_character (mmg_id, position, name, description) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (mmg_id, pos, name, description),
+                )
+        cur.execute("ALTER TABLE mmg DROP COLUMN intro_characters")
+
+
 def _ensure_intro_view(cur) -> None:
     """簡介頁的瀏覽紀錄：誰（IP）在什麼時候看了哪一齣。
 
@@ -792,9 +857,8 @@ def _ensure_mmg(cur) -> None:
             extra_note TEXT,
 
             -- 簡介頁（/mmg/<id>，不用登入就看得到）。內容與規則見 db/intro.py。
-            -- 劇本簡介與角色簡介是純文字（保留換行），標籤最多 8 個。
+            -- 劇本簡介是純文字（保留換行），標籤最多 8 個。角色在 mmg_character。
             intro_synopsis TEXT,
-            intro_characters TEXT,
             -- 老闆的話（2026-10-26）：排在角色簡介下面，一樣是保留換行的純文字。
             intro_owner_note TEXT,
             intro_tags TEXT[] NOT NULL DEFAULT '{}',
@@ -913,7 +977,6 @@ def _ensure_mmg(cur) -> None:
     # 劇本本來就有的時長、售價等資料。
     for col, ddl in (
         ("intro_synopsis", "TEXT"),
-        ("intro_characters", "TEXT"),
         ("intro_tags", "TEXT[] NOT NULL DEFAULT '{}'"),
         ("cover_image", "BYTEA"),
         ("cover_version", "INTEGER NOT NULL DEFAULT 0"),

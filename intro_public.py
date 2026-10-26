@@ -12,7 +12,10 @@
 ## 五件事
 
   1. 簡介內容快取 60 秒（找不到的也快取，免得有人亂猜編號一直查資料庫）。
-  2. 封面圖的位元組快取在記憶體（網址帶版本號，換圖就是新網址，不會舊）。
+  2. 封面與角色圖的位元組快取在記憶體（網址帶版本號，換圖就是新網址，不會舊）。
+     ★ 簡介內容沒快取到、去查資料庫的那一次，順便把這一齣所有的圖一起撈進來
+       （db/intro.public_images）。不這樣做的話，一齣 10 個角色的劇本，一個訪客
+       就要查 12 次資料庫，第 5 點的每日上限幾個人就用完了。
   3. 每個 IP 限流：簡介每分鐘 30 次、圖片每分鐘 120 次；10 分鐘內被擋 3 次的
      IP 封鎖 10 分鐘。全部在記憶體裡做，不寫資料庫。
   4. 瀏覽紀錄（誰、什麼時候、看了哪一齣）先記在記憶體，累積 200 筆或每天的
@@ -77,9 +80,10 @@ _MAX_TRACKED_IPS = 10_000
 
 INTRO_TTL_SECONDS = float(os.environ.get("INTRO_CACHE_TTL_SECONDS", "60"))
 _MAX_INTRO_ENTRIES = 2_000
-# 封面圖快取的總大小上限（每家店）。一張通常一兩百 KB，20MB 夠放上百張。
-_MAX_COVER_BYTES = 20 * 1024 * 1024
-COVER_TTL_SECONDS = 600.0
+# 圖片快取的總大小上限（每家店）。封面一兩百 KB、角色圖幾十 KB，一齣全部約 1MB，
+# 20MB 夠放二十齣。超過就整份清空（下一次看簡介時會重新撈進來）。
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+IMAGE_TTL_SECONDS = 600.0
 
 # 每家店每天最多讓公開簡介頁查幾次資料庫（見檔案開頭第 5 點）。每個 worker 各算各的。
 DB_BUDGET_PER_DAY = int(os.environ.get("INTRO_DB_BUDGET_PER_DAY", "100"))
@@ -106,12 +110,13 @@ class _Limiter:
 
 
 class _Caches:
-    __slots__ = ("intro", "covers", "cover_bytes")
+    __slots__ = ("intro", "images", "image_bytes")
 
     def __init__(self) -> None:
         self.intro: dict[int, tuple[float, dict | None]] = {}
-        self.covers: dict[tuple[int, int], tuple[float, bytes | None]] = {}
-        self.cover_bytes = 0
+        # key 是 ("cover", 劇本 id, 版本) 或 ("character", 劇本 id, 角色 id, 版本)。
+        self.images: dict[tuple, tuple[float, bytes | None]] = {}
+        self.image_bytes = 0
 
 
 class _Views:
@@ -278,27 +283,28 @@ def store_intro(mmg_id: int, payload: dict | None) -> None:
         c.intro[mmg_id] = (time.monotonic() + INTRO_TTL_SECONDS, payload)
 
 
-def cached_cover(mmg_id: int, version: int):
+def cached_image(key: tuple):
+    """快取裡的圖片位元組（可能是 None＝查過了沒有這張）。沒快取到回 MISS。"""
     c = _caches.get()
     with _lock:
-        hit = c.covers.get((mmg_id, version))
+        hit = c.images.get(key)
         if hit is not None and hit[0] > time.monotonic():
             return hit[1]
     return MISS
 
 
-def store_cover(mmg_id: int, version: int, data: bytes | None) -> None:
+def store_image(key: tuple, data: bytes | None) -> None:
     c = _caches.get()
     size = len(data) if data else 0
     with _lock:
-        if c.cover_bytes + size > _MAX_COVER_BYTES:
-            c.covers.clear()
-            c.cover_bytes = 0
-        old = c.covers.get((mmg_id, version))
+        if c.image_bytes + size > _MAX_IMAGE_BYTES:
+            c.images.clear()
+            c.image_bytes = 0
+        old = c.images.get(key)
         if old is not None and old[1]:
-            c.cover_bytes -= len(old[1])
-        c.covers[(mmg_id, version)] = (time.monotonic() + COVER_TTL_SECONDS, data)
-        c.cover_bytes += size
+            c.image_bytes -= len(old[1])
+        c.images[key] = (time.monotonic() + IMAGE_TTL_SECONDS, data)
+        c.image_bytes += size
 
 
 def invalidate() -> None:
@@ -310,8 +316,8 @@ def invalidate() -> None:
     c = _caches.get()
     with _lock:
         c.intro.clear()
-        c.covers.clear()
-        c.cover_bytes = 0
+        c.images.clear()
+        c.image_bytes = 0
 
 
 # ── 瀏覽紀錄 ─────────────────────────────────────────────────────
@@ -357,7 +363,7 @@ def stats() -> dict:
             "buffered_views": len(v.rows),
             "dropped_views": v.dropped,
             "cached_intros": len(c.intro),
-            "cached_cover_bytes": c.cover_bytes,
+            "cached_image_bytes": c.image_bytes,
             "tracked_ips": len(lim.hits),
             "blocked_ips": len(lim.blocked_until),
         }

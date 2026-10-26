@@ -38,11 +38,12 @@ def _fresh(tokens, pg_cluster):
 
     for db in ("shop_a", "shop_b"):
         _sql(pg_cluster[db], "UPDATE mmg SET status = 'active', intro_synopsis = NULL, "
-             "intro_characters = NULL, intro_owner_note = NULL, intro_tags = '{}', cover_image = NULL, period = NULL, "
+             "intro_owner_note = NULL, intro_tags = '{}', cover_image = NULL, period = NULL, "
              "players = NULL, price = NULL, price_holiday = NULL, booking_cost = NULL, "
              "booking_cost_holiday = NULL, extra_note = NULL WHERE id = 1")
         _sql(pg_cluster[db], "UPDATE functions SET value = 'on' WHERE key = 'deposit'")
         _sql(pg_cluster[db], "DELETE FROM intro_view")
+        _sql(pg_cluster[db], "DELETE FROM mmg_character")
     for state in (intro_public._limiters, intro_public._caches, intro_public._views,
                   intro_public._budgets):
         state.reset()
@@ -62,11 +63,13 @@ def test_public_intro_shows_what_the_store_wrote_and_what_the_script_has(client,
     _sql(pg_cluster["shop_a"], "UPDATE mmg SET period = 4, players = '4男4女', price = 500, "
          "price_holiday = 650, booking_cost = 200, booking_cost_holiday = 200, "
          "extra_note = '需自備服裝' WHERE id = 1")
-    r = _put_intro(client, tokens["a_admin"], synopsis=" 一場\r\n夢 ", characters="甲\n乙",
+    r = _put_intro(client, tokens["a_admin"], synopsis=" 一場\r\n夢 ", characters=[{"name": " 偵探\n 小林 ", "description": "冷靜\r\n的旁觀者"}, {"name": "管家"}],
                    owner_note=" 歡迎\r\n光臨 ", tags=["懸疑", " 懸疑 ", "", "情感"])
     assert r.status_code == 200, r.get_json()
     body = client.get("/v/shop-a/api/public/mmg/1", headers=IP).get_json()
-    assert body["synopsis"] == "一場\n夢" and body["characters"] == "甲\n乙"
+    assert body["synopsis"] == "一場\n夢"
+    assert [(c["name"], c["description"], c["image_path"]) for c in body["characters"]] == [
+        ("偵探 小林", "冷靜\n的旁觀者", None), ("管家", None, None)], "名稱是一行字，介紹保留換行"
     assert body["owner_note"] == "歡迎\n光臨"
     assert body["tags"] == ["懸疑", "情感"], "空白與重複的標籤要略過"
     assert (body["period"], body["players"], body["price"], body["price_holiday"]) == (4.0, "4男4女", 500, 650)
@@ -78,9 +81,10 @@ def test_missing_fields_are_absent_and_deposit_hidden_when_the_store_takes_none(
     _sql(pg_cluster["shop_b"], "UPDATE mmg SET booking_cost = 300 WHERE id = 1")
     _sql(pg_cluster["shop_b"], "UPDATE functions SET value = 'off' WHERE key = 'deposit'")
     body = client.get("/v/shop-b/api/public/mmg/1", headers=IP).get_json()
-    for key in ("period", "players", "price", "extra_note", "synopsis", "characters", "owner_note"):
+    for key in ("period", "players", "price", "extra_note", "synopsis", "owner_note"):
         assert body[key] is None, key
     assert body["booking_cost"] is None, "不收訂金的店，簡介頁不該出現訂金"
+    assert body["characters"] == []
 
 
 @pytest.mark.parametrize("body, message", [
@@ -88,7 +92,12 @@ def test_missing_fields_are_absent_and_deposit_hidden_when_the_store_takes_none(
     ({"tags": ["一二三四五六七八九十十一十二十三"]}, "每個最多 12 字"),
     ({"tags": "懸疑"}, "文字清單"),
     ({"synopsis": "字" * 3001}, "劇本簡介最多 3000 字"),
-    ({"characters": 123}, "角色簡介必須是文字"),
+    ({"characters": "甲"}, "角色資料格式不對"),
+    ({"characters": [{"name": "甲"}, {"name": " ", "description": "沒有名字的介紹"}]}, "第 2 個角色沒有填角色名稱"),
+    ({"characters": [{"name": f"角{i}"} for i in range(13)]}, "角色最多 12 個"),
+    ({"characters": [{"name": "名" * 31}]}, "第 1 個角色的名稱最多 30 字"),
+    ({"characters": [{"name": "甲", "description": "字" * 1001}]}, "第 1 個角色的介紹最多 1000 字"),
+    ({"characters": [{"id": 999999, "name": "甲"}]}, "請重新整理"),
     ({"owner_note": "字" * 3001}, "老闆的話最多 3000 字"),
 ])
 def test_bad_intro_is_rejected_with_a_reason(client, tokens, body, message):
@@ -354,3 +363,127 @@ def test_daily_db_budget_caps_cache_misses_but_not_cached_views(client, monkeypa
     import datetime as dt
     monkeypatch.setattr(intro_public, "_today", lambda: dt.date(2099, 1, 1))
     assert get("/v/shop-a/api/public/mmg/905").status_code == 404, "隔天歸零"
+
+
+# ── 角色 ───────────────────────────────────────────────────────
+
+
+def _characters(client, token, store="shop-a"):
+    r = client.get(f"/v/{store}/api/admin/mmg/1/intro", headers=_auth(token))
+    return r.get_json()["characters"]
+
+
+def test_characters_are_replaced_as_a_whole_keeping_ids_and_order(client, tokens):
+    _put_intro(client, tokens["a_admin"], characters=[{"name": "甲"}, {"name": "乙"}, {"name": "丙"}])
+    a, b, c = _characters(client, tokens["a_admin"])
+    # 調順序、改名、刪一個、加一個。
+    r = _put_intro(client, tokens["a_admin"], characters=[
+        {"id": c["id"], "name": "丙"}, {"id": a["id"], "name": "甲改", "description": "說明"}, {"name": "丁"}])
+    assert r.status_code == 200, r.get_json()
+    got = _characters(client, tokens["a_admin"])
+    assert [(x["name"], x["description"]) for x in got] == [("丙", None), ("甲改", "說明"), ("丁", None)]
+    assert got[0]["id"] == c["id"] and got[1]["id"] == a["id"], "既有的角色保留 id（圖片跟著它）"
+    assert b["id"] not in {x["id"] for x in got}
+
+
+def test_a_character_id_from_another_script_is_rejected(client, tokens, pg_cluster):
+    _sql(pg_cluster["shop_a"], "INSERT INTO mmg (name) VALUES ('另一齣')")
+    with psycopg.connect(pg_cluster["shop_a"]) as conn:
+        other = conn.execute("SELECT id FROM mmg WHERE name = '另一齣'").fetchone()[0]
+        cid = conn.execute("INSERT INTO mmg_character (mmg_id, position, name) VALUES (%s, 0, '別人的') "
+                           "RETURNING id", (other,)).fetchone()[0]
+        conn.commit()
+    r = _put_intro(client, tokens["a_admin"], characters=[{"id": cid, "name": "搶過來"}])
+    assert r.status_code == 400
+    with psycopg.connect(pg_cluster["shop_a"]) as conn:
+        assert conn.execute("SELECT name, mmg_id FROM mmg_character WHERE id = %s", (cid,)).fetchone() == ("別人的", other)
+        conn.execute("DELETE FROM mmg WHERE id = %s", (other,))
+        conn.commit()
+
+
+def test_character_image_is_public_only_while_on_shelf_and_goes_with_its_character(client, tokens, pg_cluster):
+    h = _auth(tokens["a_admin"])
+    _put_intro(client, tokens["a_admin"], characters=[{"name": "偵探"}])
+    cid = _characters(client, tokens["a_admin"])[0]["id"]
+    r = client.put(f"/v/shop-a/api/admin/mmg/1/characters/{cid}/image", headers=h, data=_png((3000, 2000)))
+    assert r.status_code == 200, r.get_json()
+    path = r.get_json()["characters"][0]["image_path"]
+    img = client.get(f"/v/shop-a{path}", headers=IP)
+    assert img.status_code == 200 and img.mimetype == "image/webp"
+    assert Image.open(io.BytesIO(img.data)).size == (800, 533), "角色圖縮得比封面小"
+    assert client.get(f"/v/shop-a{path.replace('/mmg/1/', '/mmg/2/')}", headers=IP).status_code == 404, \
+        "角色圖要對得上是哪一齣"
+
+    _sql(pg_cluster["shop_a"], "UPDATE mmg SET status = 'inactive' WHERE id = 1")
+    import intro_public, tenancy
+    with tenancy.use("shop-a"):
+        intro_public.invalidate()
+    assert client.get(f"/v/shop-a{path}", headers=IP).status_code == 404, "下架的劇本，角色圖也不公開"
+    assert client.get(f"/v/shop-a{path.replace('/api/public/', '/api/admin/')}", headers=h).status_code == 200
+
+    gone = client.delete(f"/v/shop-a/api/admin/mmg/1/characters/{cid}/image", headers=h).get_json()
+    assert gone["characters"][0]["image_path"] is None
+    _put_intro(client, tokens["a_admin"], characters=[])
+    with psycopg.connect(pg_cluster["shop_a"]) as conn:
+        assert conn.execute("SELECT count(*) FROM mmg_character").fetchone()[0] == 0
+
+
+def test_character_image_needs_admin_and_rejects_non_images(client, tokens):
+    _put_intro(client, tokens["a_admin"], characters=[{"name": "偵探"}])
+    cid = _characters(client, tokens["a_admin"])[0]["id"]
+    url = f"/v/shop-a/api/admin/mmg/1/characters/{cid}/image"
+    assert client.put(url, data=_png()).status_code == 401
+    assert client.put(url, headers=_auth(tokens["a_player"]), data=_png()).status_code == 403
+    r = client.put(url, headers=_auth(tokens["a_admin"]), data=b"not an image")
+    assert r.status_code == 400 and "不是圖片" in r.get_json()["error"]
+    assert client.put("/v/shop-a/api/admin/mmg/1/characters/999999/image",
+                      headers=_auth(tokens["a_admin"]), data=_png()).status_code == 404
+
+
+def test_one_page_view_costs_one_database_query_however_many_images(client, tokens, monkeypatch):
+    """一齣 10 個角色的劇本：圖要在看簡介那一次就一起撈進快取，不能每張圖各查一次。"""
+    import intro_public
+    from db.connection import pool
+
+    h = _auth(tokens["a_admin"])
+    _put_intro(client, tokens["a_admin"], characters=[{"name": f"角色{i}"} for i in range(10)])
+    for c in _characters(client, tokens["a_admin"]):
+        client.put(f"/v/shop-a/api/admin/mmg/1/characters/{c['id']}/image", headers=h, data=_png((200, 200)))
+    client.put("/v/shop-a/api/admin/mmg/1/cover", headers=h, data=_png((200, 200)))
+
+    body = client.get("/v/shop-a/api/public/mmg/1", headers=IP).get_json()
+    paths = [body["cover_path"]] + [c["image_path"] for c in body["characters"]]
+    assert all(paths) and len(paths) == 11
+
+    def boom(*_a, **_k):
+        raise AssertionError("圖片應該已經在快取裡")
+    monkeypatch.setattr(pool, "connection", boom)
+    for p in paths:
+        assert client.get(f"/v/shop-a{p}", headers=IP).status_code == 200, p
+    assert intro_public._budgets.for_tenant("shop-a").used == 1, "整頁只算一次資料庫查詢"
+
+
+def test_old_character_text_is_split_into_characters_once(pg_cluster):
+    """2026-10-26 以前角色簡介是一整段文字。升級時拆成一個一個角色，然後拿掉舊欄位。"""
+    from db import schema
+
+    url = pg_cluster["shop_a"]
+    _sql(url, "ALTER TABLE mmg ADD COLUMN intro_characters TEXT")
+    _sql(url, "UPDATE mmg SET intro_characters = %s WHERE id = 1", (
+        "陳大偉（David）：男性，曾經的班長。\n\n王鐵柱:校草\n【管家】知道太多的人\n"
+        + "很" * 40 + "長的一段說明\n",))
+    with psycopg.connect(url) as conn:
+        with conn.cursor() as cur:
+            schema._ensure_mmg_character(cur)
+        conn.commit()
+        rows = conn.execute("SELECT position, name, description FROM mmg_character "
+                            "WHERE mmg_id = 1 ORDER BY position").fetchall()
+        cols = [r[0] for r in conn.execute("SELECT column_name FROM information_schema.columns "
+                                           "WHERE table_name = 'mmg'").fetchall()]
+    assert rows == [
+        (0, "陳大偉（David）", "男性，曾經的班長。"),
+        (1, "王鐵柱", "校草"),
+        (2, "【管家】知道太多的人", None),
+        (3, "角色 4", "很" * 40 + "長的一段說明"),
+    ], rows
+    assert "intro_characters" not in cols

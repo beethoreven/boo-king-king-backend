@@ -2069,7 +2069,12 @@ def public_intro(mmg_id: int):
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 payload = intro_db.get_public(cur, mmg_id)
+                # 同一條連線把這一齣的圖全部撈進快取（intro_public 第 2 點）：
+                # 接下來瀏覽器要的封面與角色圖就不必再各查一次資料庫。
+                images = intro_db.public_images(cur, mmg_id) if payload else []
         intro_public.store_intro(mmg_id, payload)
+        for key, data in images:
+            intro_public.store_image(key, data)
     if payload is None:
         return jsonify({"error": "找不到這個劇本"}), 404
     if intro_public.record_view(mmg_id, ip, chain, request.headers.get("User-Agent", "")):
@@ -2079,26 +2084,42 @@ def public_intro(mmg_id: int):
     return resp
 
 
-@app.get("/api/public/mmg/<int:mmg_id>/cover/<int:version>.webp")
-def public_intro_cover(mmg_id: int, version: int):
-    """簡介頁的封面圖。網址帶版本號（換圖就換網址），所以可以快取一年。"""
+def _public_image(key: tuple, load):
+    """公開的圖片（封面、角色圖）。網址帶版本號（換圖就換網址），所以可以快取一年。
+    load(cur) 去資料庫拿；快取命中就不連資料庫。"""
     limited, _ip, _chain = _rate_limited("cover")
     if limited:
         return limited
-    data = intro_public.cached_cover(mmg_id, version)
+    data = intro_public.cached_image(key)
     if data is intro_public.MISS:
         busy = _db_budget_exhausted()
         if busy:
             return busy
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                data = intro_db.get_cover(cur, mmg_id, version, public=True)
-        intro_public.store_cover(mmg_id, version, data)
+                data = load(cur)
+        intro_public.store_image(key, data)
     if data is None:
         return jsonify({"error": "找不到這張圖"}), 404
     resp = app.response_class(data, mimetype="image/webp")
     resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     return resp
+
+
+@app.get("/api/public/mmg/<int:mmg_id>/cover/<int:version>.webp")
+def public_intro_cover(mmg_id: int, version: int):
+    return _public_image(
+        ("cover", mmg_id, version),
+        lambda cur: intro_db.get_cover(cur, mmg_id, version, public=True),
+    )
+
+
+@app.get("/api/public/mmg/<int:mmg_id>/characters/<int:character_id>/<int:version>.webp")
+def public_intro_character_image(mmg_id: int, character_id: int, version: int):
+    return _public_image(
+        ("character", mmg_id, character_id, version),
+        lambda cur: intro_db.get_character_image(cur, mmg_id, character_id, version, public=True),
+    )
 
 
 @app.get("/api/admin/mmg/<int:mmg_id>/intro")
@@ -2116,7 +2137,7 @@ def admin_get_intro(mmg_id: int):
 @app.put("/api/admin/mmg/<int:mmg_id>/intro")
 @require_role(1)
 def admin_update_intro(mmg_id: int):
-    """存劇本簡介、角色簡介、老闆的話、類型標籤（整份覆蓋）。"""
+    """存劇本簡介、角色、老闆的話、類型標籤（整份覆蓋）。"""
     body = request.get_json(silent=True) or {}
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -2168,6 +2189,52 @@ def admin_delete_cover(mmg_id: int):
             conn.commit()
     intro_public.invalidate()
     return jsonify(item)
+
+
+@app.put("/api/admin/mmg/<int:mmg_id>/characters/<int:character_id>/image")
+@require_role(1)
+def admin_upload_character_image(mmg_id: int, character_id: int):
+    """上傳角色圖：做法同封面（admin_upload_cover），只是縮得比較小。
+
+    角色要先存過（有 id）才能放圖：前端存檔時先存文字、拿到新角色的 id，再傳圖。
+    """
+    request.max_content_length = cover_image.MAX_UPLOAD_BYTES
+    try:
+        webp = cover_image.to_webp(request.get_data(), cover_image.CHARACTER_MAX)
+    except cover_image.CoverError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return _set_character_image(mmg_id, character_id, webp)
+
+
+@app.delete("/api/admin/mmg/<int:mmg_id>/characters/<int:character_id>/image")
+@require_role(1)
+def admin_delete_character_image(mmg_id: int, character_id: int):
+    return _set_character_image(mmg_id, character_id, None)
+
+
+def _set_character_image(mmg_id: int, character_id: int, webp: bytes | None):
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if not intro_db.set_character_image(cur, mmg_id, character_id, webp):
+                return jsonify({"error": "找不到這個角色"}), 404
+            item = intro_db.get_for_admin(cur, mmg_id)
+            conn.commit()
+    intro_public.invalidate()
+    return jsonify(item)
+
+
+@app.get("/api/admin/mmg/<int:mmg_id>/characters/<int:character_id>/<int:version>.webp")
+@require_role(1)
+def admin_intro_character_image(mmg_id: int, character_id: int, version: int):
+    """編輯頁預覽用（同 admin_intro_cover）。"""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            data = intro_db.get_character_image(cur, mmg_id, character_id, version, public=False)
+    if data is None:
+        return jsonify({"error": "找不到這張圖"}), 404
+    resp = app.response_class(data, mimetype="image/webp")
+    resp.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+    return resp
 
 
 @app.get("/api/admin/mmg/<int:mmg_id>/cover/<int:version>.webp")

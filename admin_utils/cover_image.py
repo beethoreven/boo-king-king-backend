@@ -1,4 +1,4 @@
-"""簡介頁的封面圖：收到上傳的檔案 → 驗證 → 縮小 → 轉成 WebP。
+"""簡介頁的封面圖與角色圖：收到上傳的檔案 → 驗證 → 縮小 → 轉成 WebP。
 
 ## 為什麼一律重新編碼，不直接存原檔
 
@@ -36,6 +36,9 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 # 縮圖之後的最大寬、高（等比例縮進這個框，不裁切）。
 MAX_WIDTH = 1200
 MAX_HEIGHT = 1600
+# 角色圖：平常是縮圖，點開放大最多跟封面一樣大（手機上不到 400px 寬），
+# 800 寬在兩倍密度的螢幕上也夠清楚，檔案只有封面的一半左右。
+CHARACTER_MAX = (800, 1200)
 
 # 原圖最多幾個像素才肯解開。4000 萬 ≈ 8000×5000，比任何手機或相機的原圖都大，
 # 但遠小於「解開來會撐爆記憶體」的尺寸（見檔案開頭）。
@@ -52,8 +55,8 @@ class CoverError(ValueError):
     """上傳的檔案不能用。訊息直接給店家看。"""
 
 
-def to_webp(raw: bytes) -> bytes:
-    """驗證並轉檔。不合格就拋 CoverError。"""
+def to_webp(raw: bytes, max_size: tuple[int, int] = (MAX_WIDTH, MAX_HEIGHT)) -> bytes:
+    """驗證並轉檔，等比例縮進 max_size。不合格就拋 CoverError。"""
     if not raw:
         raise CoverError("沒有收到圖片")
     if len(raw) > MAX_UPLOAD_BYTES:
@@ -92,7 +95,7 @@ def to_webp(raw: bytes) -> bytes:
     # 部分 PNG）直接存 WebP 會走樣，先轉。
     has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
     img = img.convert("RGBA" if has_alpha else "RGB")
-    img.thumbnail((MAX_WIDTH, MAX_HEIGHT), Image.Resampling.LANCZOS)
+    img.thumbnail(max_size, Image.Resampling.LANCZOS)
 
     out = io.BytesIO()
     # ★ exif 明確給空的：不同版本的 Pillow 對「沒給 exif 時要不要沿用原圖的」
