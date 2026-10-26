@@ -236,14 +236,14 @@ def test_views_are_buffered_then_written_in_one_batch_per_store(client, pg_clust
     # B 店先留一筆在暫存裡（還不到寫入的量）。暫存區要是全行程共用，下面 A 店
     # 觸發寫入時，這一筆會被一起寫進 A 店的資料庫。
     client.get("/v/shop-b/api/public/mmg/1", headers={"X-Forwarded-For": "198.51.100.99"})
-    h = {"X-Forwarded-For": "203.0.113.9, 10.0.0.1", "User-Agent": "測試瀏覽器"}
+    h = {"X-Forwarded-For": "36.227.139.115, 10.0.0.1", "User-Agent": "測試瀏覽器"}
     client.get("/v/shop-a/api/public/mmg/1", headers=h)
     client.get("/v/shop-a/api/public/mmg/1", headers=h)
     assert _views(pg_cluster["shop_a"]) == [], "還沒累積夠，不該寫資料庫"
     client.get("/v/shop-a/api/public/mmg/1", headers=h)
     rows = _views(pg_cluster["shop_a"])
-    assert len(rows) == 3 and {r[1] for r in rows} == {"203.0.113.9"}, rows
-    assert rows[0] == (1, "203.0.113.9", "203.0.113.9, 10.0.0.1", "測試瀏覽器")
+    assert len(rows) == 3 and {r[1] for r in rows} == {"36.227.139.115"}, rows
+    assert rows[0] == (1, "36.227.139.115", "36.227.139.115, 10.0.0.1", "測試瀏覽器")
     assert _views(pg_cluster["shop_b"]) == [], "B 店那一筆還在暫存，不該寫到任何地方"
 
 
@@ -296,3 +296,27 @@ def test_client_ip_ignores_what_the_visitor_wrote_in_front(client, monkeypatch):
     req = Request(EnvironBuilder(headers={"X-Forwarded-For": f"{long_fake},{real}, 172.71.81.179, 10.29.8.12"}).get_environ())
     ip, stored = intro_public.client_ip(req)
     assert ip == real and stored.endswith("10.29.8.12") and len(stored) <= 300
+
+
+
+def test_all_proxy_chain_does_not_fall_back_to_the_spoofable_first_entry():
+    """整串都落在代理網段（例如從 Cloudflare Worker 發出的請求）時，不能退回
+    最前面那段——那是使用者自己寫的。"""
+    import intro_public
+    from flask import Request
+    from werkzeug.test import EnvironBuilder
+
+    req = Request(EnvironBuilder(headers={"X-Forwarded-For": "172.71.1.1, 172.71.81.179, 10.29.8.12"}).get_environ())
+    assert intro_public.client_ip(req)[0] == "10.29.8.12"
+
+
+def test_unpublishing_a_script_hides_its_intro_right_away(client, tokens):
+    """劇本管理存檔（下架）之後，簡介頁的快取要在 commit 之後清掉。"""
+    h = _auth(tokens["a_admin"])
+    assert client.get("/v/shop-a/api/public/mmg/1", headers=IP).status_code == 200   # 先進快取
+    item = client.get("/v/shop-a/api/admin/mmg", headers=h).get_json()
+    m = next(x for x in (item if isinstance(item, list) else item.get("items", [])) if x["id"] == 1)
+    m["status"] = "inactive"
+    r = client.put("/v/shop-a/api/admin/mmg/1", headers=h, json=m)
+    assert r.status_code == 200, r.get_json()
+    assert client.get("/v/shop-a/api/public/mmg/1", headers=IP).status_code == 404

@@ -152,8 +152,12 @@ def client_ip(request) -> tuple[str, str]:
             ip = candidate
             break
     if ip is None:
-        # 整串都是代理（或根本沒帶）：用連線的來源位址。本機開發與測試走這裡。
-        ip = parts[0] if parts else (request.remote_addr or "unknown")
+        # 整串都是代理（或根本沒帶）。★ 不能退回第一段：那一段是使用者自己寫的
+        # （例如從 Cloudflare Worker 發出的請求，整串都會落在 Cloudflare 網段，
+        # 第一段就能任意指定）。取最右邊那段——它可能是代理自己的位址，那樣頂多
+        # 是很多人擠在同一個 IP 下一起被限流，不會被偽造。沒帶標頭（本機開發、
+        # 測試）就用連線的來源位址。
+        ip = parts[-1] if parts else (request.remote_addr or "unknown")
     return ip[:64], header[-_MAX_HEADER_CHARS:]
 
 

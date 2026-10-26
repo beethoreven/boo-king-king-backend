@@ -1858,6 +1858,7 @@ def _admin_write(fn):
     def wrapper(*args, **kwargs):
         body = request.get_json(silent=True) or {}
         g.outbox = []
+        g.after_commit = []
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 try:
@@ -1866,6 +1867,10 @@ def _admin_write(fn):
                     conn.rollback()
                     return jsonify({"error": str(exc)}), 400
                 conn.commit()
+        # commit 之後才做的事（例如清快取）。在 commit 前清的話，中間那一瞬間
+        # 進來的讀取會把舊資料重新放回快取。
+        for after in g.after_commit:
+            after()
         # ★ commit 成功才送。被包住的路由把要發的通知放進 g.outbox，
         #   由這裡統一在交易外送出——寄信、推播都不該有機會影響交易。
         notify_events.send(g.outbox)
@@ -1981,7 +1986,8 @@ def admin_list_mmg():
 @_admin_write
 def admin_update_mmg(cur, body, mmg_id: int):
     # 名稱、價錢、上下架都會出現在公開的簡介頁上（見 intro_public.invalidate）。
-    intro_public.invalidate()
+    # commit 之後才清（_admin_write 的 after_commit），理由見那裡。
+    g.after_commit.append(intro_public.invalidate)
     changed = mmg_admin.update(cur, mmg_id, body)
     changed = _save_schedule(cur, mmg_id, body) or changed
     # ★ 一定排在兩個寫入都做完之後：價格與排期是同一次存檔，要看的是
@@ -1995,7 +2001,7 @@ def admin_update_mmg(cur, body, mmg_id: int):
 @require_role(1)
 @_admin_write
 def admin_create_mmg(cur, body):
-    intro_public.invalidate()   # 同上：簡介頁對「找不到這齣」的結果也有快取
+    g.after_commit.append(intro_public.invalidate)   # 同上：「找不到這齣」的結果也有快取
     new_id = mmg_admin.create(cur, body)
     _save_schedule(cur, new_id, body)
     bookings_db.check_deposit_coverage(cur, new_id)  # 同上
