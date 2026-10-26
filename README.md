@@ -56,6 +56,11 @@ curl -s localhost:5001/api/health
   都要用 `tenancy.PerTenant` / `tenancy.TableCache`**——`tests/test_tenant_state.py`
   會掃整個後端，沒用的直接失敗；`tests/test_cross_tenant.py` 用兩家測試店驗證結果。
   設定的兩種寫法（單店／多店家）見 `.env.example` 與 `tenancy.py` 開頭
+- **劇本簡介頁是公開的（2026-10-26）**：`/mmg/<id>` 不用登入。風險不是資料外洩（內容本來就公開），
+  是被拿來叫醒資料庫燒額度，所以 `intro_public.py` 讓大部分流量只打到記憶體：內容與圖片快取、
+  每個 IP 限流（IP 從 `X-Forwarded-For` 右邊往左讀——實測 Render 前面的代理會保留使用者偽造的
+  第一段）、瀏覽紀錄先暫存再整批寫入 `intro_view`（保留 90 天，隱私權政策寫的是同一個數字）。
+  封面圖一律用 Pillow 重新編碼（`admin_utils/cover_image.py`），清掉 EXIF 與 GPS
 - 連線層：`db/connection.py`，**每次請求各自開一條連線 + 號誌當反壓上限**（整台
   機器 5 條、每家店 3 條）。原本用 psycopg3 的 `ConnectionPool`，在 Render 免費方案上會永久卡死
   （容器凍結後池子的背景執行緒不恢復），2026-08-31 實測後換掉，完整理由見檔案內註解
