@@ -195,16 +195,44 @@ def _character_list(data: dict) -> list[tuple[int | None, str, str | None]]:
         cid = c.get("id")
         if cid is not None and (not isinstance(cid, int) or isinstance(cid, bool)):
             raise IntroError("角色資料格式不對")
-        name = _text(c, "name", CHARACTER_NAME_MAX, f"第 {n} 個角色的名稱")
-        if name is None:
-            raise IntroError(f"第 {n} 個角色沒有填角色名稱")
-        name = " ".join(name.split())          # 名稱是一行字：換行、連續空白併成一個空白
-        description = _text(c, "description", CHARACTER_DESCRIPTION_MAX, f"第 {n} 個角色的介紹")
-        out.append((cid, name, description))
+        out.append((cid, *_one_character(c, n)))
     ids = [cid for cid, _n, _d in out if cid is not None]
     if len(ids) != len(set(ids)):
         raise IntroError("角色資料格式不對")
     return out
+
+
+def _one_character(c: dict, n: int) -> tuple[str, str | None]:
+    """(名稱, 介紹)。名稱必填（見 _character_list）。n 是第幾個，放進錯誤訊息。"""
+    name = _text(c, "name", CHARACTER_NAME_MAX, f"第 {n} 個角色的名稱")
+    if name is None:
+        raise IntroError(f"第 {n} 個角色沒有填角色名稱")
+    name = " ".join(name.split())          # 名稱是一行字：換行、連續空白併成一個空白
+    description = _text(c, "description", CHARACTER_DESCRIPTION_MAX, f"第 {n} 個角色的介紹")
+    return name, description
+
+
+def create_character(cur, mmg_id: int, data: dict, n: int) -> int | None:
+    """單獨新增一個角色（排在最後面），回傳 id；劇本不存在回 None。
+
+    給「還沒存過的角色要放圖」用：圖片在選的當下就上傳，而上傳要有角色 id。
+    n 是它在編輯畫面上是第幾個，只用在錯誤訊息。
+    """
+    name, description = _one_character(data, n)
+    cur.execute("SELECT 1 FROM mmg WHERE id = %s FOR UPDATE", (mmg_id,))
+    if cur.fetchone() is None:
+        return None
+    cur.execute("SELECT count(*), coalesce(max(position) + 1, 0) FROM mmg_character WHERE mmg_id = %s",
+                (mmg_id,))
+    count, position = cur.fetchone()
+    if count >= CHARACTERS_MAX:
+        raise IntroError(f"角色最多 {CHARACTERS_MAX} 個")
+    cur.execute(
+        "INSERT INTO mmg_character (mmg_id, position, name, description) VALUES (%s, %s, %s, %s) "
+        "RETURNING id",
+        (mmg_id, position, name, description),
+    )
+    return cur.fetchone()[0]
 
 
 def _save_characters(cur, mmg_id: int, characters: list[tuple[int | None, str, str | None]]) -> None:

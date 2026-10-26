@@ -487,3 +487,22 @@ def test_old_character_text_is_split_into_characters_once(pg_cluster):
         (3, "角色 4", "很" * 40 + "長的一段說明"),
     ], rows
     assert "intro_characters" not in cols
+
+
+def test_a_single_character_can_be_created_for_its_image(client, tokens):
+    """選圖的當下就上傳：還沒存過的角色先單獨建出來，排在最後面。"""
+    h = _auth(tokens["a_admin"])
+    _put_intro(client, tokens["a_admin"], characters=[{"name": "甲"}])
+    r = client.post("/v/shop-a/api/admin/mmg/1/characters", headers=h,
+                    json={"name": " 新 角色 ", "description": "說明", "position": 2})
+    assert r.status_code == 200, r.get_json()
+    cid = r.get_json()["id"]
+    assert [(c["id"] == cid, c["name"]) for c in r.get_json()["intro"]["characters"]] == [(False, "甲"), (True, "新 角色")]
+    r = client.post("/v/shop-a/api/admin/mmg/1/characters", headers=h, json={"description": "x", "position": 3})
+    assert r.status_code == 400 and "第 3 個角色沒有填角色名稱" in r.get_json()["error"]
+    assert client.post("/v/shop-a/api/admin/mmg/1/characters", headers=_auth(tokens["a_player"]),
+                       json={"name": "x"}).status_code == 403
+    assert client.post("/v/shop-a/api/admin/mmg/999/characters", headers=h, json={"name": "x"}).status_code == 404
+    _put_intro(client, tokens["a_admin"], characters=[{"name": f"角{i}"} for i in range(12)])
+    r = client.post("/v/shop-a/api/admin/mmg/1/characters", headers=h, json={"name": "第十三"})
+    assert r.status_code == 400 and "最多 12 個" in r.get_json()["error"]

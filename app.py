@@ -2191,12 +2191,38 @@ def admin_delete_cover(mmg_id: int):
     return jsonify(item)
 
 
+@app.post("/api/admin/mmg/<int:mmg_id>/characters")
+@require_role(1)
+def admin_create_character(mmg_id: int):
+    """單獨新增一個角色（見 db/intro.create_character）。回 {"id": 新角色, "intro": 整份簡介}。
+
+    body：{"name", "description", "position"}，position 是它在畫面上是第幾個（1 起算），
+    只用在錯誤訊息。
+    """
+    body = request.get_json(silent=True) or {}
+    n = body.get("position") if isinstance(body.get("position"), int) else 1
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            try:
+                cid = intro_db.create_character(cur, mmg_id, body, n)
+            except intro_db.IntroError as exc:
+                conn.rollback()
+                return jsonify({"error": str(exc)}), 400
+            if cid is None:
+                return jsonify({"error": "找不到這個劇本"}), 404
+            item = intro_db.get_for_admin(cur, mmg_id)
+            conn.commit()
+    intro_public.invalidate()
+    return jsonify({"id": cid, "intro": item})
+
+
 @app.put("/api/admin/mmg/<int:mmg_id>/characters/<int:character_id>/image")
 @require_role(1)
 def admin_upload_character_image(mmg_id: int, character_id: int):
     """上傳角色圖：做法同封面（admin_upload_cover），只是縮得比較小。
 
-    角色要先存過（有 id）才能放圖：前端存檔時先存文字、拿到新角色的 id，再傳圖。
+    角色要先存在（有 id）才能放圖：還沒存過的角色，前端先用 admin_create_character
+    單獨建出來再傳圖。
     """
     request.max_content_length = cover_image.MAX_UPLOAD_BYTES
     try:
