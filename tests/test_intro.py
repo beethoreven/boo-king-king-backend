@@ -43,7 +43,8 @@ def _fresh(tokens, pg_cluster):
              "booking_cost_holiday = NULL, extra_note = NULL WHERE id = 1")
         _sql(pg_cluster[db], "UPDATE functions SET value = 'on' WHERE key = 'deposit'")
         _sql(pg_cluster[db], "DELETE FROM intro_view")
-    for state in (intro_public._limiters, intro_public._caches, intro_public._views):
+    for state in (intro_public._limiters, intro_public._caches, intro_public._views,
+                  intro_public._budgets):
         state.reset()
     for store in ("shop-a", "shop-b"):
         with tenancy.use(store):
@@ -320,3 +321,34 @@ def test_unpublishing_a_script_hides_its_intro_right_away(client, tokens):
     r = client.put("/v/shop-a/api/admin/mmg/1", headers=h, json=m)
     assert r.status_code == 200, r.get_json()
     assert client.get("/v/shop-a/api/public/mmg/1", headers=IP).status_code == 404
+
+
+
+def test_daily_db_budget_caps_cache_misses_but_not_cached_views(client, monkeypatch):
+    """很多 IP 各猜一個沒查過的編號：每一次都是快取沒有的。每天的總量上限擋這個。"""
+    import intro_public
+    from db.connection import pool
+
+    monkeypatch.setattr(intro_public, "DB_BUDGET_PER_DAY", 3)
+    ips = iter(f"36.227.0.{i}" for i in range(1, 50))
+    def get(path):
+        return client.get(path, headers={"X-Forwarded-For": next(ips)})
+
+    assert get("/v/shop-a/api/public/mmg/1").status_code == 200        # 第 1 次查：放進快取
+    assert get("/v/shop-a/api/public/mmg/901").status_code == 404      # 第 2 次
+    assert get("/v/shop-a/api/public/mmg/902").status_code == 404      # 第 3 次
+    r = get("/v/shop-a/api/public/mmg/903")                            # 額度用完
+    assert r.status_code == 503 and int(r.headers["Retry-After"]) >= 1
+
+    def boom(*_a, **_k):
+        raise AssertionError("額度用完之後不該再連資料庫")
+    monkeypatch.setattr(pool, "connection", boom)
+    assert get("/v/shop-a/api/public/mmg/904").status_code == 503
+    assert get("/v/shop-a/api/public/mmg/1").status_code == 200, "快取裡有的照常顯示"
+    monkeypatch.undo()
+
+    monkeypatch.setattr(intro_public, "DB_BUDGET_PER_DAY", 3)
+    assert get("/v/shop-b/api/public/mmg/1").status_code == 200, "別家店的額度另外算"
+    import datetime as dt
+    monkeypatch.setattr(intro_public, "_today", lambda: dt.date(2099, 1, 1))
+    assert get("/v/shop-a/api/public/mmg/905").status_code == 404, "隔天歸零"

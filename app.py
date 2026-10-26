@@ -2025,6 +2025,16 @@ def _rate_limited(kind: str):
     return (resp, 429), ip, chain
 
 
+def _db_budget_exhausted():
+    """今天的資料庫查詢額度用完了就回 503（見 intro_public 的第 5 點），否則 None。"""
+    retry = intro_public.take_db_budget()
+    if retry is None:
+        return None
+    resp = jsonify({"error": "簡介頁今天的讀取量已達上限，請明天再試"})
+    resp.headers["Retry-After"] = str(retry)
+    return resp, 503
+
+
 def _flush_intro_views() -> None:
     """把暫存的瀏覽紀錄寫進資料庫。失敗就放回去，下一次再寫——紀錄不該讓
     看簡介的人看到錯誤。"""
@@ -2053,6 +2063,9 @@ def public_intro(mmg_id: int):
         return limited
     payload = intro_public.cached_intro(mmg_id)
     if payload is intro_public.MISS:
+        busy = _db_budget_exhausted()
+        if busy:
+            return busy
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 payload = intro_db.get_public(cur, mmg_id)
@@ -2074,6 +2087,9 @@ def public_intro_cover(mmg_id: int, version: int):
         return limited
     data = intro_public.cached_cover(mmg_id, version)
     if data is intro_public.MISS:
+        busy = _db_budget_exhausted()
+        if busy:
+            return busy
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 data = intro_db.get_cover(cur, mmg_id, version, public=True)

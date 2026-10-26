@@ -9,7 +9,7 @@
   ★ **大部分流量完全不碰資料庫。** 一直重新整理、很多人同時看同一齣、
     亂猜不存在的劇本編號——都只打到記憶體。
 
-## 四件事
+## 五件事
 
   1. 簡介內容快取 60 秒（找不到的也快取，免得有人亂猜編號一直查資料庫）。
   2. 封面圖的位元組快取在記憶體（網址帶版本號，換圖就是新網址，不會舊）。
@@ -19,6 +19,12 @@
      排程跑時才一次寫進資料庫（db/intro.py 的 insert_views）。
      代價：服務重新啟動時，還沒寫進去的那幾筆會遺失。這份紀錄是用來追查
      攻擊的，不需要即時，這個取捨是刻意的。
+  5. **每家店每天最多讓公開頁查 100 次資料庫**（INTRO_DB_BUDGET_PER_DAY）。
+     限流是每個 IP 各自算的，擋不住「很多不同 IP 各打幾次、每次猜一個沒查過的
+     編號」——那種流量每一次都是快取沒有的，每一次都會叫醒資料庫。這一道是
+     總量的上限：用完之後，快取裡沒有的頁面暫時回 503，台北時間午夜歸零。
+     快取命中的瀏覽不算次數，照常顯示；管理員的編輯畫面不經過這裡。
+     （案主 2026-10-26：簡介頁一天有 10 次瀏覽就不錯了，100 很充足。）
 
 ★ 全部都是每家店一份（tenancy.PerTenant），也都是每個 gunicorn worker 一份：
   兩個 worker 時，實際的限流門檻是設定值的兩倍。這跟 db/slot_cache.py 的取捨
@@ -50,9 +56,13 @@ import os
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+import logging
 
 import tenancy
+
+log = logging.getLogger(__name__)
 
 INTRO_PER_MINUTE = int(os.environ.get("INTRO_RATE_PER_MINUTE", "30"))
 COVER_PER_MINUTE = int(os.environ.get("INTRO_COVER_RATE_PER_MINUTE", "120"))
@@ -70,6 +80,10 @@ _MAX_INTRO_ENTRIES = 2_000
 # 封面圖快取的總大小上限（每家店）。一張通常一兩百 KB，20MB 夠放上百張。
 _MAX_COVER_BYTES = 20 * 1024 * 1024
 COVER_TTL_SECONDS = 600.0
+
+# 每家店每天最多讓公開簡介頁查幾次資料庫（見檔案開頭第 5 點）。每個 worker 各算各的。
+DB_BUDGET_PER_DAY = int(os.environ.get("INTRO_DB_BUDGET_PER_DAY", "100"))
+_TAIPEI = timezone(timedelta(hours=8))
 
 # 瀏覽紀錄：累積到這麼多筆就寫進資料庫；暫存最多這麼多筆，再多就丟掉新的。
 FLUSH_AT = 200
@@ -108,7 +122,17 @@ class _Views:
         self.dropped = 0
 
 
+class _Budget:
+    __slots__ = ("day", "used", "warned")
+
+    def __init__(self) -> None:
+        self.day = None
+        self.used = 0
+        self.warned = False
+
+
 _limiters = tenancy.PerTenant(_Limiter)
+_budgets = tenancy.PerTenant(_Budget)
 _caches = tenancy.PerTenant(_Caches)
 _views = tenancy.PerTenant(_Views)
 
@@ -204,6 +228,35 @@ def check_rate(ip: str, kind: str) -> int | None:
         return max(1, int(_WINDOW - (now - dq[0])) + 1)
 
 
+# ── 每天的資料庫查詢上限 ─────────────────────────────────────────
+
+
+def _today():
+    return datetime.now(_TAIPEI).date()
+
+
+def take_db_budget() -> int | None:
+    """快取沒有、要去查資料庫之前先問這裡。可以查回 None；今天的額度用完了
+    回傳離台北午夜還有幾秒（給 Retry-After）。"""
+    b = _budgets.get()
+    today = _today()
+    with _lock:
+        if b.day != today:
+            b.day, b.used, b.warned = today, 0, False
+        if b.used < DB_BUDGET_PER_DAY:
+            b.used += 1
+            return None
+        first = not b.warned
+        b.warned = True
+    if first:
+        # 一天只記一次：這是「有人在大量打簡介頁」的訊號，值得在 log 裡看見，
+        # 但每一個被擋的請求都記一行只會把 log 洗掉。
+        log.warning("簡介頁今天的資料庫查詢已達上限（%s 次），之後只回快取", DB_BUDGET_PER_DAY)
+    now = datetime.now(_TAIPEI)
+    midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), _TAIPEI)
+    return max(1, int((midnight - now).total_seconds()))
+
+
 # ── 快取 ─────────────────────────────────────────────────────────
 
 
@@ -296,9 +349,11 @@ def give_back(rows: list[tuple]) -> None:
 
 def stats() -> dict:
     """目前這家店的暫存狀況（給 /internal/idle-gap-stats）。不碰資料庫。"""
-    v, c, lim = _views.get(), _caches.get(), _limiters.get()
+    v, c, lim, b = _views.get(), _caches.get(), _limiters.get(), _budgets.get()
     with _lock:
         return {
+            "db_budget_per_day": DB_BUDGET_PER_DAY,
+            "db_budget_used_today": b.used if b.day == _today() else 0,
             "buffered_views": len(v.rows),
             "dropped_views": v.dropped,
             "cached_intros": len(c.intro),
