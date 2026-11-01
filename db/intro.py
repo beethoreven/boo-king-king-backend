@@ -12,10 +12,10 @@
 ★ 訂金只有「這家店有收訂金」（functions.deposit = on）時才回。不收訂金的店，
   簡介頁上不該出現一個「訂金 NT$ 0」。
 
-★ 只公開**上架中**的劇本（status 是 active，或 preparing 但上架時間已到）。
-  準備中、已下架的一律當作不存在（404）——還沒公開的劇本不該先被看到。
-  跟玩家的劇本清單不同的是：預約截止（end_booking）過了照樣看得到簡介，
-  因為那只代表「不再接預約」，這齣戲還在架上（見 db/listing.py）。
+★ **只有下架（inactive）的劇本不公開**（404）；上架與「尚未上架」都看得到。
+  尚未上架的戲要先拿簡介頁去打廣告，所以一定要打得開（案主 2026-11-01）。
+  跟玩家的劇本清單不同：清單只列上架中、還沒過預約截止的；簡介頁不看
+  上架時間，也不看預約截止（end_booking 只代表「不再接預約」，見 db/listing.py）。
 
 ## 防攻擊放在哪
 
@@ -25,7 +25,7 @@
 
 from __future__ import annotations
 
-from db import functions, listing
+from db import functions
 
 # 字數上限。超過就擋下來並說清楚上限是多少，不要默默截斷——截斷的話，
 # 店家貼了一大段、存檔成功，簡介頁卻少了後半段，他不會知道為什麼。
@@ -38,10 +38,8 @@ CHARACTER_DESCRIPTION_MAX = 1000
 TAGS_MAX = 8
 TAG_MAX_CHARS = 12
 
-# 上架中（見檔案開頭）。跟 listing.VISIBLE_SQL 的差別是不看 end_booking。
-ON_SHELF_SQL = (
-    "(status = 'active' OR (status = 'preparing' AND start_booking <= %(now)s))"
-)
+# 簡介頁公開的條件（見檔案開頭）：只有下架的不公開。
+PUBLIC_SQL = "(status <> 'inactive')"
 
 _FIELDS = (
     "id, name, period, players, price, price_holiday, booking_cost, booking_cost_holiday, "
@@ -99,22 +97,20 @@ def _characters(cur, mmg_id: int) -> list[dict]:
 
 
 def get_public(cur, mmg_id: int) -> dict | None:
-    """上架中的劇本的簡介。不在架上或不存在回 None（呼叫端回 404）。"""
-    now = listing.now_taipei(cur)
+    """公開中（沒下架）的劇本的簡介。下架或不存在回 None（呼叫端回 404）。"""
     cur.execute(
-        f"SELECT {_FIELDS} FROM mmg WHERE id = %(id)s AND {ON_SHELF_SQL}",
-        {"id": mmg_id, "now": now},
+        f"SELECT {_FIELDS} FROM mmg WHERE id = %(id)s AND {PUBLIC_SQL}",
+        {"id": mmg_id},
     )
     row = cur.fetchone()
     return _payload(cur, row) if row else None
 
 
 def get_for_admin(cur, mmg_id: int) -> dict | None:
-    """管理員編輯用：不管上不上架都回，另外附上它現在公不公開。"""
-    now = listing.now_taipei(cur)
+    """管理員編輯用：下架的也回，另外附上它現在公不公開。"""
     cur.execute(
-        f"SELECT {_FIELDS}, {ON_SHELF_SQL} FROM mmg WHERE id = %(id)s",
-        {"id": mmg_id, "now": now},
+        f"SELECT {_FIELDS}, {PUBLIC_SQL} FROM mmg WHERE id = %(id)s",
+        {"id": mmg_id},
     )
     row = cur.fetchone()
     if row is None:
@@ -273,12 +269,11 @@ def set_cover(cur, mmg_id: int, webp: bytes | None) -> int | None:
 
 
 def get_cover(cur, mmg_id: int, version: int, *, public: bool) -> bytes | None:
-    """取封面圖。版本對不上（舊網址）回 None。public=True 時只給上架中的劇本。"""
+    """取封面圖。版本對不上（舊網址）回 None。public=True 時只給公開中（沒下架）的劇本。"""
     sql = "SELECT cover_image FROM mmg WHERE id = %(id)s AND cover_version = %(v)s"
     params = {"id": mmg_id, "v": version}
     if public:
-        sql += f" AND {ON_SHELF_SQL}"
-        params["now"] = listing.now_taipei(cur)
+        sql += f" AND {PUBLIC_SQL}"
     cur.execute(sql, params)
     row = cur.fetchone()
     return bytes(row[0]) if row and row[0] is not None else None
@@ -296,15 +291,14 @@ def set_character_image(cur, mmg_id: int, character_id: int, webp: bytes | None)
 
 
 def get_character_image(cur, mmg_id: int, character_id: int, version: int, *, public: bool) -> bytes | None:
-    """取角色圖。版本對不上回 None。public=True 時只給上架中的劇本（同 get_cover）。"""
+    """取角色圖。版本對不上回 None。public=True 時只給公開中（沒下架）的劇本（同 get_cover）。"""
     sql = (
         "SELECT c.image FROM mmg_character c JOIN mmg ON mmg.id = c.mmg_id "
         "WHERE c.id = %(cid)s AND c.mmg_id = %(id)s AND c.image_version = %(v)s"
     )
     params = {"cid": character_id, "id": mmg_id, "v": version}
     if public:
-        sql += f" AND {ON_SHELF_SQL}"
-        params["now"] = listing.now_taipei(cur)
+        sql += f" AND {PUBLIC_SQL}"
     cur.execute(sql, params)
     row = cur.fetchone()
     return bytes(row[0]) if row and row[0] is not None else None

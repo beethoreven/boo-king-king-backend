@@ -2053,7 +2053,7 @@ def _flush_intro_views() -> None:
 
 @app.get("/api/public/mmg/<int:mmg_id>")
 def public_intro(mmg_id: int):
-    """簡介頁的內容。不用登入，只回上架中的劇本。
+    """簡介頁的內容。不用登入，下架的劇本不回（見 db/intro.py）。
 
     ★ 快取命中就完全不碰資料庫（見 intro_public.py 開頭：公開頁面最大的風險是
       被拿來叫醒資料庫）。找不到的結果也快取，亂猜編號一樣打不到資料庫。
@@ -2125,7 +2125,7 @@ def public_intro_character_image(mmg_id: int, character_id: int, version: int):
 @app.get("/api/admin/mmg/<int:mmg_id>/intro")
 @require_role(1)
 def admin_get_intro(mmg_id: int):
-    """編輯頁用：不管上不上架都給，另外附上 public（現在公開了沒有）。"""
+    """編輯頁用：下架的也給，另外附上 public（現在公開了沒有）。"""
     with pool.connection() as conn:
         with conn.cursor() as cur:
             item = intro_db.get_for_admin(cur, mmg_id)
@@ -2266,7 +2266,7 @@ def admin_intro_character_image(mmg_id: int, character_id: int, version: int):
 @app.get("/api/admin/mmg/<int:mmg_id>/cover/<int:version>.webp")
 @require_role(1)
 def admin_intro_cover(mmg_id: int, version: int):
-    """編輯頁預覽用：不管上不上架都給。前端用帶登入憑證的 fetch 拿，不是 <img src>。"""
+    """編輯頁預覽用：下架的也給。前端用帶登入憑證的 fetch 拿，不是 <img src>。"""
     with pool.connection() as conn:
         with conn.cursor() as cur:
             data = intro_db.get_cover(cur, mmg_id, version, public=False)

@@ -111,11 +111,33 @@ def test_only_admins_can_edit(client, tokens):
     assert client.put("/v/shop-a/api/admin/mmg/1/cover", data=_png()).status_code == 401
 
 
-def test_scripts_not_on_shelf_are_not_public_but_admins_still_see_them(client, tokens, pg_cluster):
+def test_delisted_scripts_are_not_public_but_admins_still_see_them(client, tokens, pg_cluster):
     _sql(pg_cluster["shop_a"], "UPDATE mmg SET status = 'inactive' WHERE id = 1")
     assert client.get("/v/shop-a/api/public/mmg/1", headers=IP).status_code == 404
     r = client.get("/v/shop-a/api/admin/mmg/1/intro", headers=_auth(tokens["a_admin"]))
     assert r.status_code == 200 and r.get_json()["public"] is False
+
+
+def test_scripts_not_yet_on_sale_are_public_for_advertising(client, tokens, pg_cluster):
+    """尚未上架（上架時間還沒到）的戲要先拿簡介頁去打廣告，所以要打得開。"""
+    h = _auth(tokens["a_admin"])
+    _put_intro(client, tokens["a_admin"], characters=[{"name": "偵探"}])
+    cid = _characters(client, tokens["a_admin"])[0]["id"]
+    cover = client.put("/v/shop-a/api/admin/mmg/1/cover", headers=h, data=_png()).get_json()["cover_path"]
+    char = client.put(f"/v/shop-a/api/admin/mmg/1/characters/{cid}/image", headers=h,
+                      data=_png()).get_json()["characters"][0]["image_path"]
+    _sql(pg_cluster["shop_a"], "UPDATE mmg SET status = 'preparing', "
+         "start_booking = NOW() + interval '30 days' WHERE id = 1")
+    import intro_public, tenancy
+    with tenancy.use("shop-a"):
+        intro_public.invalidate()
+    assert client.get("/v/shop-a/api/public/mmg/1", headers=IP).status_code == 200
+    with tenancy.use("shop-a"):
+        intro_public.invalidate()      # 圖片也要直接查資料庫那一條路打得開，不只是預先撈好的快取
+    assert client.get(f"/v/shop-a{cover}", headers=IP).status_code == 200
+    assert client.get(f"/v/shop-a{char}", headers=IP).status_code == 200
+    r = client.get("/v/shop-a/api/admin/mmg/1/intro", headers=h)
+    assert r.get_json()["public"] is True
 
 
 # ── 封面圖 ─────────────────────────────────────────────────────
@@ -168,7 +190,7 @@ def test_cover_upload_rejects_non_images_and_huge_files(client, tokens):
 def test_admin_preview_cover_works_while_not_public(client, tokens, pg_cluster):
     h = _auth(tokens["a_admin"])
     path = client.put("/v/shop-a/api/admin/mmg/1/cover", headers=h, data=_png()).get_json()["cover_path"]
-    _sql(pg_cluster["shop_a"], "UPDATE mmg SET status = 'preparing', start_booking = NOW() + interval '7 days' WHERE id = 1")
+    _sql(pg_cluster["shop_a"], "UPDATE mmg SET status = 'inactive' WHERE id = 1")
     import intro_public, tenancy
     with tenancy.use("shop-a"):
         intro_public.invalidate()
