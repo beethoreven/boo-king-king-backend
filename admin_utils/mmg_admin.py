@@ -11,8 +11,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from auth_utils.user_status import active_sql
 from db import functions, slot_cache
-from db.bookings import BookingError
+from db.bookings import BookingError, instant_booking
 
 # 台北是固定的 UTC+8，沒有日光節約，所以不需要 zoneinfo（那在某些精簡的
 # 部署環境沒有時區資料庫可讀）。全系統一律以台北時間解讀日期。
@@ -62,7 +63,7 @@ def _money(data: dict, key: str) -> int | None:
     return value
 
 
-def _capacity(data: dict, default: int | None = None) -> int:
+def _capacity(cur, data: dict, default: int | None = None) -> int:
     """序位上限（waitlist_limit）：這個時段最多幾組，含已成立的那一組。
 
     ★ 0 不合法。0 的意思是「任何時段都已額滿」——玩家看到的是每一個時間都
@@ -71,10 +72,20 @@ def _capacity(data: dict, default: int | None = None) -> int:
       這一格是「候補幾組」）。要讓一齣戲不能訂，用狀態下架，不是把容量設 0。
     ★ 資料庫的 CHECK 仍是 >= 0，沒有一起收緊：既有資料庫裡可能已經有 0，
       收緊的話 ensure_schema 在啟動時就會失敗，整個服務起不來。
+    ★ 一建立就成立的店（不收訂金＋唯一主持人）只能是 1（案主 2026-11-10）。
+      那種店沒有人工關卡，第二組會跟第一組一樣直接成立，理由見
+      db/bookings.instant_booking。擋在存檔這裡，而不是默默改成 1：店家
+      填 2 的時候心裡想的是「要排候補」，那個念頭要被當場告訴做不到。
     """
-    value = data.get("waitlist_limit", default)
+    instant = instant_booking(cur)
+    value = data.get("waitlist_limit", 1 if instant else default)
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise BookingError("序位上限至少要 1（1＝一個時段只收一組，不排候補）")
+    if instant and value != 1:
+        raise BookingError(
+            "這家店不收訂金、主持人也不需要確認，預約一送出就成立，"
+            "所以一個時段只能收一組：序位上限請填 1"
+        )
     return value
 
 
@@ -219,7 +230,7 @@ def list_gm_candidates(cur) -> list[dict]:
         return []
     cur.execute(
         "SELECT id, name, email, role FROM users "
-        "WHERE role <= 2 AND status = 'active' ORDER BY role, name"
+        f"WHERE role <= 2 AND {active_sql()} ORDER BY role, name"
     )
     return [{"id": r[0], "name": r[1], "email": r[2], "role": r[3]} for r in cur.fetchall()]
 
@@ -347,7 +358,7 @@ def update(cur, mmg_id: int, data: dict) -> bool:
         # ★ 沒送就保留現值，理由同上面的假日價：還沒更新的舊前端不知道有這一欄，
         #   照 data.get() 寫的話它每存一次檔就把註記清掉。
         "extra_note": _extra_note(data) if "extra_note" in data else current["extra_note"],
-        "waitlist_limit": _capacity(data),
+        "waitlist_limit": _capacity(cur, data),
         "status": data["status"],
         "room_id": _room_id(cur, data),
         # ★ 上架日期不可為空，見下方 _require_start 的說明。
@@ -460,7 +471,7 @@ def create(cur, data: dict) -> int:
             data.get("ready_time_cost", 0.5), data.get("reset_time_cost", 0.5),
             price, price_holiday, cost, cost_holiday,
             data.get("players"), _extra_note(data),
-            _capacity(data, default=3), data.get("status", "active"),
+            _capacity(cur, data, default=3), data.get("status", "active"),
             _room_id(cur, data),
             start, end,
             names[0], user_ids[0],

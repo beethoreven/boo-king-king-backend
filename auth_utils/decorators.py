@@ -16,6 +16,7 @@ from flask import g, jsonify, request
 import tenancy
 from auth_utils import guard, whitelist
 from auth_utils.google_auth import extract_bearer_token
+from auth_utils.user_status import active_sql
 from auth_utils import sessions as sessions_mod
 from auth_utils.sessions import resolve_cached, resolve_session
 from db.connection import pool
@@ -145,7 +146,7 @@ def admin_display_name() -> str | None:
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT name FROM users WHERE role = 1 AND status = 'active' "
+                    f"SELECT name FROM users WHERE role = 1 AND {active_sql()} "
                     "ORDER BY id LIMIT 1"
                 )
                 row = cur.fetchone()

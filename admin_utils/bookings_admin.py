@@ -204,11 +204,11 @@ def create(cur, data: dict) -> int:
         day_type=data.get("day_type") or None,
     )
     # 狀態預設是 gm_confirm；管理員若指定了別的（或勾了確認），補一次更新。
-    update(cur, result.id, data)
+    update(cur, result.id, data, creating=True)
     return result.id
 
 
-def update(cur, booking_id: int, data: dict) -> bool:
+def update(cur, booking_id: int, data: dict, *, creating: bool = False) -> bool:
     """編輯一筆場次。回傳是否真的改到任何欄位。
 
     可編輯：劇本、預訂者、日期、時間、場次類型、狀態、訂金、備註，以及
@@ -275,6 +275,19 @@ def update(cur, booking_id: int, data: dict) -> bool:
     # 沒有指派主持人的角色不可能「已確認」——放著會讓
     # confirm_gm() 的「全員確認了嗎」判斷得到錯誤結果。
     gm_confirmed = [bool(c) and u is not None for c, u in zip(gm_confirmed, gm_user_ids)]
+
+    # 從別的狀態改回「待主持確認」→ 主持人的確認全部取消（案主 2026-11-10）。
+    #
+    # ★ 不清的話，「待主持確認」配上「全員已確認」是一個流程走不出來的組合：
+    #   主持人按不了確認（系統說他確認過了），而下一次只是改個備註存檔，
+    #   自動轉態就會把它默默推回「待收訂金」並再寄一次信給管理員
+    #   （2026-11-10 用臨時資料庫實際跑出來的）。改回去代表要主持人重新點頭，
+    #   所以就真的讓他重新點頭——系統會寄「請重新確認」給他們（notify_events ⑩）。
+    #
+    # 新增不算：create 建完會套一次 update，那時的「原本的狀態」是剛推導出來的，
+    # 不是管理員要退回的東西。
+    if not creating and status == "gm_confirm" and current["status"] != "gm_confirm":
+        gm_confirmed = [False] * 4
 
     new = {
         "mmg_id": data.get("mmg_id"), "player_id": data.get("player_id"),
@@ -404,3 +417,93 @@ def update(cur, booking_id: int, data: dict) -> bool:
     return True
 
 
+
+
+# ── 存檔前的確認對話框要用的資料（2026-11-10）────────────────────
+#
+# 這幾支只讀不寫。管理員在後台改狀態本來就是人工介入、可以做任何事；
+# 前端在送出之前用它們把「這次改動會牽動到誰」列給他看，讓他知道自己
+# 在做什麼，而不是事後才發現。
+
+
+def revive_preview(cur, booking_id: int) -> dict:
+    """把一筆已取消的預約改回來，它會排在第幾序位、誰會因此往後移。
+
+    序位是 created_at 算的（見 schema.py），所以改回來的那一筆回到它當初的
+    位置，排在它後面建立的那幾組都往後移一位。
+
+        position  改回來之後是第幾序位
+        moved     往後移的那幾組：{from, to, player_name, status, status_label}
+        booked    這個時段裡已經成立的那幾組（不論前後）：{position, player_name}
+    """
+    cur.execute(
+        "SELECT mmg_id, session_date, session_time, created_at "
+        "FROM booking_record WHERE id = %s",
+        (booking_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise BookingError(f"預約 id={booking_id} 不存在")
+    mmg_id, d, t, mine = row
+    cur.execute(
+        """
+        SELECT u.name, b.status, b.created_at
+          FROM booking_record b JOIN users u ON u.id = b.player_id
+         WHERE b.mmg_id = %s AND b.session_date = %s AND b.session_time = %s
+           AND b.status <> 'cancelled' AND b.id <> %s
+         ORDER BY b.created_at, b.id
+        """,
+        (mmg_id, d, t, booking_id),
+    )
+    others = cur.fetchall()
+    position = 1 + sum(1 for _n, _s, created in others if created < mine)
+    moved, booked = [], []
+    for i, (name, status, created) in enumerate(others):
+        now_at = i + 1
+        if created >= mine:
+            moved.append({
+                "from": now_at, "to": now_at + 1, "player_name": name,
+                "status": status, "status_label": TABS.get(status, status),
+            })
+        if status == "booked":
+            booked.append({
+                "position": now_at + 1 if created >= mine else now_at,
+                "player_name": name,
+            })
+    return {"position": position, "moved": moved, "booked": booked}
+
+
+def future_bookings(cur, *, mmg_id: int | None = None, user_id: int | None = None) -> dict:
+    """還沒開演、也還沒取消或結束的場次。下架劇本、停用帳號之前列給管理員看。
+
+    mmg_id 給的是這齣戲的；user_id 給的是這個人的，分成他主持的與他預訂的
+    （同一個人兩種身分都可能有）。
+    """
+    base = f"""
+        SELECT b.id, m.name, u.name, b.session_date, b.session_time, b.status
+          FROM booking_record b
+          JOIN mmg m ON m.id = b.mmg_id
+          JOIN users u ON u.id = b.player_id
+         WHERE b.status NOT IN ('cancelled', 'ended')
+           AND (b.session_date + b.session_time) >= (NOW() AT TIME ZONE 'Asia/Taipei')
+           AND {{cond}}
+         ORDER BY b.session_date, b.session_time, b.created_at
+    """
+
+    def fetch(cond: str, params: tuple) -> list[dict]:
+        cur.execute(base.format(cond=cond), params)
+        return [{
+            "id": r[0], "mmg_name": r[1], "player_name": r[2],
+            "session_date": r[3].isoformat(), "session_time": r[4].strftime("%H:%M"),
+            "status": r[5], "status_label": TABS.get(r[5], r[5]),
+        } for r in cur.fetchall()]
+
+    if mmg_id is not None:
+        return {"bookings": fetch("b.mmg_id = %s", (mmg_id,))}
+    return {
+        "as_gm": fetch(
+            "%s IN (b.gm1_user_id, b.gm2_user_id, b.gm3_user_id, b.gm4_user_id)",
+            (user_id,),
+        ),
+        "as_player": fetch("b.player_id = %s", (user_id,)),
+    }

@@ -29,6 +29,7 @@ import tenancy  # noqa: E402
 from auth_utils import guard, profile, sessions, whitelist  # noqa: E402
 from auth_utils.decorators import admin_display_name, require_auth, require_role  # noqa: E402
 from auth_utils.google_auth import extract_bearer_token, verify_google_id_token  # noqa: E402
+from auth_utils.user_status import effective_status_sql  # noqa: E402
 from admin_utils import bookings_admin, cover_image, mmg_admin, users_admin  # noqa: E402
 import jobs  # noqa: E402
 from db import bookings as bookings_db
@@ -351,7 +352,9 @@ def _revoke_if_banned(cur, user_id: int, email: str, before_status: str | None) 
       立刻重新登入——/auth/login 走的是同一支帶快取的權限查詢，命中時仍然
       回「active」，於是又拿到新 session、繞回原點。
     """
-    cur.execute("SELECT status FROM users WHERE id = %s", (user_id,))
+    # 讀當下生效的狀態，跟 before_status（來自 whitelist）同一把尺。讀欄位的話，
+    # 停權早已到期的人隨便一次記點都會被當成「剛被停權」踢下線。
+    cur.execute(f"SELECT {effective_status_sql()} FROM users WHERE id = %s", (user_id,))
     row = cur.fetchone()
     if row is None or row[0] != "banned" or before_status == "banned":
         return
@@ -1095,8 +1098,10 @@ def get_slot(mmg_id: int):
             #   但說法完全不同：「此時間未開放」會讓玩家去試別的時間，而
             #   那天不管幾點都不行。
             store_busy = busy_db.store_busy(cur, d)
+            # 跟 create_booking 用同一個容量（一建立就成立的店一律是 1）。各算
+            # 各的話，畫面會說「您將排在第 2 序位」，按下送出卻被擋下來。
+            capacity = bookings_db.effective_capacity(cur, item["waitlist_limit"])
 
-    capacity = item["waitlist_limit"]
     # 這個時段有沒有已經成立的那一組。玩家看到的說法差很多：已經有人
     # 成立了，後面排的就是候補；都還沒成立的話，大家只是先後順序不同。
     has_booked = any(st == "booked" for _p, _b, _n, st, _d, _t2, _r in queue)
@@ -2335,6 +2340,36 @@ def admin_list_users():
 def admin_update_user(cur, body, user_id: int):
     changed = users_admin.update(cur, user_id, body)
     return jsonify({"changed": changed, "item": users_admin.get(cur, user_id)})
+
+
+@app.get("/api/admin/users/<int:user_id>/future-bookings")
+@require_role(1)
+def admin_user_future_bookings(user_id: int):
+    """停用或停權之前，這個人還有哪些沒開演的場次（主持的、預訂的分開）。"""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            return jsonify(bookings_admin.future_bookings(cur, user_id=user_id))
+
+
+@app.get("/api/admin/mmg/<int:mmg_id>/future-bookings")
+@require_role(1)
+def admin_mmg_future_bookings(mmg_id: int):
+    """下架之前，這齣戲還有哪些沒開演的場次。"""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            return jsonify(bookings_admin.future_bookings(cur, mmg_id=mmg_id))
+
+
+@app.get("/api/admin/bookings/<int:booking_id>/revive")
+@require_role(1)
+def admin_booking_revive_preview(booking_id: int):
+    """把已取消的預約改回來之前：它會排第幾、誰會往後移、這個時段有沒有已成立的。"""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            try:
+                return jsonify(bookings_admin.revive_preview(cur, booking_id))
+            except BookingError as exc:
+                return jsonify({"error": str(exc)}), 404
 
 
 @app.post("/api/admin/users")

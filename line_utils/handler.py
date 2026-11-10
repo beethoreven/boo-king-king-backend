@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import uuid
 
+from auth_utils.user_status import active_sql
 from db import line_template
 from db.bookings import (
     REASON_GM_BUSY,
@@ -259,7 +260,7 @@ def is_staff(cur, line_user_id: str | None) -> bool:
         return False
     cur.execute(
         "SELECT 1 FROM users "
-        " WHERE line_user_id = %s AND status = 'active' AND role <= 2",
+        f" WHERE line_user_id = %s AND {active_sql()} AND role <= 2",
         (line_user_id,),
     )
     return cur.fetchone() is not None
@@ -282,10 +283,10 @@ def push_targets(cur, *, exclude_user_id: int | None = None) -> list[str]:
       得到）。少任何一個就不是有效的收件人。
     """
     cur.execute(
-        """
+        f"""
         SELECT u.id, u.line_user_id
           FROM users u JOIN roles r ON r.id = u.role
-         WHERE u.status = 'active'
+         WHERE {active_sql("u")}
            AND r.line_notification
            AND u.line_user_id IS NOT NULL
         """

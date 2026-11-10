@@ -132,6 +132,26 @@ TEMPLATES: dict[str, tuple[str, str]] = {
 {_foot()}
 </div>''',
     ),
+    # ── ⑩ 主持人：管理員把場次改回「待主持確認」（2026-11-10）──
+    #
+    # 改回去的同時，主持人原本的確認會被清掉（見 bookings_admin.update）。
+    # 不寄這封的話，主持人以為自己早就確認過了，那筆預約就一直卡著。
+    "gm_reconfirm": (
+        "【重新確認】《{{mmg_name}}》{{session_short}} 請再確認一次主持",
+        f'''<div style="{_WRAP}">
+<p style="margin:0 0 14px;">{{{{gm_name}}}} 您好：</p>
+<p style="margin:0 0 20px;">管理員把這筆預約改回「待主持人確認」，您先前的確認已經取消，請前往重新確認。</p>
+<div style="{_BOX}">
+{_row("劇本", "<strong>{{mmg_name}}</strong>")}
+{_row("場次", "<strong>{{session}}</strong>")}
+{_row("角色", "{{gm_role}}")}
+{_row("預訂者", "{{player_name}}")}
+</div>
+<p style="margin:0 0 24px;">在您重新確認之前，這筆預約<strong>不會成立</strong>。</p>
+{_btn("前往確認")}
+{_foot()}
+</div>''',
+    ),
     # ── ② 管理員：主持人都確認完了 ──────────────────────────
     "admin_reviewed": (
         "【場次確認通知】《{{mmg_name}}》{{session_short}} 主持人已全數確認，待收訂金",

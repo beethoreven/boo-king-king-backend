@@ -248,6 +248,25 @@ def on_transition(cur, before: dict | None, after: dict | None) -> list:
             if msg:
                 out.append(msg)
 
+    # ⑩ 從別的狀態改回「待主持確認」→ 請被指定的主持人重新確認（2026-11-10）。
+    #
+    #    只有管理員改得出這個轉移（流程本身只會往前走），而改回去的同時主持人
+    #    的確認已經被清掉（bookings_admin.update）。這次才新指定的人跳過——
+    #    他們已經收到 ① 了，不必一次收兩封。
+    #    single 模式走不到 gm_confirm（unreachable_statuses 擋著），不必特別判斷。
+    if before and old_status != "gm_confirm" and after["status"] == "gm_confirm":
+        again = [i for i in after["gm_user_ids"] if i and i in old_gms]
+        for gm in nf.users_by_id(cur, again):
+            msg = nf.build(cur, "gm_reconfirm", [gm], {
+                **base,
+                "gm_name": gm["name"] or "主持人",
+                "gm_role": _gm_role_name(
+                    cur, after["mmg_id"], after["gm_user_ids"], gm["id"]
+                ),
+            })
+            if msg:
+                out.append(msg)
+
     # ② 主持人全數確認 → 通知管理員去收訂金。
     if after["status"] == "gm_reviewed" != old_status:
         msg = nf.build(cur, "admin_reviewed", nf.admins(cur), base)

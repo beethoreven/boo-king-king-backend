@@ -27,6 +27,7 @@ import threading
 import time
 
 import tenancy
+from auth_utils.user_status import effective_status_sql
 
 # 快取存活秒數。這個查詢會出現在每一個受保護的請求上，沒有快取的話
 # 每次請求都要多一次資料庫往返。30 秒是「撤銷權限多快生效」與
@@ -50,21 +51,16 @@ def _fetch_user(cur, email: str) -> dict | None:
 
     停權是有期限的，而到期那一刻不會有人跑來把狀態改回去（那需要一個每分鐘
     醒來的排程，而那會讓 Neon 永遠不休眠——理由見 db/listing.py）。所以這裡
-    直接在 SQL 裡算：banned 但時間已過就等於 active。
+    直接在 SQL 裡算：banned 但時間已過就等於 active（算式在 auth_utils/user_status.py，
+    全後端共用同一條）。
 
     資料庫裡那個字什麼時候才會被改回來？每週的排程順手做（guard.decay_points）。
     那只是為了讓管理員在使用者清單上看到對的東西，不影響任何判定。
     """
     cur.execute(
-        """
+        f"""
         SELECT id, email, name, role,
-               CASE
-                   WHEN status = 'banned'
-                        AND banned_until IS NOT NULL
-                        AND banned_until <= NOW()
-                   THEN 'active'
-                   ELSE status
-               END AS effective_status,
+               {effective_status_sql()} AS effective_status,
                banned_until,
                abuse_point
           FROM users WHERE lower(email) = %s

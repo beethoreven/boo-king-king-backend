@@ -53,6 +53,7 @@ from dataclasses import dataclass
 import requests
 
 import tenancy
+from auth_utils.user_status import active_sql
 from db import roles
 
 log = logging.getLogger(__name__)
@@ -133,6 +134,7 @@ _RAW_VALUES = ("site_url", "link")
 #   的連結（不能接受）。
 _BUTTON_TARGET = {
     "gm_assigned": "view=gm&tab=pending",
+    "gm_reconfirm": "view=gm&tab=pending",
     "admin_reviewed": "view=admin&tab=bookings",
     "player_booked": "view=mybookings&tab=booked",
     "abuse_point": "view=admin&tab=abuse",
@@ -283,17 +285,13 @@ def build(cur, key: str, recipients: list[dict], values: dict) -> Message | None
 
 # ── 收件人 ──────────────────────────────────────────────────────
 
-# 「現在還算不算啟用」。跟 auth_utils/whitelist._fetch_user 用同一條算式，
-# 而且必須同一條——
+# 「現在還算不算啟用」。算式在 auth_utils/user_status.py，全後端共用同一條——
 #
 # 停權到期時 users.status 不會馬上變回 'active'：判定是讀取時即時算的
 # （所以人一到期就能登入工作），寫回資料庫是每週排程才做的（guard.decay_points）。
 # 中間最多差七天。這裡如果只看欄位字面值，那個人就會「照常使用系統、卻收不到
 # 任何通知」，而且沒有任何錯誤——正是不會有人回報的那種壞法。
-_EFFECTIVE_ACTIVE = """
-    (CASE WHEN status = 'banned' AND banned_until IS NOT NULL AND banned_until <= NOW()
-          THEN 'active' ELSE status END) = 'active'
-"""
+_EFFECTIVE_ACTIVE = active_sql()
 
 
 def _wants_email(cur, role_id: int) -> bool:

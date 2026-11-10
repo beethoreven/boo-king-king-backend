@@ -86,6 +86,31 @@ DUE_SQL = (
 AWAITING_DEPOSIT = ("gm_confirm", "gm_reviewed")
 
 
+def instant_booking(cur) -> bool:
+    """這家店的預約是不是「一建立就成立」：不收訂金，又是唯一主持人。
+
+    這種店從建立到成立之間沒有任何人要動手（沒有主持人要確認、沒有訂金
+    要收），所以同一個時段的第二組也會在建立的當下直接變成 booked——一個
+    時段兩組成立（2026-11-10 用臨時資料庫實際跑出來的）。別的店靠的是
+    「主持人只會確認一組、店家只會向一組收訂金」這道人工的關卡，這種店
+    沒有那道關卡，所以容量只能是 1，見 effective_capacity。
+
+    ★ option 模式（主持人可不指定）在玩家沒選主持人時也會一建立就成立，
+      但那種店的其他預約仍要確認，案主 2026-11-10 決定的範圍只到 single。
+    """
+    return functions.gm_mode(cur) == "single" and not functions.deposit_required(cur)
+
+
+def effective_capacity(cur, waitlist_limit: int) -> int:
+    """這個時段實際上最多收幾組。instant_booking 的店一律是 1。
+
+    劇本存檔時就會擋下大於 1 的值（mmg_admin._capacity），這裡再收一次，
+    是給「規則出現之前就存好的劇本」與「之後才改功能表的店」——那些資料
+    還留著舊的數字，不能讓它們繼續開出第二組。
+    """
+    return 1 if instant_booking(cur) else waitlist_limit
+
+
 def default_day_type(session_date) -> str:
     """依日期推場次類型：週六日是假日場，其餘是平日場。
 
@@ -781,7 +806,7 @@ def create_booking(
     # 地方。
     cur.execute("SELECT name, waitlist_limit FROM mmg WHERE id = %s", (mmg_id,))
     mms_name, waitlist_limit = cur.fetchone()
-    capacity = waitlist_limit
+    capacity = effective_capacity(cur, waitlist_limit)
 
     clash = has_room_conflict(cur, mmg_id, session_date, session_time)
     if clash is not None:
@@ -873,12 +898,12 @@ def create_booking(
             #   沒有意義。前端的 slotMessage 用同一條規則（看 slot.capacity）。
             # 容量擋下的一定是「同一齣戲、同一個開始時間」（衝突檢查已經把
             # 這種情況排除在外了），所以原因固定是 same_time。
-            if waitlist_limit == 1:
+            if capacity == 1:
                 raise BookingError("這個時段已經被預約了，請改選其他時間",
                                    reason=REASON_SAME_TIME)
             raise BookingError(
                 f"《{mms_name}》{session_date} {session_time} 已額滿"
-                f"（最多 {waitlist_limit} 組）",
+                f"（最多 {capacity} 組）",
                 reason=REASON_SAME_TIME,
             )
         cur.execute(

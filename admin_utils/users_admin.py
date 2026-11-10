@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from auth_utils import guard, sessions, whitelist
+from auth_utils.user_status import effective_status_sql
 from db import roles
 from db.bookings import BookingError
 
@@ -43,7 +44,13 @@ def _row_to_dict(cur, row) -> dict:
     }
 
 
-_COLUMNS = "id, email, name, role, status, line_id, phone, banned_until, abuse_point"
+# status 是**當下生效的**狀態（停權到期就是 active），不是欄位裡存的字。
+# 直接讀欄位的話，到期的人在清單上仍標「異常停權」、編輯時「啟用 → 停用」
+# 也認不出來（踢不下線），見 auth_utils/user_status.py。
+_COLUMNS = (
+    f"id, email, name, role, {effective_status_sql()}, line_id, phone, "
+    "banned_until, abuse_point"
+)
 
 
 def list_all(cur) -> list[dict]:
