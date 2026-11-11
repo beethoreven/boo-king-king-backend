@@ -14,8 +14,8 @@
 ★ 玩家的劇本清單只列 active。preparing 與 inactive 都不會出現，
   連選單裡都沒有——見 db/mmg.py 的 list_active。
 
-★ 欄位值沿用既有的 inactive（案主口語說「deactive」，那是 users 表的
-  用字）。兩張表用不同的字是既成事實，改名要動遷移又沒有換到任何東西，
+★ 欄位值沿用既有的 inactive（users 表用的字是
+  「deactive」）。兩張表用不同的字是既成事實，改名要動遷移又沒有換到任何東西，
   所以維持原樣；顯示層一律講「下架」。
 
 ## 到點自動切換：為什麼不是每分鐘跑一次 cron

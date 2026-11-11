@@ -26,7 +26,7 @@ cp .env.example .env   # 單店寫法：VARIANT、DATABASE_URL、GOOGLE_CLIENT_I
 macOS 的 AirPlay 接收器佔用 5000，而且是回 403 不是拒絕連線，症狀看起來會
 像應用程式自己壞了。
 
-被佔用時的處理見 `release-occupied-port` skill；不要改用隨機 port，
+被佔用時用 `lsof -iTCP:5001 -sTCP:LISTEN` 找出佔用的程序並結束它；不要改用隨機 port，
 Google OAuth 的 authorized origins 是連 port 一起比對的。
 
 確認起來了：

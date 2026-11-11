@@ -37,9 +37,6 @@ with inactivity, which can delay requests by 50 seconds or more」）。行程
 這不是參數調得出來的。連線池的整個設計就是把建立連線交給背景執行緒——
 那些執行緒在這個託管模型下沒有存活保證，池子就不可能可靠。
 
-★ 姊妹專案 zh-cn-to-tw 在 Render 上踩過同一類問題並做了同樣的取捨，記在
-  known-issue-check 清單的第 16、17、18 條。
-
 ## 代價與換到的東西
 
 代價是每次請求多一次連線握手。同區實測約 0.2-0.6 秒——不是零，但現況是
@@ -68,8 +65,8 @@ with inactivity, which can delay requests by 50 seconds or more」）。行程
 但沒有寫在它名字裡的事。少了它，尖峰時的連線數不再有天花板，而 Render
 免費方案是 0.1 CPU / 512MB。
 
-zh-cn-to-tw 就是這樣把服務打掛過：拿掉全域鎖之後，10 個併發請求讓整個
-服務回 502 直到自己重啟。所以這裡用號誌補回那個上限，而且兩個方向都有界：
+在同樣的 Render 免費方案上，拿掉全域鎖、又沒有其他上限時，10 個併發請求
+就讓整個服務回 502 直到自己重啟。所以這裡用號誌補回那個上限，而且兩個方向都有界：
   - 同時最多 _MAX_CONCURRENT 條
   - 等不到名額最多等 _SLOT_WAIT 秒，然後明確失敗
 
@@ -78,7 +75,7 @@ zh-cn-to-tw 就是這樣把服務打掛過：拿掉全域鎖之後，10 個併�
 
 ## 同區是前提，不是選配
 
-Render 與 Neon 都必須開在 ap-southeast-1（Singapore）。zh-cn-to-tw 實測，
+Render 與 Neon 都必須開在 ap-southeast-1（Singapore）。實測顯示，
 握手成本幾乎完全由網路距離決定（連線耗時 ÷ 一次乾淨的 RTT ≈ 6，兩條不同
 路徑分別量到 5.98 與 6.15）。跨區時單次查詢 1.76 秒、同區 0.03 秒，差 59 倍。
 

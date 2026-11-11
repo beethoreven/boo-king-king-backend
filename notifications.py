@@ -203,7 +203,7 @@ def render(text: str, values: dict, *, body: bool = False) -> str:
     壞掉，重則有人可以用暱稱往管理員的信箱塞任意 HTML。
 
     ★ 例外是 site_url 與 link：它們要進 href。兩者都不是使用者輸入——
-      site_url 來自 settings 表（只有案主用 SQL 改得到），link 是下面
+      site_url 來自 settings 表（只有用 SQL 才改得到），link 是下面
       _button_link() 用 site_url 加一段寫死的查詢字串組出來的——所以
       照原樣代入是安全的。
 

@@ -106,7 +106,7 @@ def update(cur, user_id: int, data: dict) -> bool:
 
     # 帳號從啟用轉成停用時，主動撤銷它名下所有 session。
     #
-    # 這是 zh-cn-to-tw 實作同一個功能時回報過來的教訓：光刪 session
+    # 光刪 session
     # 是無效的，對方可以立刻重新登入。/auth/login 走的是同一支有 30 秒
     # 快取的權限查詢，命中時仍然回「active」，於是又拿到新 session、
     # 繞回原點。兩件事一定要一起做：

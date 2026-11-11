@@ -96,7 +96,7 @@ def instant_booking(cur) -> bool:
     沒有那道關卡，所以容量只能是 1，見 effective_capacity。
 
     ★ option 模式（主持人可不指定）在玩家沒選主持人時也會一建立就成立，
-      但那種店的其他預約仍要確認，案主 2026-11-10 決定的範圍只到 single。
+      但那種店的其他預約仍要確認，所以這條規則的範圍只到 single。
     """
     return functions.gm_mode(cur) == "single" and not functions.deposit_required(cur)
 
@@ -351,7 +351,7 @@ def _occupied_reason(cur, resource: str, mmg_id: int, session_date, session_time
       的回傳會進管理員看到的詳細訊息。改它們的排序或形狀，步經徑的畫面就會跟著
       變。這裡另外問一句「那個開始時間點有沒有場」，只用來決定原因代碼。
 
-    規則（案主 2026-09-14 選的規則 B）：**只看開始時間是否相同，不管是哪一齣**。
+    規則：**只看開始時間是否相同，不管是哪一齣**。
     已經有「丹水山莊 14:00」時，有人訂「傀儡的記憶 14:00」也算 same_time——那個
     時間點已經有場了；訂「丹水山莊 15:00」才算 overlap。
 
@@ -361,7 +361,7 @@ def _occupied_reason(cur, resource: str, mmg_id: int, session_date, session_time
 
     ★ **不排除同一齣戲**。兩支衝突檢查會排除「同一齣戲、同一個開始時間」，
       但這裡不能照抄：如果那個時間點已經有同一齣的場，而隔壁時段又有別齣
-      撞到主持人，主持人檢查會先觸發——這時那個時間點確實已經有場，照規則 B
+      撞到主持人，主持人檢查會先觸發——這時那個時間點確實已經有場，照上面的規則
       要回 same_time，排除掉就會錯判成 overlap。
     """
     base = """
@@ -594,7 +594,7 @@ def find_conflicts(cur, booking_id: int) -> dict:
     # 兩者的處置完全不同，所以分開回：
     #   store_busy  店家自己標的。管理員可以放行（跳對話框確認），因為
     #               場次管理那條路本來就不問排期。
-    #   busy_gms    主持人自己標的。**誰都不能放行**（案主 2026-09-18），
+    #   busy_gms    主持人自己標的。**誰都不能放行**，
     #               只能請他先解除忙碌日。
     #
     # ★ 跟上面兩種撞期不一樣，這兩個不看 status='booked'：忙碌日講的是
@@ -748,8 +748,8 @@ def create_booking(
     #   當場標成「已確認」——後面每一段判斷「還在等誰確認」的程式碼因此
     #   完全不需要知道 single 這回事。
     #
-    #   固定用 users.id = 1：那家店的第一個帳號就是店主本人。案主明確承擔
-    #   這個風險（2026-09-11）：「你不用擔心 DB 搬移意外，要真的發生我來改正」。
+    #   固定用 users.id = 1：那家店的第一個帳號就是店主本人。風險與取捨見
+    #   db/functions.py 的 SINGLE_GM_USER_ID。
     gm_confirmed = [False, False, False, False]
     if functions.gm_mode(cur) == "single":
         cur.execute(
@@ -824,7 +824,7 @@ def create_booking(
             reason=reason,
         )
 
-    # 主持人忙碌日。**硬擋，管理員也不能放行**（案主 2026-09-18）：它跟主持人
+    # 主持人忙碌日。**硬擋，管理員也不能放行**：它跟主持人
     # 撞期同一級，差別只在撞期是系統算的、忙碌日是他自己標的。所以這一段刻意
     # 放在 allow_closed_slot 的判斷之外——場次管理那條路不問排期，但這一條照擋。
     busy_gms = busy.busy_gm_ids(cur, gm_ids, session_date)
@@ -1248,7 +1248,7 @@ def list_player_date(cur, player_id: int, session_date, *, start: int = 1) -> di
     就會講不一樣的話。
 
     ★ 跟行事曆上的點**刻意不一致**：點不畫已取消的（見 player_month_days），
-      這裡全部列出（案主 2026-09-17 定案）。兩者回答的問題不同——點回答
+      這裡全部列出。兩者回答的問題不同——點回答
       「那天我有沒有事」，列表回答「那天這筆後來怎麼了」。
 
     排序只看時間，不像頁籤那樣分「最早／最近」：同一天之內由早到晚，就是
@@ -1270,7 +1270,7 @@ def player_month_days(cur, player_id: int, year: int, month: int) -> dict[str, l
     畫面上的點要照開始時間由左往右畫，所以順序本身就是資料的一部分；
     改成回傳每種狀態幾場的話，那個順序就再也還原不回來了。
 
-    ★ 不含已取消（案主 2026-09-17 定案）。要看已取消的走 list_player_date()。
+    ★ 不含已取消。要看已取消的走 list_player_date()。
 
     ★ 用半開區間 [這個月 1 號, 下個月 1 號) 而不是算出當月最後一天：閏年與
       大小月不必自己判斷，少一個會算錯的地方。
@@ -1704,7 +1704,7 @@ def list_gm_date(cur, gm_id: int, session_date, *, start: int = 1) -> dict:
     跟頁籤那三包的差別只有「條件是日期、不是頁籤」，欄位與排序規則沿用同一
     份查詢；多回一個 category（見 _GM_CATEGORY_SQL），畫面靠它上色與標字。
 
-    ★ 點不畫已取消、清單全部列出——三份行事曆同一條規則（案主 2026-09-17）。
+    ★ 點不畫已取消、清單全部列出——三份行事曆同一條規則。
     """
     def item(r):
         return {
@@ -1739,7 +1739,7 @@ def gm_month_days(cur, gm_id: int, year: int, month: int) -> dict[str, list[str]
     回傳 {'2026-09-05': ['pending', 'confirmed']}。一場一個值，不是計數——
     點要照開始時間由左往右畫，順序本身就是資料。
 
-    ★ 不含已取消（案主 2026-09-17 定案）；要看已取消的走 list_gm_date()。
+    ★ 不含已取消；要看已取消的走 list_gm_date()。
     """
     first = date(year, month, 1)
     nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)

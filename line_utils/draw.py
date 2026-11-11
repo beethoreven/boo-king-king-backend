@@ -48,7 +48,7 @@ BUSY_RING = "#141413"   # --busy-ring
 DOT = {
     "gm_confirm": "#c8890c",   # --dot-wait
     "gm_reviewed": "#cf5148",  # --dot-deposit
-    "booked": "#c3aee0",       # --dot-booked：粉紫（案主 2026-09-19 指定）
+    "booked": "#c3aee0",       # --dot-booked：粉紫
     "ended": "#625d56",        # --dot-ended：深灰
 }
 
@@ -122,7 +122,7 @@ def day_png(day: date, items: list[dict], has_more: bool, *, now: datetime) -> b
     """某一天的場次，一場一張卡片（網站 storeCard 的樣子）。已取消的也列——
     跟網站同一條規則：點不畫已取消，清單全部列出。
 
-    ★ 卡片上只有劇本、日期時間、狀態，**不放預訂者與備註**（案主 2026-09-19）。
+    ★ 卡片上只有劇本、日期時間、狀態，**不放預訂者與備註**。
       這張圖會貼在有客人的群組裡，網站上那張卡片是給店家自己看的。
     """
     fonts = _Fonts(3)
@@ -200,7 +200,7 @@ def _month(cv: _Canvas, x0: float, y0: float, year: int, month: int,
 
 
 def _marks(cv: _Canvas, center_x: float, top: float, statuses: list[str]) -> None:
-    """一場一個點、依開始時間由左到右；四場以上改畫一條線（案主定案）。"""
+    """一場一個點、依開始時間由左到右；四場以上改畫一條線。"""
     if len(statuses) > MAX_DOTS:
         cv.shape(center_x - LINE_W / 2, top + (MARKS_H - LINE_H) / 2,
                  LINE_W, LINE_H, 2, INK)

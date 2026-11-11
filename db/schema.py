@@ -8,7 +8,7 @@
 
 只支援 Postgres（Neon）。冪等操作（CREATE TABLE IF NOT EXISTS、補欄位前
 先檢查），但只需要在這個 process 生命週期裡成功跑過一次——第一次成功後
-就把旗標打開，之後直接跳過。理由與 zh-cn-to-tw 相同：Neon 這種每次連線
+就把旗標打開，之後直接跳過。理由：Neon 這種每次連線
 都有實質延遲的服務，重跑整段檢查的成本不能忽略。
 
 ★ 旗標是**每家店一個**。一個服務服務好幾家店時，每家都是自己的資料庫，
@@ -115,8 +115,8 @@ def ensure_schema(cur) -> None:
     _ensure_intro_view(cur)
 
     # ★ LINE 是模組，不是每一家都有。沒設定 LINE 的店，資料庫裡就不建
-    #   它的表與欄位——那家店用不到的東西不該留在它的資料庫裡（案主
-    #   2026-09-14）。判斷用的是跟 webhook 同一支 enabled()，所以「服務
+    #   它的表與欄位——那家店用不到的東西不該留在它的資料庫裡。
+    #   判斷用的是跟 webhook 同一支 enabled()，所以「服務
     #   說 LINE 開著」跟「資料庫有 LINE 的表」不會兜不起來。
     #
     #   之後要開：設好兩個環境變數、重新部署，開機時就會建出來。
@@ -202,7 +202,7 @@ def _ensure_line_template(cur) -> None:
              '變數：owner_name（LINE 訂場掛名的帳號的名字，即 users.id = 1）'),
             -- ★ 預設文字**不寫死店主的名字**，用 owner_name 變數：後端是每一家
             --    店共用的程式，寫死的話這句話會被種進其他店家的資料庫。在 eli
-            --    的資料庫裡它讀出來就是「eli」，顯示的結果跟案主要的一模一樣。
+            --    的資料庫裡它讀出來就是「eli」，顯示的結果跟寫死名字一模一樣。
             ('store_busy',
              '❌ 當天{owner_name}有其他的排程，請換一個日期。',
              '那天是店家忙碌日，整天不開放。硬要排就得走後台（管理員那條路不問排期）。'
@@ -220,7 +220,7 @@ def _ensure_line_template(cur) -> None:
              '❌ 行事曆一次最多查 {max_months} 個月，而且要由早到晚，例如「2026/8~2026/12行事曆」',
              '行事曆的範圍倒過來，或超過上限。變數：max_months（上限，寫在程式裡，'
              '見 line_utils/commands.py 的 MAX_MONTHS）'),
-            -- 案主 2026-09-19 給的原文，有換行。每一段結尾的換行字元是 Python 放進去的；
+            -- 這段文字有換行。每一段結尾的換行字元是 Python 放進去的；
             -- 相鄰的字串常數中間隔著換行，Postgres 會把它們接成同一段。
             -- ★ 這幾行註解本身不能出現反斜線 n：整段 SQL 是 Python 字串，那會變成真的
             --   換行，把註解後半截推出去變成 SQL。
@@ -260,7 +260,7 @@ def _ensure_busy_day(cur) -> None:
 
     現在沒有任何地方讀它們。設忙碌日當下要寄的信在那一刻就知道是誰按的，
     不需要回頭查。哪天真的要追「誰設的」再加——沒有人讀的欄位就是髒東西
-    （案主的原則：每家店的資料庫只放用得到的）。
+    （原則：每家店的資料庫只放用得到的）。
     """
     cur.execute(
         """
@@ -531,7 +531,7 @@ def _ensure_roles(cur) -> None:
         )
         """
     )
-    # ON CONFLICT DO NOTHING：只在沒有時給預設值，不覆蓋案主調過的設定。
+    # ON CONFLICT DO NOTHING：只在沒有時給預設值，不覆蓋手動調過的設定。
     cur.execute(
         """
         INSERT INTO roles (id, name, line_notification, email_notification) VALUES
@@ -553,8 +553,8 @@ def _ensure_users(cur) -> None:
     因為是階層而非互斥的角色，權限判斷一律寫成 `user.role <= 需要的等級`，
     不要寫成 `user.role == 1`——後者會讓管理員在主持人專用的功能上被擋下來。
 
-    這裡刻意不建 permissions 表、role 也不設 FK：zh-cn-to-tw 的 permissions
-    表存在的理由是「每個角色有不同的 API 用量額度」，本專案沒有這個需求，
+    這裡刻意不建 permissions 表、role 也不設 FK：permissions
+    表只在「每個角色有不同的 API 用量額度」這類需求下才有意義，本專案沒有這個需求，
     多一張只為了三個固定數字而存在的表沒有意義。用 CHECK 約束把值鎖死即可。
     """
     cur.execute(
@@ -657,7 +657,7 @@ def _ensure_mmg_character(cur) -> None:
             mmg_id INTEGER NOT NULL REFERENCES mmg(id) ON DELETE CASCADE,
             -- 顯示順序，從 0 開始。
             position SMALLINT NOT NULL,
-            -- ★ 沒有名稱就不能有介紹或圖片（案主 2026-10-26）：名稱 NOT NULL 且不能是空白。
+            -- ★ 沒有名稱就不能有介紹或圖片：名稱 NOT NULL 且不能是空白。
             name TEXT NOT NULL CHECK (btrim(name) <> ''),
             description TEXT,
             -- 角色圖（一律轉成 WebP）。版本號的用途同 mmg.cover_version：換圖就換網址。
@@ -716,7 +716,7 @@ def _ensure_abuse_rule(cur) -> None:
     """幾點停權多久。
 
     做成資料表而不是程式裡的常數，因為這幾個數字要靠實際運作調整，而改常數
-    要重新部署。案主直接用 SQL 改，不做管理介面——三行資料，做一個介面的
+    要重新部署。直接用 SQL 改，不做管理介面——三行資料，做一個介面的
     成本遠大於它省下來的事。
 
         UPDATE abuse_rule SET ban_seconds = 600 WHERE min_point = 3;
@@ -736,7 +736,7 @@ def _ensure_abuse_rule(cur) -> None:
         """
     )
     # ON CONFLICT DO NOTHING：這是「沒有才給預設值」，不是「每次啟動都
-    # 覆蓋回預設值」——後者會把案主調過的數字默默蓋掉。
+    # 覆蓋回預設值」——後者會把手動調過的數字默默蓋掉。
     cur.execute(
         """
         INSERT INTO abuse_rule (min_point, ban_seconds, label) VALUES
@@ -906,7 +906,7 @@ def _ensure_mmg(cur) -> None:
             --   end_booking IS NULL OR <場次時刻> < end_booking
             -- 所以填一個很遠的真實時刻（2999-12-31 00:00）跟填 NULL 結果
             -- 完全相同——★ 不要把遙遠日期當成 magic value 特別處理，
-            -- 案主明確要求保留「寫真實數字也 OK」的空間。
+            -- 規格要求保留「寫真實數字也 OK」的空間。
             --
             -- 與 start_booking 同樣是 TIMESTAMP：下架也是一個明確的時刻，
             -- 而且時間到了要自動把狀態切成 inactive（見 db/listing.py）。
@@ -1063,7 +1063,7 @@ def _ensure_schedule(cur) -> None:
     ## 為什麼例外的優先序高於常態
 
     例外是「這一週跟平常不同」，常態是「每週都這樣」。週期性的差異
-    （平日／週末）屬於常態層，單週的臨時變動屬於例外層——這是案主定的
+    （平日／週末）屬於常態層，單週的臨時變動屬於例外層——這是刻意的
     分工，也是這個模型能同時保持簡單與完整的原因。
     """
     cur.execute(

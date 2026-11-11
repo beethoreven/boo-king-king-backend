@@ -281,10 +281,10 @@ def on_transition(cur, before: dict | None, after: dict | None) -> list:
         if msg:
             out.append(msg)
 
-    # ⑥ 預約成立 → 通知所有管理員（案主 2026-09-14）。
+    # ⑥ 預約成立 → 通知所有管理員。
     #
     #    跟 ③ 同一個條件，寄給店家這一側。讓場次成立的人本身是管理員時
-    #    **不排除他**（案主決定）——例如步經徑是管理員登記訂金收足才成立，
+    #    **不排除他**——例如步經徑是管理員登記訂金收足才成立，
     #    他照樣會收到這封。
     #
     #    選填的列交給範本決定出不出現：這裡給空字串，那一列就整列拿掉。
@@ -316,7 +316,7 @@ class LinePush:
 @safe_line
 def line_on_booked(cur, before: dict | None, after: dict | None, *,
                    actor_id: int | None) -> LinePush | None:
-    """預約成立 → LINE 推播給店家人員，**排除讓它成立的那個人**（案主 2026-09-14）。
+    """預約成立 → LINE 推播給店家人員，**排除讓它成立的那個人**。
 
     跟 ③⑥ 同一個條件（進 booked），網站訂場、主持人確認、後台建立或修改、
     LINE 訂場都一樣。原本只有 LINE 訂的才推，網站上成立的場店家人員收不到。
@@ -401,7 +401,7 @@ def _actor_name(cur, actor_id: int | None) -> str:
 def on_busy_day_set(cur, busy_date, sessions: list, *, actor_id: int | None):
     """⑦ 把有場次的日子設成忙碌日 → 通知所有管理員。
 
-    sessions 是那天既存的非取消場次（含已結束，案主 2026-09-18）。空的就不寄
+    sessions 是那天既存的非取消場次（含已結束）。空的就不寄
     ——沒有東西要善後的忙碌日是常態，不需要通知任何人。
     """
     if not sessions:
@@ -423,8 +423,8 @@ def on_busy_day_booking(cur, before: dict | None, after: dict | None, *,
                         actor_id: int | None) -> list:
     """⑧⑨ 忙碌日被排進場次 → 通知所有管理員，以及被指定的主持人。
 
-    什麼時候算「被排進去」：這一筆是新建的，或它被改到另一天（案主
-    2026-09-18：改期算）。只是改備註、改訂金不算——那不會讓忙碌日多出
+    什麼時候算「被排進去」：這一筆是新建的，或它被改到另一天。
+    只是改備註、改訂金不算——那不會讓忙碌日多出
     一場戲，每次存檔都寄一輪只會讓這封信變成雜訊。
 
     ★ 主持人那封（⑨）的收件人是「這次新被指定、或整筆搬過來時掛著的」
@@ -514,7 +514,7 @@ def _until_text(until) -> tuple[str, str]:
 def on_abuse(cur, user_id: int, kind: str, outcome: dict):
     """寄給管理員。outcome 是 guard.record() 的回傳。
 
-    ★ **跨過停權門檻的那一次只發 ⑤，不發 ④。**（案主決定）同一個事件
+    ★ **跨過停權門檻的那一次只發 ⑤，不發 ④。**同一個事件
       同時寄「他被記點了」跟「他被停權了」兩封，第一封講的事第二封全都
       包含了，只是製造兩倍的信。
     """

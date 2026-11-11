@@ -348,7 +348,7 @@ def _record_bad_request(user: dict, message: str) -> None:
 def _revoke_if_banned(cur, user_id: int, email: str, before_status: str | None) -> None:
     """剛剛那次記點如果導致停權，把人踢下線並清掉權限快取。
 
-    ★ 兩件事一定要一起做（zh-cn-to-tw 的教訓）：只刪 session 的話，對方可以
+    ★ 兩件事一定要一起做：只刪 session 的話，對方可以
       立刻重新登入——/auth/login 走的是同一支帶快取的權限查詢，命中時仍然
       回「active」，於是又拿到新 session、繞回原點。
     """
@@ -639,7 +639,7 @@ def ready():
     """連資料庫一起檢查。部署後確認整條路徑通了用的，不要拿來當保活目標
     （那會讓每次保活都把 Neon 喚醒，把免費的 CU-hours 額度燒掉）。
 
-    ★ 要帶這家店的 X-Job-Token（2026-10-25，known-issue-check 第 33 條）。原本
+    ★ 要帶這家店的 X-Job-Token（2026-10-25 加上）。原本
       誰都能打，而它每次都會連資料庫——任何人每 5 分鐘打一次，那家店的 Neon
       就永遠不睡、月額度用完整家店停擺。改成跟 /internal/idle-gap-stats 同一組
       通行證：它本來就是給維運的人看的，不是給使用者的。
@@ -721,8 +721,6 @@ def login():
             #
             # 換句話說：撤銷的效果取決於「重新取得憑證」這條路徑有多新，
             # 而不是取決於「舊憑證被刪掉」。登入頻率低，多一次查詢沒有成本。
-            #
-            # 這個縫是 zh-cn-to-tw 實作停用撤銷時踩到並回報的。
             user = whitelist.get_user(cur, email, fresh=True)
             # ★ 被停權的擋在這裡，而且要擋在發 session 之前。
             #   放行的話他手上會有一張有效憑證，就算每支路由都會再擋一次，
@@ -1355,7 +1353,7 @@ def my_bookings_month(ym: str):
     回傳 {"days": {"2026-09-05": ["gm_confirm", "booked"]}}——一場一個值，
     順序就是畫面上那排點由左往右的順序。
 
-    ★ 不含已取消的場次；點進某一天的清單則全部列出（案主定案）。
+    ★ 不含已取消的場次；點進某一天的清單則全部列出。
     """
     try:
         first = date.fromisoformat(f"{ym}-01")
@@ -1614,7 +1612,7 @@ def admin_busy_check():
 def admin_busy_set():
     """把某一天設成店家忙碌日。
 
-    ★ 那天已經有場次也照設（案主 2026-09-17：跳警告，他堅持就讓他設）。
+    ★ 那天已經有場次也照設，只是畫面要先跳警告、管理員確認了才送。
       警告由畫面負責——它手上已經有那個月每天有幾場。後端負責的是**寄信**
       通知所有管理員，那是店裡其他人唯一會知道這件事的管道。
     """
@@ -2492,7 +2490,7 @@ def admin_update_booking(cur, body, booking_id: int):
     # 後台可以直接把狀態改成 gm_reviewed 或 booked，也可以補指派主持人——
     # 前後比對讓這三種都跟正常流程走同一條通知規則（見 notify_events）。
     g.outbox = notify_events.on_booking_change(cur, before, after, actor_id=g.user["id"])
-    # 改期到忙碌日也算「被排進去」（案主 2026-09-18）。只改備註、改訂金
+    # 改期到忙碌日也算「被排進去」。只改備註、改訂金
     # 不會觸發——判斷在 on_busy_day_booking 裡。
     g.outbox += notify_events.on_busy_day_booking(
         cur, before, after, actor_id=g.user["id"]) or []

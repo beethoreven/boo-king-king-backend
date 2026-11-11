@@ -113,7 +113,7 @@ def list_date(cur, session_date, *, start: int = 1) -> dict:
 
     跟子頁籤清單共用同一份查詢與同一張卡片，差別只有條件是日期不是狀態。
 
-    ★ 點不畫已取消、清單全部列出——三份行事曆同一條規則（案主 2026-09-17）。
+    ★ 點不畫已取消、清單全部列出——三份行事曆同一條規則。
     """
     return paged(
         cur,
@@ -130,7 +130,7 @@ def month_days(cur, year: int, month: int) -> dict[str, list[str]]:
     回傳 {'2026-09-05': ['gm_confirm', 'booked']}——一場一個值，不是計數，
     因為點要照開始時間由左往右畫，順序本身就是資料。
 
-    ★ 不含已取消（案主 2026-09-17：「只要有非取消的場次」才畫點）。
+    ★ 不含已取消：那天有非取消的場次才畫點。
 
     ★ 半開區間 [這個月 1 號, 下個月 1 號)：閏年與大小月不必自己判斷。
     """
@@ -276,7 +276,7 @@ def update(cur, booking_id: int, data: dict, *, creating: bool = False) -> bool:
     # confirm_gm() 的「全員確認了嗎」判斷得到錯誤結果。
     gm_confirmed = [bool(c) and u is not None for c, u in zip(gm_confirmed, gm_user_ids)]
 
-    # 從別的狀態改回「待主持確認」→ 主持人的確認全部取消（案主 2026-11-10）。
+    # 從別的狀態改回「待主持確認」→ 主持人的確認全部取消。
     #
     # ★ 不清的話，「待主持確認」配上「全員已確認」是一個流程走不出來的組合：
     #   主持人按不了確認（系統說他確認過了），而下一次只是改個備註存檔，
@@ -316,7 +316,7 @@ def update(cur, booking_id: int, data: dict, *, creating: bool = False) -> bool:
     if all(new[k] == current[k] for k in current):
         return False
 
-    # 主持人忙碌日：**硬擋，管理員也不能放行**（案主 2026-09-18）。
+    # 主持人忙碌日：**硬擋，管理員也不能放行**。
     #
     # ★ 只在「指定這件事真的變了」時擋：這一天新指定了誰，或整筆被搬到
     #   另一天。既有的那些照樣可以改備註、改訂金——一位主持人事後把某天

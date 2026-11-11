@@ -19,7 +19,6 @@ email 的快取命中，就根本不會去 B 店的資料庫查 token，直接�
 
   tests/test_tenant_state.py 會掃整個後端：出現沒走這裡的模組層狀態，測試
   直接失敗；tests/test_cross_tenant.py 用兩家測試店驗證結果真的分得開。
-  兩者都是 known-issue-check 清單上的固定檢查項目。
 
 ★ 不知道是哪一家店的時候，PerTenant 與 pool.connection() 會直接拋 NoTenant，
   **不會**退回某個預設的店。退回預設值的寫法在只有一家店的 demo 上永遠測不
