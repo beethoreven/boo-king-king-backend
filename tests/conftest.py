@@ -68,7 +68,7 @@ def pg_cluster():
         pytest.skip("本機沒有 Postgres 伺服器程式（initdb / pg_ctl），跨店測試略過。")
 
     # 路徑要短：unix socket 的路徑在 macOS 上限約 100 字元。
-    root = Path(tempfile.mkdtemp(prefix="bkk-pg-", dir="/tmp"))
+    root = Path(tempfile.mkdtemp(prefix="boo-king-king-pg-", dir="/tmp"))
     data = root / "data"
     port = _free_port()
     # ★ macOS 上沒設 LC_ALL 的話，postmaster 啟動時會因為
