@@ -120,7 +120,7 @@ def update(cur, user_id: int, data: dict) -> bool:
     # 只在「active -> deactive」這個轉換上做，不是「只要 status 是
     # deactive 就做」——後者會讓管理員每次編輯一個早就停用的帳號
     # （改個名字之類）都重跑一次無意義的 DELETE。也不對所有 update
-    # 做：改名字或調角色不該把人踢下線。
+    # 做：改名字、升級角色不該把人踢下線（降級另外處理，見最後一段）。
     # 管理員把系統判定的停權改回「啟用」＝解除停權。
     #
     # ★ 點數一定要一起歸零。只改狀態的話，對方下一次違規會立刻跳回門檻
@@ -154,6 +154,19 @@ def update(cur, user_id: int, data: dict) -> bool:
         # 權限判斷還是用舊值。
         whitelist.invalidate(new["email"])
         whitelist.invalidate(current["email"])
+
+    # 降級（角色的數字變大＝權限變小）：把他名下的 session 全部刪掉，要重新登入。
+    #
+    # ★ 只清權限快取不夠：快取是每個 gunicorn worker 各一份，上面只清得到處理這個
+    #   請求的那一個，別的 worker 最多還會用舊的角色 30 秒（whitelist 的快取時間）——
+    #   被拿掉管理員權限的人，這段時間裡在別的 worker 上仍然是管理員。session 刪掉
+    #   之後，別的 worker 最慢在 token 的解析快取過期時（3 秒，見 sessions.py）就查
+    #   不到這張 token；重新登入時查的是資料庫，拿到的就是新的角色。
+    # ★ 只對降級做。升級晚幾十秒生效沒有風險，不必讓人重新登入。
+    if new["role"] > current["role"]:
+        sessions.delete_sessions_for_email(cur, current["email"])
+        if new["email"] != current["email"]:
+            sessions.delete_sessions_for_email(cur, new["email"])
 
     return True
 

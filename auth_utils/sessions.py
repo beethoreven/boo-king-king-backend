@@ -133,18 +133,47 @@ def is_authentic(token: str | None) -> bool:
     return hmac.compare_digest(tag, _tag(random_part))
 
 
+# 同一個 email 最多同時有幾張有效的 session。
+#
+# ★ 為什麼要有上限：每次登入都會多一列，舊的要閒置 SESSION_IDLE_DAYS 天才會清掉。
+#   一張有效的 Google 憑證（效期約一小時）可以一直拿來換新 session，沒有上限的話
+#   這張表會被一個帳號灌到幾千列。
+# ★ 超過就刪「最久沒用的」那幾張（last_seen_at 最舊），不是最早發的：還在用的裝置
+#   last_seen_at 一直在更新，不會被擠掉。手機、電腦、平板、幾個瀏覽器加起來也
+#   遠不到 10；被擠掉的通常是早就清掉瀏覽器資料、再也不會回來的那幾張。
+MAX_SESSIONS_PER_EMAIL = 10
+
+
 def create_session(cur, email: str) -> str:
-    """簽發一張新的 session token。
+    """簽發一張新的 session token。超過 MAX_SESSIONS_PER_EMAIL 張就刪掉最久沒用的。
 
     呼叫端（/auth/login）負責先驗證 Google ID Token 並確認授權，
     這裡不重複做那兩件事。
     """
+    email = email.lower().strip()
     random_part = secrets.token_hex(_RANDOM_HEX // 2)
     token = random_part + _tag(random_part)
     cur.execute(
         "INSERT INTO sessions (token, email) VALUES (%s, %s)",
-        (token, email.lower().strip()),
+        (token, email),
     )
+    # 新的這張明確排除在外，其餘留最近用過的 MAX-1 張。
+    # ★ 不能靠「新的這張 last_seen_at 最新」：欄位預設值是 NOW()，那是交易開始的時間，
+    #   同一個交易裡發的幾張時間一模一樣，排序打平時誰被刪是隨機的。
+    cur.execute(
+        """
+        DELETE FROM sessions WHERE token IN (
+            SELECT token FROM sessions
+             WHERE lower(email) = %(email)s AND token <> %(new)s
+             ORDER BY last_seen_at DESC, created_at DESC
+            OFFSET %(keep)s
+        )
+        RETURNING token
+        """,
+        {"email": email, "new": token, "keep": MAX_SESSIONS_PER_EMAIL - 1},
+    )
+    for (evicted,) in cur.fetchall():
+        _forget(evicted)
     return token
 
 

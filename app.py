@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
 from datetime import date, time
 from functools import wraps
 
@@ -50,6 +51,8 @@ from line_utils import signature as line_signature  # noqa: E402
 import notifications  # noqa: E402
 import notify_events  # noqa: E402
 import intro_public  # noqa: E402
+import ip_limit  # noqa: E402
+from auth_utils import ip_guard  # noqa: E402
 
 # ── log：每一行都標上店家 ────────────────────────────────────────
 #
@@ -573,9 +576,10 @@ def line_image(token: str):
     「這張圖是發給店家人員的」只有網址上的簽名：發網址之前已經確認過發問的
     人是店家人員，簽名確保網址上的日期沒被改過。驗不過一律 404。
 
-    ## 每次都照當下的資料現畫
+    ## 7 天後過期；畫好的圖快取 10 分鐘
 
-    理由與那一行 [line-img] log 見 line_utils/images.py 的開頭。
+    過期回 410，連資料庫都不碰。快取命中也不碰資料庫、不重畫。理由與那一行
+    [line-img] log 見 line_utils/images.py 的開頭。
     """
     if not line_client.enabled():
         return jsonify({"error": "LINE 未設定"}), 503
@@ -583,16 +587,24 @@ def line_image(token: str):
     if checked is None:
         return jsonify({"error": "網址無效"}), 404
     spec, issued = checked
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            png = line_images.render(
-                cur, spec, issued=issued, user_agent=request.headers.get("User-Agent", "")
-            )
+    user_agent = request.headers.get("User-Agent", "")
+    if line_images.expired(issued):
+        line_images.log_expired(spec, issued=issued, user_agent=user_agent)
+        return jsonify({"error": "這張圖的網址已過期，請重新查詢"}), 410
+    png = line_images.cached(token)
+    if png is None:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                png = line_images.render(cur, spec, issued=issued, user_agent=user_agent)
+        line_images.remember(token, png)
+    else:
+        line_images.log_cache_hit(spec, issued=issued, user_agent=user_agent, size=len(png))
     resp = app.response_class(png, mimetype="image/png")
     # 網址含發出時間，每一次查詢都是新的網址，所以快取住也不會把別次的圖給
     # 錯人；被快取住的就是第一次抓到的那張，跟圖上的「截至幾點」一致。
-    # 快取留得愈久，LINE 愈不需要回來抓——也就愈少碰到這裡正在休眠的時候。
-    resp.headers["Cache-Control"] = "public, max-age=31536000"
+    # 留到網址過期為止：快取留得愈久，LINE 愈不需要回來抓——也就愈少碰到這裡正在
+    # 休眠的時候；但不超過期限，過期之後誰都拿不到新的。
+    resp.headers["Cache-Control"] = f"public, max-age={line_images.seconds_left(issued)}"
     return resp
 
 
@@ -664,19 +676,20 @@ def ready():
                 cur.fetchone()
         return jsonify({"status": "ok", "database": "ok", "config": config})
     except Exception as exc:  # noqa: BLE001 - 回報狀態，不讓例外變成 500
-        # ★ 連線池只會說「等不到連線」，把真正的原因吞掉——那句話對排查
-        #   完全沒有幫助，因為「密碼錯」「主機名打錯」「SSL 沒開」「Neon
-        #   在冷啟動」全都長這樣。這裡直接繞過池子連一次，把底層的例外
-        #   attempt 出來。
-        #
-        #   不會洩漏密碼：Postgres 的錯誤訊息只講失敗原因與主機，連線字串
-        #   本身不會出現在裡面。為保險起見仍然只取例外的類別與訊息，
-        #   不回傳任何設定值。
+        # ★ 回應裡只放固定的文字與例外的類別名稱，**不放驅動程式的錯誤原文**。連線
+        #   函式的錯誤訊息有時會把連線字串整串帶出來——值的格式不對時，含密碼的整串
+        #   就出現在錯誤訊息裡（2026-10-25 在 log 裡實際看過）。這支雖然要
+        #   X-Job-Token，回應仍然不該帶任何可能含秘密的東西。原文遮掉密碼之後寫進
+        #   伺服器 log，排查時到 Render 的 log 看。
+        # ★ 連線池只會說「等不到連線」，「密碼錯」「主機名打錯」「SSL 沒開」「Neon
+        #   在冷啟動」全都長這樣。這裡直接繞過池子連一次，至少分得出問題在池子
+        #   還是在資料庫。
         # ★ 池子的內部統計。這是唯一能分辨「有在嘗試連線但失敗」與
         #   「根本沒在嘗試」的東西——後者代表背景 worker 沒在運作，
         #   那是完全不同的問題，而 PoolTimeout 對兩者是同一句話。
         stats = pool.get_stats()
-        detail = None
+        app.logger.warning("/api/ready 資料庫檢查失敗：%s：%s",
+                           type(exc).__name__, _redact_secrets(str(exc)))
         try:
             with psycopg.connect(tenant.database_url, connect_timeout=10) as _c:
                 with _c.cursor() as _cur:
@@ -684,14 +697,31 @@ def ready():
                     _cur.fetchone()
             detail = "直連成功——問題出在連線池，不是資料庫本身"
         except Exception as inner:  # noqa: BLE001
-            detail = f"{type(inner).__name__}: {inner}"
+            detail = f"直連也失敗（{type(inner).__name__}），原因記在伺服器 log"
+            app.logger.warning("/api/ready 直連資料庫也失敗：%s：%s",
+                               type(inner).__name__, _redact_secrets(str(inner)))
         return jsonify({
             "status": "degraded",
-            "database": str(exc),
+            "database": f"資料庫檢查失敗（{type(exc).__name__}），原因記在伺服器 log",
             "database_detail": detail,
             "pool_stats": stats,
             "config": config,
         }), 503
+
+
+# 連線字串裡的帳號密碼（scheme://帳號:密碼@主機）與 password=… 這種寫法。
+# ★ scheme:// 之後一路遮到最後一個 @：密碼裡可能有 /（照規定要編碼，但不能指望），
+#   遮多了只是少看到主機名稱，遮少了就是密碼進 log。
+_SECRET_IN_TEXT = re.compile(
+    r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s'\"]*@|\b(password\s*=\s*)('[^']*'|\"[^\"]*\"|\S+)"
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """錯誤訊息寫進 log 之前，遮掉裡面可能夾帶的帳號密碼。"""
+    return _SECRET_IN_TEXT.sub(
+        lambda m: f"{m.group(1)}***@" if m.group(1) else f"{m.group(2)}***", text
+    )
 
 
 @app.post("/auth/login")
@@ -700,7 +730,12 @@ def login():
 
     ★ 這是全站唯一驗證 Google ID Token 的地方。之後所有請求都用回傳的
       session_token，不要再送 Google 的 token。理由見 auth_utils/google_auth.py。
+
+    ★ 限流排在最前面，在驗 Google 憑證與碰資料庫之前（理由見 auth_utils/ip_guard.py）。
     """
+    limited = ip_guard.check_auth(request, "login")
+    if limited:
+        return limited
     data = request.get_json(silent=True) or {}
     id_token = data.get("id_token")
     if not id_token:
@@ -802,6 +837,9 @@ def auth_status():
 
     只有在完全沒帶 token 或 token 無法解析時才回 401。
     """
+    limited = ip_guard.check_auth(request, "status")
+    if limited:
+        return limited
     token = extract_bearer_token(request)
     if not token:
         return jsonify({"error": "未提供登入憑證"}), 401
@@ -866,6 +904,9 @@ def register():
     註冊完成後原本那張 session 立刻可用——email 沒變，只是 users 多了一
     列，下一次 require_auth 查就會通過。不需要重新登入。
     """
+    limited = ip_guard.check_auth(request, "register")
+    if limited:
+        return limited
     token = extract_bearer_token(request)
     if not token:
         return jsonify({"error": "未提供登入憑證"}), 401
@@ -1142,6 +1183,14 @@ def check_gm_route():
     讓玩家在填表當下就知道，而不是全部填完按下送出才被退回。這裡不做
     任何寫入，也不取任何鎖——真正的把關仍然在 create_booking() 裡，
     那裡才有 advisory lock 保證「檢查到寫入」之間沒有人插隊。
+
+    ★ 只能問「這齣戲可選的主持人」（gm{n}_user 裡的人），而且劇本要是玩家看得到的
+      （同 mmg_db.get）。管理員不受限；問自己也可以。少了這道限制，user_id 由呼叫端
+      任意填，任何登入的人都能逐一探詢任何人在任何時段有沒有場次、哪天是忙碌日。
+      玩家在畫面上本來就只看得到、選得到這齣戲的那幾位（/api/mmg/<id> 的 gm_slots），
+      這裡回的不會超過畫面上做得到的事。
+    ★ 不在名單裡回 403，不記異常點數（不走 bad_request）：管理員剛改過主持人名單、
+      而玩家的畫面還開著舊的名單，就會送出一個已經不在名單裡的人——那是正常操作。
     """
     try:
         mmg_id = int(request.args.get("mmg_id", ""))
@@ -1156,9 +1205,19 @@ def check_gm_route():
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM mmg WHERE id = %s", (mmg_id,))
-            if cur.fetchone() is None:
+            if g.user["role"] <= 1:
+                cur.execute("SELECT true FROM mmg WHERE id = %s", (mmg_id,))
+            else:
+                cur.execute(
+                    "SELECT %(uid)s = ANY(gm1_user || gm2_user || gm3_user || gm4_user) "
+                    f"FROM mmg WHERE id = %(id)s AND {listing.VISIBLE_SQL}",
+                    {"uid": user_id, "id": mmg_id, "now": listing.now_taipei(cur)},
+                )
+            row = cur.fetchone()
+            if row is None:
                 return jsonify({"error": "找不到這個劇本"}), 404
+            if not (row[0] or user_id == g.user["id"]):
+                return jsonify({"error": "只能查詢這齣戲可選的主持人"}), 403
 
             # 忙碌日排在撞期前面：兩者都擋，但一句是「他那天有場次」、
             # 一句是「他那天整天不接」，玩家要做的事不一樣。
@@ -2019,7 +2078,7 @@ def admin_create_mmg(cur, body):
 
 def _rate_limited(kind: str):
     """公開簡介頁的限流。通過回 (None, ip, 原始標頭)，被擋回 (429 回應, ...)。"""
-    ip, chain = intro_public.client_ip(request)
+    ip, chain = ip_limit.client_ip(request)
     retry = intro_public.check_rate(ip, kind)
     if retry is None:
         return None, ip, chain

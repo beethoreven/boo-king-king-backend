@@ -82,17 +82,24 @@ def list_active(cur) -> list[dict]:
 
 
 def get(cur, mmg_id: int) -> dict | None:
-    """單一劇本。不篩狀態——管理員與主持人也走這支。
+    """玩家看得到的單一劇本：「尚未上架」與「已下架」的都當作不存在，回 None。
 
-    「看不到的劇本也訂不到」不是由這支負責，而是 create_booking 在建立
-    預約的同一個交易裡自己查一次 listing.VISIBLE_SQL（見 db/bookings.py）。
-    擋在那裡而不是這裡，是因為那個檢查必須跟搶位在同一個交易內才有意義——
-    在別處先問過、再開一個交易去寫入，中間就有空隙。
+    用在預約畫面的三支（劇本細節、可預約的日期、時段狀況），條件跟清單
+    （list_active）同一段 listing.VISIBLE_SQL。
 
-    ★ 這裡曾經有一支 is_visible() 想當那個關卡，但從來沒有任何地方呼叫過
-      （2026-09-01 刪除）。留著一個「看起來是關卡、實際上沒接線」的函式，
-      比沒有更危險：下一個讀的人會以為呼叫它就安全了。
+    ★ 少了這個條件，任何登入的人換個編號就讀得到還沒開賣、或已經下架的劇本的
+      名稱、價錢與主持人——清單裡沒有它們，不代表打不到。管理員看全部劇本走的是
+      /api/admin/mmg，不經過這裡。
+
+    「看不到的劇本也訂不到」仍然由 create_booking 在建立預約的同一個交易裡自己
+    查一次 listing.VISIBLE_SQL（見 db/bookings.py）。那個檢查必須跟搶位在同一個
+    交易內才有意義——在別處先問過、再開一個交易去寫入，中間就有空隙。這裡的條件
+    管的是「讀不讀得到」，不是那個關卡。
     """
-    cur.execute(f"SELECT {_COLUMNS} FROM mmg WHERE id = %s", (mmg_id,))
+    now = listing.now_taipei(cur)
+    cur.execute(
+        f"SELECT {_COLUMNS} FROM mmg WHERE id = %(id)s AND {listing.VISIBLE_SQL}",
+        {"id": mmg_id, "now": now},
+    )
     row = cur.fetchone()
     return _row_to_dict(cur, row) if row else None

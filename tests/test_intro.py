@@ -216,12 +216,13 @@ def test_rate_limit_is_per_ip_and_per_store(client):
 
 def test_repeat_offenders_get_blocked_for_a_while(client):
     import intro_public
+    import ip_limit
 
     for _ in range(intro_public.INTRO_PER_MINUTE):
         client.get("/v/shop-a/api/public/mmg/1", headers=IP)
     retries = [int(client.get("/v/shop-a/api/public/mmg/1", headers=IP).headers["Retry-After"])
-               for _ in range(intro_public._STRIKES_TO_BLOCK)]
-    assert retries[-1] >= 590, f"第 {intro_public._STRIKES_TO_BLOCK} 次被擋要封鎖 10 分鐘：{retries}"
+               for _ in range(ip_limit.STRIKES_TO_BLOCK)]
+    assert retries[-1] >= 590, f"第 {ip_limit.STRIKES_TO_BLOCK} 次被擋要封鎖 10 分鐘：{retries}"
 
 
 def test_cached_views_and_unknown_ids_never_touch_the_database(client, monkeypatch):
@@ -327,8 +328,9 @@ def test_client_ip_ignores_what_the_visitor_wrote_in_front(client, monkeypatch):
     long_fake = ", ".join(f"5.5.5.{i % 250}" for i in range(400))
     from flask import Request
     from werkzeug.test import EnvironBuilder
+    import ip_limit
     req = Request(EnvironBuilder(headers={"X-Forwarded-For": f"{long_fake},{real}, 172.71.81.179, 10.29.8.12"}).get_environ())
-    ip, stored = intro_public.client_ip(req)
+    ip, stored = ip_limit.client_ip(req)
     assert ip == real and stored.endswith("10.29.8.12") and len(stored) <= 300
 
 
@@ -336,12 +338,12 @@ def test_client_ip_ignores_what_the_visitor_wrote_in_front(client, monkeypatch):
 def test_all_proxy_chain_does_not_fall_back_to_the_spoofable_first_entry():
     """整串都落在代理網段（例如從 Cloudflare Worker 發出的請求）時，不能退回
     最前面那段——那是使用者自己寫的。"""
-    import intro_public
+    import ip_limit
     from flask import Request
     from werkzeug.test import EnvironBuilder
 
     req = Request(EnvironBuilder(headers={"X-Forwarded-For": "172.71.1.1, 172.71.81.179, 10.29.8.12"}).get_environ())
-    assert intro_public.client_ip(req)[0] == "10.29.8.12"
+    assert ip_limit.client_ip(req)[0] == "10.29.8.12"
 
 
 def test_unpublishing_a_script_hides_its_intro_right_away(client, tokens):

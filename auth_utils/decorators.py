@@ -14,7 +14,7 @@ from functools import wraps
 from flask import g, jsonify, request
 
 import tenancy
-from auth_utils import guard, whitelist
+from auth_utils import guard, ip_guard, whitelist
 from auth_utils.google_auth import extract_bearer_token
 from auth_utils.user_status import active_sql
 from auth_utils import sessions as sessions_mod
@@ -41,6 +41,14 @@ def _authenticate() -> tuple[dict | None, tuple | None]:
     #   把這家店的資料庫叫醒（見 auth_utils/sessions.py 的「token 的形狀與簽章」）。
     if not sessions_mod.is_authentic(token):
         return None, (jsonify({"error": "登入憑證無效或已過期"}), 401)
+
+    # ★ 同一個 IP 的總量上限，不管用了幾個帳號（理由見 auth_utils/ip_guard.py）。
+    #   排在查身分之前：被擋的請求不必再查快取、更不會開連線。排在驗簽章之後：
+    #   亂打的 token 在上一步就擋掉、不算次數，跟別人共用 IP 的人沒辦法用垃圾請求
+    #   把大家的額度吃掉。
+    limited = ip_guard.check_api(request)
+    if limited:
+        return None, limited
 
     # ★ 兩層快取都命中就完全不開連線。
     #

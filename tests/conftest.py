@@ -151,6 +151,16 @@ def client(app_module):
     return app_module.app.test_client()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_ip_limits():
+    """每個測試從乾淨的 IP 限流開始。測試全部從同一個 IP 打，前面的測試用掉的額度
+    不該讓後面的測試被擋（見 auth_utils/ip_guard.py）。"""
+    from auth_utils import ip_guard
+
+    ip_guard.reset()
+    yield
+
+
 # 每家店的 session token 由 seeded 在那家店裡用 sessions.create_session 發
 # （token 帶著那家店的簽章，見 auth_utils/sessions.py），測試用 tokens 取。
 #   a_admin       A 店：admin@shop.test，管理員

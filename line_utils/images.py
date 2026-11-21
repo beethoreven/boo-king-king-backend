@@ -15,18 +15,29 @@ LINE 的圖片訊息**只收網址**（HTTPS），不收檔案本身。所以 bo
 鑰匙，只有這個後端簽得出來；權限在發網址之前就查過了（handler 的 is_staff），
 網址本身就是那次查詢的憑證。
 
-★ 網址裡還記著發出的時間。不拿它設期限（理由見最後一段）；留著是為了 log
-  能算出「發出後幾秒被抓」。
+★ 網址裡還記著發出的時間：過了 URL_TTL_SECONDS（7 天）就不再給圖（回 410），
+  log 也用它算「發出後幾秒被抓」。
 
-## 來抓的時候才畫，不存檔
+## 期限為什麼是 7 天
+
+圖是來抓的時候照當下的資料畫的，所以沒有期限的話，拿到網址的人（群組裡也有
+客人）可以一直回來看這家店**最新的**場次狀況，永遠有效。期限要夠長，讓晚幾天
+才打開聊天室的店家人員（週末、休假）還看得到；過期之後重打一次查詢就是新的圖。
+代價：7 天後才第一次打開那則訊息的裝置會看到破圖。
+
+## 來抓的時候才畫，同一個網址快取 10 分鐘
 
 LINE 什麼時候來抓圖——發送當下，還是有人打開聊天室時——官方文件沒寫。
-存檔的話就得決定「存多久」，而那正是不知道的事；存在記憶體裡則每次部署、
-每次休眠都會清掉。所以每次來抓都照當下的資料現畫，圖的最下面印「截至幾點」，
-看圖的人知道那是什麼時候的樣子。
+存檔的話就得決定「存多久」，而那正是不知道的事。所以第一次來抓時照當下的
+資料畫，圖的最下面印「截至幾點」，看圖的人知道那是什麼時候的樣子。
 
-★ 每抓一次，log 記一行 [line-img]：距離發出網址幾秒、誰來抓（User-Agent）、
-  畫了多久。
+畫好的圖在記憶體裡留 CACHE_SECONDS（10 分鐘，每家店、每個 worker 各一份）：
+每畫一張要查一次資料庫、在 Render 上花一兩秒 CPU，而同一個網址會被抓好幾次
+（預覽圖與原圖是同一個網址、群組裡每台裝置各抓一次），拿到網址的人也可以一直
+重抓。快取期間抓到的是同一張圖，「截至幾點」照樣是那張圖畫的時間。
+
+★ 每抓一次（包括快取命中），log 記一行 [line-img]：距離發出網址幾秒、誰來抓
+  （User-Agent）、畫了多久。
 
 ## 實際上是誰、什麼時候來抓（2026-09-19 eli 第一次使用的 log）
 
@@ -38,8 +49,8 @@ LINE 什麼時候來抓圖——發送當下，還是有人打開聊天室時—
 - 預覽圖與原圖是同一個網址，Mac 版**兩個都抓**，所以每次顯示會畫兩張。
 - 畫五個月在 Render 上約 1.8 秒，本機純畫圖約 0.2 秒。這兩次可能各是一個
   worker 第一次畫圖，含載入 Pillow 的時間；之後的 log 會看得出來。
-- 所以**網址不設期限**：之後才打開聊天室的裝置會在那時候才來抓，期限一到，
-  晚看的人就是一張破圖。
+- 之後才打開聊天室的裝置會在那時候才來抓——期限設得太短，晚看的人就是一張
+  破圖（期限怎麼訂見上面「期限為什麼是 7 天」）。
 - 手機版是不是也一樣（直接抓、打開時才抓），這次只有一台 Mac 的資料，要看
   之後出現的手機 UA 那幾行。
 """
@@ -50,10 +61,12 @@ import base64
 import hashlib
 import hmac
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
+import tenancy
 from admin_utils import bookings_admin
 from db import busy as busy_db
 from db.bookings import reachable_tabs
@@ -62,6 +75,79 @@ from line_utils import commands
 
 # 台北是固定的 UTC+8、沒有日光節約（同 admin_utils/mmg_admin.py）。
 _TAIPEI = timezone(timedelta(hours=8))
+
+# 網址從發出起多久內有效（理由見檔案開頭「期限為什麼是 7 天」）。
+URL_TTL_SECONDS = 7 * 24 * 3600
+
+# 畫好的圖在記憶體裡留多久，以及每家店最多留多少位元組（一張幾十 KB，十二個月的
+# 也才一百 KB 左右；8 MB 放得下上百張）。超過就整份清空，下一次來抓時重畫。
+CACHE_SECONDS = 600.0
+_MAX_CACHE_BYTES = 8 * 1024 * 1024
+
+
+class _Cache:
+    __slots__ = ("images", "size")
+
+    def __init__(self) -> None:
+        self.images: dict[str, tuple[float, bytes]] = {}   # 網址那一段 -> (到期時間, PNG)
+        self.size = 0
+
+
+_cache = tenancy.PerTenant(_Cache)
+_cache_lock = threading.Lock()
+
+
+def expired(issued: int, *, now: float | None = None) -> bool:
+    """這個網址（發出時間 issued）過期了沒。"""
+    return (time.time() if now is None else now) - issued > URL_TTL_SECONDS
+
+
+def seconds_left(issued: int) -> int:
+    """離過期還有幾秒（給回應的 Cache-Control 用）。"""
+    return max(0, int(issued + URL_TTL_SECONDS - time.time()))
+
+
+def cached(token: str) -> bytes | None:
+    """這個網址最近畫過的圖；沒有或已過了 CACHE_SECONDS 就回 None。"""
+    c = _cache.get()
+    with _cache_lock:
+        hit = c.images.get(token)
+        if hit is not None and hit[0] > time.monotonic():
+            return hit[1]
+    return None
+
+
+def remember(token: str, png: bytes) -> None:
+    c = _cache.get()
+    with _cache_lock:
+        old = c.images.get(token)
+        if old is not None:
+            c.size -= len(old[1])
+        if c.size + len(png) > _MAX_CACHE_BYTES:
+            c.images.clear()
+            c.size = 0
+        c.images[token] = (time.monotonic() + CACHE_SECONDS, png)
+        c.size += len(png)
+
+
+def log_cache_hit(spec: str, *, issued: int, user_agent: str, size: int) -> None:
+    """快取命中也記一行，跟 render() 那一行同一個格式：這些 log 是用來量「LINE 什麼時候、
+    由誰來抓」的，命中的那幾次也是一次「來抓」。"""
+    print(
+        f"[line-img] {spec} 發出後 {time.time() - issued:.0f} 秒被抓"
+        f"｜快取｜{size // 1024} KB｜UA: {user_agent[:120] or '(無)'}",
+        flush=True,
+    )
+
+
+def log_expired(spec: str, *, issued: int, user_agent: str) -> None:
+    """過期被擋下的那幾次也要記：它們正是「7 天後才打開那則訊息」的人，期限訂得對不對，
+    要看這幾行出現得多不多。"""
+    print(
+        f"[line-img] {spec} 發出後 {time.time() - issued:.0f} 秒被抓"
+        f"｜已過期，回 410｜UA: {user_agent[:120] or '(無)'}",
+        flush=True,
+    )
 
 
 @dataclass(frozen=True)

@@ -17,7 +17,8 @@
        （db/intro.public_images）。不這樣做的話，一齣 10 個角色的劇本，一個訪客
        就要查 12 次資料庫，第 5 點的每日上限幾個人就用完了。
   3. 每個 IP 限流：簡介每分鐘 30 次、圖片每分鐘 120 次；10 分鐘內被擋 3 次的
-     IP 封鎖 10 分鐘。全部在記憶體裡做，不寫資料庫。
+     IP 封鎖 10 分鐘。全部在記憶體裡做，不寫資料庫。怎麼找出真正的來源 IP、
+     怎麼計數，在 ip_limit.py（登入與註冊的限流也用同一套）。
   4. 瀏覽紀錄（誰、什麼時候、看了哪一齣）先記在記憶體，累積 200 筆或每天的
      排程跑時才一次寫進資料庫（db/intro.py 的 insert_views）。
      代價：服務重新啟動時，還沒寫進去的那幾筆會遺失。這份紀錄是用來追查
@@ -33,50 +34,26 @@
   兩個 worker 時，實際的限流門檻是設定值的兩倍。這跟 db/slot_cache.py 的取捨
   一樣——要精準就得多一個 Redis，不划算。
 
-## 使用者的 IP 怎麼拿（2026-10-26 在 demo 實測過）
-
-Render 前面有兩層代理：Cloudflare（172.71.x.x 這類）與 Render 自己的負載平衡
-（10.x）。它們會把**使用者自己送來的 X-Forwarded-For 原封不動留在最前面**，
-再接上真正的來源 IP。實測：
-
-    沒帶標頭          36.227.139.114, 172.71.81.179, 10.29.8.12
-    偽造 1.2.3.4      1.2.3.4,36.227.139.114, 172.71.81.179, 10.29.8.12
-
-所以**第一段是使用者愛寫什麼就寫什麼**——拿它來限流，攻擊者每次換一個假 IP
-就繞過了。正確的讀法是從右邊往左，跳過 Cloudflare 與私有網段的位址，遇到的
-第一個就是真正的使用者（client_ip）。
-
-★ 要是哪天 Cloudflare 多了新的網段而這裡沒更新，錯的方向是「把 Cloudflare 的
-  位址當成使用者」——很多人會擠在同一個 IP 下一起被限流（看得見的 429），
-  而不是讓攻擊者繞過。網段清單來自 https://www.cloudflare.com/ips/。
-★ 瀏覽紀錄另外存原始的整串（保留右邊可信的那一段），規則要改也能回頭重新判讀。
+★ 瀏覽紀錄另外存 X-Forwarded-For 的原始整串（保留右邊可信的那一段），判讀規則
+  （見 ip_limit.py）要改也能回頭重新判讀。
 """
 
 from __future__ import annotations
 
-import ipaddress
 import os
 import threading
 import time
-from collections import deque
 from datetime import datetime, timedelta, timezone
 
 import logging
 
+import ip_limit
 import tenancy
 
 log = logging.getLogger(__name__)
 
 INTRO_PER_MINUTE = int(os.environ.get("INTRO_RATE_PER_MINUTE", "30"))
 COVER_PER_MINUTE = int(os.environ.get("INTRO_COVER_RATE_PER_MINUTE", "120"))
-_WINDOW = 60.0
-# 10 分鐘內被擋 3 次就封鎖 10 分鐘。偶爾連按幾下重新整理不會被封；持續在打的會。
-_STRIKES_TO_BLOCK = 3
-_STRIKE_WINDOW = 600.0
-_BLOCK_SECONDS = 600.0
-# 記憶體上限：一次記住的 IP 超過這麼多就先清掉閒置的，還是太多就整份清空。
-# 清空等於暫時不限流（寧可放過，也不要讓這一層自己把記憶體吃光）。
-_MAX_TRACKED_IPS = 10_000
 
 INTRO_TTL_SECONDS = float(os.environ.get("INTRO_CACHE_TTL_SECONDS", "60"))
 _MAX_INTRO_ENTRIES = 2_000
@@ -98,15 +75,6 @@ _MAX_HEADER_CHARS = 300
 _lock = threading.Lock()
 
 MISS = object()   # 快取沒有這一筆（跟「查過了，沒有這齣」的 None 分開）
-
-
-class _Limiter:
-    __slots__ = ("hits", "strikes", "blocked_until")
-
-    def __init__(self) -> None:
-        self.hits: dict[tuple[str, str], deque] = {}     # (種類, ip) -> 時間
-        self.strikes: dict[str, deque] = {}               # ip -> 被擋的時間
-        self.blocked_until: dict[str, float] = {}         # ip -> 封鎖到什麼時候
 
 
 class _Caches:
@@ -136,101 +104,19 @@ class _Budget:
         self.warned = False
 
 
-_limiters = tenancy.PerTenant(_Limiter)
+_limiters = tenancy.PerTenant(ip_limit.Limiter)
 _budgets = tenancy.PerTenant(_Budget)
 _caches = tenancy.PerTenant(_Caches)
 _views = tenancy.PerTenant(_Views)
 
 
-# ── IP ───────────────────────────────────────────────────────────
-
-
-# 代理自己的位址：Cloudflare 公布的網段（https://www.cloudflare.com/ips/，2026-10-26）
-# 加上私有網段（Render 內部的負載平衡是 10.x）。從右往左讀 X-Forwarded-For 時跳過這些。
-_PROXY_NETS = tuple(ipaddress.ip_network(n) for n in (
-    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
-    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
-    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
-    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
-    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
-    "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
-))
-
-
-def _is_proxy(value: str) -> bool:
-    try:
-        addr = ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    if addr.is_private or addr.is_loopback or addr.is_link_local:
-        return True
-    return any(addr in net for net in _PROXY_NETS)
-
-
-def client_ip(request) -> tuple[str, str]:
-    """(拿來限流與記錄的 IP, 存進紀錄用的 X-Forwarded-For)。規則見檔案開頭。
-
-    ★ 先完整解析、存的時候才截短，而且保留**右邊**：先截短再解析的話，攻擊者
-      塞一長串假值就能把右邊可信的那一段擠掉。
-    """
-    header = request.headers.get("X-Forwarded-For") or ""
-    parts = [p.strip() for p in header.split(",") if p.strip()]
-    ip = None
-    for candidate in reversed(parts):
-        if not _is_proxy(candidate):
-            ip = candidate
-            break
-    if ip is None:
-        # 整串都是代理（或根本沒帶）。★ 不能退回第一段：那一段是使用者自己寫的
-        # （例如從 Cloudflare Worker 發出的請求，整串都會落在 Cloudflare 網段，
-        # 第一段就能任意指定）。取最右邊那段——它可能是代理自己的位址，那樣頂多
-        # 是很多人擠在同一個 IP 下一起被限流，不會被偽造。沒帶標頭（本機開發、
-        # 測試）就用連線的來源位址。
-        ip = parts[-1] if parts else (request.remote_addr or "unknown")
-    return ip[:64], header[-_MAX_HEADER_CHARS:]
-
-
 # ── 限流 ─────────────────────────────────────────────────────────
-
-
-def _prune(dq: deque, now: float, window: float) -> None:
-    while dq and now - dq[0] > window:
-        dq.popleft()
 
 
 def check_rate(ip: str, kind: str) -> int | None:
     """記一次請求。被擋時回傳建議的重試秒數，否則 None。kind 是 'intro' 或 'cover'。"""
     limit = INTRO_PER_MINUTE if kind == "intro" else COVER_PER_MINUTE
-    lim = _limiters.get()
-    now = time.monotonic()
-    with _lock:
-        until = lim.blocked_until.get(ip)
-        if until is not None:
-            if until > now:
-                return int(until - now) + 1
-            del lim.blocked_until[ip]
-
-        if len(lim.hits) > _MAX_TRACKED_IPS:
-            for key in [k for k, dq in lim.hits.items() if not dq or now - dq[-1] > _WINDOW]:
-                del lim.hits[key]
-            if len(lim.hits) > _MAX_TRACKED_IPS:
-                lim.hits.clear()
-                lim.strikes.clear()
-
-        dq = lim.hits.setdefault((kind, ip), deque())
-        _prune(dq, now, _WINDOW)
-        if len(dq) < limit:
-            dq.append(now)
-            return None
-
-        strikes = lim.strikes.setdefault(ip, deque())
-        _prune(strikes, now, _STRIKE_WINDOW)
-        strikes.append(now)
-        if len(strikes) >= _STRIKES_TO_BLOCK:
-            lim.blocked_until[ip] = now + _BLOCK_SECONDS
-            strikes.clear()
-            return int(_BLOCK_SECONDS)
-        return max(1, int(_WINDOW - (now - dq[0])) + 1)
+    return ip_limit.check(_limiters.get(), ip, kind, limit)
 
 
 # ── 每天的資料庫查詢上限 ─────────────────────────────────────────
@@ -355,15 +241,14 @@ def give_back(rows: list[tuple]) -> None:
 
 def stats() -> dict:
     """目前這家店的暫存狀況（給 /internal/idle-gap-stats）。不碰資料庫。"""
-    v, c, lim, b = _views.get(), _caches.get(), _limiters.get(), _budgets.get()
+    v, c, b = _views.get(), _caches.get(), _budgets.get()
     with _lock:
-        return {
+        local = {
             "db_budget_per_day": DB_BUDGET_PER_DAY,
             "db_budget_used_today": b.used if b.day == _today() else 0,
             "buffered_views": len(v.rows),
             "dropped_views": v.dropped,
             "cached_intros": len(c.intro),
             "cached_image_bytes": c.image_bytes,
-            "tracked_ips": len(lim.hits),
-            "blocked_ips": len(lim.blocked_until),
         }
+    return {**local, **ip_limit.stats(_limiters.get())}

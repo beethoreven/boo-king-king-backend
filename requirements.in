@@ -1,0 +1,35 @@
+# 正式環境的直接相依。這個檔案只寫「要哪些套件、為什麼」；Render 實際安裝的是
+# requirements.txt——由這個檔案產生，鎖住每一個套件（包括間接相依）的確切版本
+# 與檔案雜湊。Render 的 Build Command 照舊是 `pip install -r requirements.txt`。
+#
+# ★ 有雜湊的 requirements.txt 會讓 pip 自動進入「雜湊檢查」模式：下載到的檔案
+#   跟鎖檔記的雜湊對不上就拒絕安裝。PyPI 上的同一個版本號被換成別的檔案，裝不進來。
+#
+# 改了這個檔案之後重新產生（不加 --upgrade 時，已鎖的版本盡量不動）：
+#
+#   ./.venv/bin/uv pip compile requirements.in --universal --generate-hashes \
+#       --python-version 3.14 -o requirements.txt
+#
+# 全部升到最新正式版就加 --upgrade。產生完要連 requirements-dev.txt 一起重產
+# （指令在 requirements-dev.in），兩邊的版本才會一致。
+#
+# ★ --python-version 要跟正式服務的 Python 小版本一致（.python-version；Render 用
+#   環境變數 PYTHON_VERSION 釘住）。
+
+psycopg[binary]
+python-dotenv>=1.2.2
+Flask
+# 6.0.0 修了三個跨來源比對的弱點（大小寫、正規表示式、比對順序）。
+Flask-Cors>=6.0.0
+google-auth
+# google-auth 每次驗證都會重抓 Google 的公開金鑰（套件原始碼就是這樣）。
+# CacheControl 讓它遵守 Google 回的 Cache-Control 標頭。理由詳見 auth_utils/google_auth.py。
+cachecontrol
+requests>=2.33.0
+gunicorn
+# LINE 的查詢指令回一張圖（行事曆、某一天的場次），用它畫，見 line_utils/draw.py；
+# 簡介頁的上傳圖也用它重新編碼，見 admin_utils/cover_image.py。
+# 13.0.0 修了解析上傳圖時會被小檔案拖垮（記憶體、CPU）的一批弱點，要 Python 3.11 以上。
+# 沒有現成安裝包時 pip 會改成從原始碼編譯，那要系統裝有 libjpeg、zlib 的開發檔——
+# 不要把部署押在那上面（產生鎖檔後確認過 Linux x86_64 有現成的安裝包，見 README）。
+Pillow>=13.0.0

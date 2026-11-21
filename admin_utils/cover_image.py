@@ -21,6 +21,16 @@
 一張幾 KB 的 PNG 可以宣告自己是 50000×50000，解開來要好幾 GB 記憶體——
 Render 免費方案只有 512MB，一張就能讓服務重開。所以先只讀表頭的尺寸，
 超過上限直接拒絕，根本不解碼像素。
+
+## 只讓收的那四種格式的解析器上場
+
+Image.open() 預設會拿每一種它認得的格式（XBM、TIFF、PSD、EPS…幾十種）去試，
+認出來就交給那一種格式的解析器讀表頭——**在我們檢查格式之前**。所以就算最後
+因為「格式不支援」而拒絕，那個解析器已經跑過一次了，而它的弱點也就打得到：
+例如 XBM 的解析有一個 512 位元組就能卡住 CPU 好幾分鐘的檔案、TIFF 的標籤解析
+有一個 144 KB 就要吃掉 1.6 GB 記憶體的檔案（Pillow 13.0.0 之前的版本）。
+Image.open(formats=...) 讓其他格式的解析器根本不會被叫到。正式店家共用同一個
+後端行程，任何一家店的管理員上傳一個這種檔案，所有店會一起停擺。
 """
 
 from __future__ import annotations
@@ -46,7 +56,10 @@ MAX_SOURCE_PIXELS = 40_000_000
 
 # 收哪幾種格式。手機的 HEIC 不在裡面：Pillow 沒有外掛讀不了，而 iPhone 從
 # 網頁上傳照片時本來就會轉成 JPEG。
-ACCEPTED_FORMATS = {"JPEG", "PNG", "WEBP", "GIF"}
+#
+# 同一份清單也交給 Image.open(formats=...)：只有這幾種格式的解析器會被叫到
+# （理由見檔案開頭「只讓收的那四種格式的解析器上場」）。
+ACCEPTED_FORMATS = ("JPEG", "PNG", "WEBP", "GIF")
 
 WEBP_QUALITY = 82
 
@@ -66,7 +79,7 @@ def to_webp(raw: bytes, max_size: tuple[int, int] = (MAX_WIDTH, MAX_HEIGHT)) -> 
         # Pillow 對「大但還沒到兩倍上限」的圖只發警告不拋例外，這裡一律當錯誤。
         warnings.simplefilter("error", Image.DecompressionBombWarning)
         try:
-            img = Image.open(io.BytesIO(raw))
+            img = Image.open(io.BytesIO(raw), formats=ACCEPTED_FORMATS)
             fmt = img.format
             width, height = img.size          # 只讀表頭，還沒解開像素
         except (Image.DecompressionBombError, Image.DecompressionBombWarning):
@@ -75,6 +88,8 @@ def to_webp(raw: bytes, max_size: tuple[int, int] = (MAX_WIDTH, MAX_HEIGHT)) -> 
         except Exception:  # noqa: BLE001 - 讀不出來就是不是圖片，原因不重要
             raise CoverError("這不是圖片檔，或格式不支援（可用 JPG、PNG、WebP、GIF）") from None
 
+        # ★ 上面的 formats 擋不到這一種：JPEG 的解析器遇到多張圖的 MPO（部分相機與
+        #   手機的照片）會回報成 MPO 而不是 JPEG。多影格的檔案不收，維持原本的規則。
         if fmt not in ACCEPTED_FORMATS:
             raise CoverError("格式不支援（可用 JPG、PNG、WebP、GIF）")
         if width * height > MAX_SOURCE_PIXELS:

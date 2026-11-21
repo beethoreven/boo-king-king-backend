@@ -45,8 +45,35 @@ curl -s localhost:5001/api/health
 
 前端在另一個 repo（boo-king-king-web），用 `python3 -m http.server 5173` 起，
 直接開 <http://localhost:5173> 就好——前端偵測到跑在 localhost 上會自動打
-`http://localhost:5001`，不用帶參數。要對別的後端測就帶 `?apiBase=`，
-查詢參數永遠優先（見 `js/api.js` 的 `API_BASE`）。
+`http://localhost:5001`，不用帶參數。要對別的後端測就帶 `?apiBase=`
+（只在 localhost 有效，見 `js/api.js` 的 `devParam`）。
+
+## 套件與鎖檔
+
+直接相依寫在 `requirements.in`（正式環境）與 `requirements-dev.in`（開發用，含前者），
+實際安裝的是由它們產生、鎖住每一個套件（包括間接相依）的版本與檔案雜湊的
+`requirements.txt` 與 `requirements-dev.txt`。Render 的 Build Command 照舊是
+`pip install -r requirements.txt`：有雜湊的檔案會讓 pip 自動檢查下載到的每個檔案。
+
+全部升到最新正式版（產生的指令也寫在兩個 `.in` 檔的開頭）：
+
+```bash
+./.venv/bin/uv pip compile requirements.in --universal --generate-hashes --python-version 3.14 --upgrade -o requirements.txt
+./.venv/bin/uv pip compile requirements-dev.in --universal --generate-hashes --python-version 3.14 -c requirements.txt --upgrade -o requirements-dev.txt
+./.venv/bin/uv pip sync requirements-dev.txt --python .venv/bin/python
+./.venv/bin/python -m pytest
+```
+
+確認 Render（Linux x86_64）上每個套件都有現成的安裝包、雜湊也對得上——沒有現成
+安裝包的套件會改從原始碼編譯，那要系統裝有編譯器與函式庫的開發檔，不要把部署押在那上面：
+
+```bash
+./.venv/bin/pip download -r requirements.txt --only-binary=:all: \
+  --platform manylinux_2_28_x86_64 --platform manylinux_2_17_x86_64 --platform manylinux2014_x86_64 \
+  --python-version 3.14 --implementation cp --abi cp314 --abi abi3 --abi none -d "$(mktemp -d)"
+```
+
+★ `--python-version` 要跟正式服務的 Python 小版本一致（`.python-version`）。
 
 ## 已定案的架構決策
 
